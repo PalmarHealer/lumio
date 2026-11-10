@@ -1583,12 +1583,18 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
 
   // GET /music/lyrics/:id: a track's lyrics as a source outside Jellyfin (lrclib, a plugin's) gave them once.
   // PUT /music/lyrics/:id {lines: [{time?, text}], synced, source, sourceName?}: kept for everyone. Anyone may fill a
-  // gap or turn plain lyrics into synced ones; only administrators replace what is there.
+  // gap or turn plain lyrics into synced ones; only administrators replace what is there. DELETE: see below.
   const lyrics = path.match(/^\/music\/lyrics\/([0-9a-f-]{32,36})$/i)
   if (lyrics) {
     const id = lyrics[1]!.toLowerCase()
     const stored = store.lyrics(id)
     if (request.method === 'GET') return stored ? send(response, 200, { ...(stored.data as object), source: stored.source }) : send(response, 404, { error: 'No lyrics' })
+    // DELETE: administrators take wrong lyrics out again (the apps then look them up anew).
+    if (request.method === 'DELETE') {
+      if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
+      store.deleteLyrics(id)
+      return send(response, 204)
+    }
     if (request.method === 'PUT') {
       const body = await readJson<{ lines?: unknown; synced?: unknown; source?: unknown; sourceName?: unknown }>(request).catch(() => null)
       const source = typeof body?.source === 'string' && /^[a-z0-9][a-z0-9_.-]{0,59}$/i.test(body.source) ? body.source : null

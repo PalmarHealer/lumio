@@ -486,6 +486,10 @@ export class Store {
     return Object.fromEntries(rows.map((row) => [row.item_id, { synced: !!row.synced, source: row.source }]))
   }
 
+  deleteLyrics(id: string) {
+    this.db.prepare('DELETE FROM lyrics WHERE item_id = ?').run(id)
+  }
+
   setLyrics(id: string, data: unknown, source: string) {
     this.db
       .prepare('INSERT INTO lyrics (item_id, data, source, at) VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET data = excluded.data, source = excluded.source, at = excluded.at')

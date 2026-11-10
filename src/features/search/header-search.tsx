@@ -20,6 +20,7 @@ import { artistsOf, itemHref, SQUARE_TYPES } from '@/lib/item-links'
 import { inMode, useAppMode } from '@/lib/app-mode'
 import { useMessages } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
+import { useLyricsSearch } from './lyrics-query'
 import { searchMessages, typeLabels } from './messages'
 import { canPlay, usePlayResult } from './play-result'
 import { useRecentSearches, type SearchEntry, type SearchTarget } from './recent-searches'
@@ -32,6 +33,8 @@ const MAX_RESULTS = 8
 
 /** Podcasts shown in the short list, after the library's results. */
 const MAX_PODCASTS = 3
+/** Songs found by their lyrics in the short list, after the library's results (as in Spotify). */
+const MAX_LYRICS = 3
 
 /** Results with a menu ("…" and right-click), as the queue's rows have. */
 const WITH_MENU = new Set(['Audio', 'MusicAlbum', 'MusicArtist', 'Playlist'])
@@ -84,10 +87,17 @@ export function HeaderSearch({ persistent = false }: { persistent?: boolean }) {
   const listing = !onSearchPage
   const results = useSearch(listing ? term : '', mode)
   const podcasts = usePodcastSearch(listing && mode === 'listen' ? term : '')
+  const lyrics = useLyricsSearch(listing && mode === 'listen' ? term : '')
   // Whole titles first; episodes and tracks would otherwise crowd the short list.
-  const items = [...(results.data ?? [])]
+  const found = [...(results.data ?? [])]
     .sort((a, b) => TYPE_ORDER.indexOf(a.Type ?? '') - TYPE_ORDER.indexOf(b.Type ?? ''))
     .slice(0, MAX_RESULTS)
+  // Then songs whose lyrics have the term (those found by name already aren't repeated). Kept for the term they were
+  // found for, so the previous term's songs don't linger under the new one.
+  const foundIds = new Set(found.map((item) => item.Id))
+  const lyricItems = lyrics.isPlaceholderData ? [] : (lyrics.data?.items ?? []).filter((item) => !foundIds.has(item.Id)).slice(0, MAX_LYRICS)
+  const inLyrics = new Set(lyricItems.map((item) => item.Id!))
+  const items = [...found, ...lyricItems]
   const resultEntries: SearchEntry[] = [
     ...items.map((item) => ({
       target: { kind: 'item' as const, id: item.Id!, type: item.Type ?? '' },
@@ -316,6 +326,7 @@ export function HeaderSearch({ persistent = false }: { persistent?: boolean }) {
               index={index}
               entry={entry}
               item={entry.target.kind === 'item' ? itemsById.get(entry.target.id) : undefined}
+              inLyrics={!showingRecent && inLyrics.has(entry.key)}
               active={index === active}
               onHover={() => setActive(index)}
               onChoose={() => choose(entry)}
@@ -353,6 +364,7 @@ function ResultRow({
   index,
   entry,
   item,
+  inLyrics,
   active,
   onHover,
   onChoose,
@@ -365,6 +377,8 @@ function ResultRow({
   entry: SearchEntry
   /** The result itself, when the search found it (recent searches only know the id). */
   item?: BaseItemDto
+  /** Found by its lyrics, not its name: says so above the title. */
+  inLyrics?: boolean
   active: boolean
   onHover: () => void
   onChoose: () => void
@@ -415,6 +429,7 @@ function ResultRow({
           )}
         </div>
         <div className="min-w-0">
+          {inLyrics && <p className="truncate text-xs text-muted-foreground">{t.foundInLyrics}</p>}
           <p className={cn('truncate text-[15px] font-medium', current && 'text-listen')}>{entry.title}</p>
           <p className="truncate text-sm text-muted-foreground">
             {item?.Type === 'Audio' || item?.Type === 'MusicAlbum' ? (

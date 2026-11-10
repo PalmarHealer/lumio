@@ -16,8 +16,8 @@ export interface LyricsSearch {
 }
 
 /** Around a match in a snippet (characters lyrics don't have). */
-export const MARK_START = ''
-export const MARK_END = ''
+export const MARK_START = '\uE000'
+export const MARK_END = '\uE001'
 
 /** Ids as Jellyfin's API gives them: 32 hex digits, lower case. */
 export const lyricsId = (id: string) => id.replace(/-/g, '').toLowerCase()

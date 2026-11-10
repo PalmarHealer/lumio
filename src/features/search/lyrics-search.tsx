@@ -1,33 +1,12 @@
-import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
-import { useQuery } from '@tanstack/react-query'
 import { Fragment } from 'react'
-import { useAuthedSession } from '@/features/auth/session'
 import { TrackTableRow } from '@/features/listen/album-view'
 import { music } from '@/features/listen/player/music-player'
-import { useLumioFetch } from '@/features/social/social'
 import { useMessages } from '@/lib/i18n'
-import { usePublicConfig } from '@/lib/public-config'
+import { useLyricsSearch } from './lyrics-query'
 import { searchMessages } from './messages'
 
 /** Around a match in a snippet (as the server marks it, see server/src/lyrics-search.ts). */
-const MARK = /([^]*)/
-
-/** Songs whose lyrics have the term's words, with the lines around the match; only when the server can search lyrics. */
-function useLyricsSearch(term: string) {
-  const { session } = useAuthedSession()
-  const lumioFetch = useLumioFetch()
-  const enabled = !!usePublicConfig().data?.lyricsSearch && term.length >= 3
-  return useQuery({
-    queryKey: ['lyrics-search', session.userId, term],
-    enabled,
-    placeholderData: (previous) => previous,
-    queryFn: async () => {
-      const response = await lumioFetch(`/music/lyrics-search?${new URLSearchParams({ q: term })}`).catch(() => null)
-      if (!response?.ok) return { items: [], snippets: {} }
-      return (await response.json()) as { items: BaseItemDto[]; snippets: Record<string, string> }
-    },
-  })
-}
+const MARK = /\uE000([^\uE001]*)\uE001/
 
 /** A snippet with its matches marked. */
 function Snippet({ text }: { text: string }) {

@@ -21,6 +21,7 @@ import { cn } from '@/lib/utils'
 import { searchMessages, typeLabels } from './messages'
 import { canPlay, usePlayResult } from './play-result'
 import { useRecentSearches, type SearchEntry, type SearchTarget } from './recent-searches'
+import { displayName } from '@/lib/unscanned'
 
 const TYPE_ORDER = ['Movie', 'Series', 'BoxSet', 'MusicArtist', 'MusicAlbum', 'Playlist', 'AudioBook', 'Book', 'Episode', 'Audio']
 const DEBOUNCE_MS = 200
@@ -89,7 +90,7 @@ export function HeaderSearch({ persistent = false }: { persistent?: boolean }) {
       target: { kind: 'item' as const, id: item.Id!, type: item.Type ?? '' },
       key: item.Id!,
       href: itemHref(item),
-      title: item.Name ?? '',
+      title: displayName(item),
       meta: [types[item.Type ?? ''], item.Type === 'Episode' ? item.SeriesName : item.Type === 'MusicAlbum' ? item.AlbumArtist : item.ProductionYear].filter(Boolean).join(' · '),
       image: portraitImageUrl(api, item, { fillHeight: 120 }),
       shape: item.Type === 'MusicArtist' ? ('round' as const) : SQUARE_TYPES.has(item.Type ?? '') || item.Type === 'Playlist' ? ('square' as const) : ('poster' as const),

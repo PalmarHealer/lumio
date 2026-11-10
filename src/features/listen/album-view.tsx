@@ -38,6 +38,7 @@ import { DownloadButton, DownloadMenuItem } from './download-ui'
 import { useHeldByDownload } from './download-ui'
 import { useUnavailable } from './availability'
 import { MediaAdminMenu } from '@/features/admin/media-admin'
+import { displayName } from '@/lib/unscanned'
 
 const messages = defineMessages({
   de: {
@@ -147,7 +148,7 @@ export function AlbumView({ item }: { item: BaseItemDto }) {
           </ImageLightbox>
           <div className="min-w-0 space-y-3">
             <p className="text-sm font-medium">{kindOf(list.length, t, isBook)}</p>
-            <h1 className="line-clamp-2 text-4xl font-black leading-none tracking-tight text-balance sm:text-6xl xl:text-7xl">{item.Name}</h1>
+            <h1 className="line-clamp-2 text-4xl font-black leading-none tracking-tight text-balance sm:text-6xl xl:text-7xl">{displayName(item)}</h1>
             <p className="flex flex-wrap items-center gap-x-1.5 text-sm text-foreground/80">
               {mainArtist && <ArtistAvatar id={mainArtist.id} />}
               {artists.map((artist, index) => (
@@ -358,8 +359,9 @@ export function TrackTableRow({
           <span className="flex min-w-0 items-center gap-3">
             {cover && <span className="size-10 shrink-0 overflow-hidden rounded bg-muted">{image && <FadeImage src={image} alt="" className="size-full object-cover" />}</span>}
             <span className="min-w-0">
-              <span className={cn('block truncate', isCurrent ? 'text-listen' : 'text-foreground')}>{track.Name}</span>
-              <span className="block truncate text-sm text-muted-foreground">
+              <span className={cn('block truncate', isCurrent ? 'text-listen' : 'text-foreground')}>{displayName(track)}</span>
+              {/* Keeps its line when there are no artists yet, so every row is as tall. */}
+              <span className="block min-h-5 truncate text-sm text-muted-foreground">
                 {/* All of them, with the featured artists (as Spotify lists them on an album too). */}
                 <TrackArtists track={track} stopPropagation />
               </span>
@@ -368,7 +370,8 @@ export function TrackTableRow({
           {extra !== undefined && <span className="hidden min-w-0 justify-end text-right text-sm tabular-nums text-muted-foreground sm:flex max-md:hidden">{extra}</span>}
           <span className="flex items-center justify-end gap-3 text-sm tabular-nums text-muted-foreground">
             <LikeToggle track={track} />
-            <span className="max-md:hidden">{formatClock(ticksToSeconds(track.RunTimeTicks ?? 0))}</span>
+            {/* Unknown until the scan has probed the file. */}
+            <span className="max-md:hidden">{track.RunTimeTicks ? formatClock(ticksToSeconds(track.RunTimeTicks)) : '–'}</span>
           </span>
           <TrackMenu track={track} onRemove={onRemove} />
         </div>

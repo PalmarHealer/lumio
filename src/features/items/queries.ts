@@ -8,6 +8,7 @@ import { getUserDataApi } from '@jellyfin/sdk/lib/utils/api/user-data-api'
 import { keepPreviousData, queryOptions, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAuthedSession } from '@/features/auth/session'
 import type { AppMode } from '@/lib/app-mode'
+import { trackIndex } from '@/lib/unscanned'
 
 const PAGE_SIZE = 60
 
@@ -378,16 +379,20 @@ export function useAncestors(itemId: string | undefined) {
 export const albumTracksOptions = (api: Api, userId: string, albumId: string) =>
   queryOptions({
     queryKey: ['tracks', userId, albumId],
-    queryFn: async () =>
-      (
-        await getLibraryApi(api).getItems({
-          userId,
-          parentId: albumId,
-          includeItemTypes: [BaseItemKind.Audio],
-          sortBy: [ItemSortBy.ParentIndexNumber, ItemSortBy.IndexNumber, ItemSortBy.SortName],
-          fields: [ItemFields.PrimaryImageAspectRatio],
-        })
-      ).data.Items ?? [],
+    queryFn: async () => {
+      const items =
+        (
+          await getLibraryApi(api).getItems({
+            userId,
+            parentId: albumId,
+            includeItemTypes: [BaseItemKind.Audio],
+            sortBy: [ItemSortBy.ParentIndexNumber, ItemSortBy.IndexNumber, ItemSortBy.SortName],
+            fields: [ItemFields.PrimaryImageAspectRatio],
+          })
+        ).data.Items ?? []
+      // Files the scan hasn't probed yet have no number and would come first; their file name has one.
+      return items.toSorted((a, b) => (a.ParentIndexNumber ?? 1) - (b.ParentIndexNumber ?? 1) || (trackIndex(a) ?? Infinity) - (trackIndex(b) ?? Infinity))
+    },
   })
 
 /**

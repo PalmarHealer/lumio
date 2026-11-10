@@ -12,6 +12,8 @@ import { latestApps } from './apps.ts'
 import { creditsOfRecording, lookupCredits, sameName, searchRecordings, type Failure, type JobState, type TrackCredits, type TrackMeta } from './credits.ts'
 import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, type Privacy } from './store.ts'
 import { tasteSignals, type TasteSignals } from './taste.ts'
+import { SOUND_VERSION } from './sound-analysis.ts'
+import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
 import { LANGS, detectLanguage, localizeTitle, type Lang, type LanguageDeps, type LocalImage, type LocalImageKind, type Localized, type LocalizedMeta, type Texts, type VideoItem } from './languages.ts'
 
@@ -721,13 +723,14 @@ async function creditsFor(id: string, meta: TrackMeta): Promise<TrackCredits | n
   return lookup
 }
 
-type JobName = 'credits' | 'artists' | 'languages'
+type JobName = 'credits' | 'artists' | 'languages' | 'sound'
 
 /** The administrators' tasks on the library, each running on its own (one run at a time). */
 const jobs: Record<JobName, JobState & { stop?: boolean }> = {
   credits: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
   artists: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
   languages: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
+  sound: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
 }
 
 /**
@@ -901,6 +904,95 @@ function scanArtists(token: string, userId: string, lastfmKey: string | undefine
     },
     (artist) => ({ id: artist.Id, title: artist.Name ?? '' }),
   )
+}
+
+// ---- what songs sound like, and their tags (see sound.ts), for the mood and tag mixes ----
+
+const SOUND_FIELDS = 'Genres'
+
+/** Last.fm through the relay (its answers kept), with the app's key when the server has none. */
+function lastfmVia(lastfmKey: string | undefined) {
+  return async (params: Record<string, string>) => {
+    const entry = await relayGet('lastfm', '', new URLSearchParams({ ...params, ...(lastfmKey ? { api_key: lastfmKey } : {}), format: 'json', autocorrect: '1' }))
+    return entry.body ? (JSON.parse(entry.body) as unknown) : null
+  }
+}
+
+const canLastfm = (lastfmKey: string | undefined) => !!(lastfmKey || process.env.LASTFM_API_KEY)
+
+/**
+ * Measures a song and fetches its tags (and its artists' tags, once a month), then keeps them. Without Last.fm, only
+ * the sound; Last.fm failing leaves the tags empty but keeps the measurement. Returns whether it could be measured.
+ */
+async function soundOf(token: string, track: SoundTrack, lastfmKey: string | undefined, known: Record<string, { at: number }>) {
+  const features = await measureTrack(JELLYFIN_URL, token, track)
+  let tags: string[] = []
+  if (canLastfm(lastfmKey)) {
+    const lastfm = lastfmVia(lastfmKey)
+    tags = await trackTags(lastfm, track).catch(() => [])
+    for (const artist of artistsOfTrack(track)) {
+      if (known[artist.id] && Date.now() - known[artist.id]!.at < 30 * 24 * HOUR) continue
+      const found = await artistTags(lastfm, artist.name).catch(() => null)
+      if (found) {
+        store.setArtistTags(artist.id, artist.name, found)
+        known[artist.id] = { at: Date.now() }
+      }
+    }
+  }
+  store.setTrackSound(track.Id, features, tags)
+  return !!features
+}
+
+/** Measures every song not measured yet (with this version of the analysis); a second or so each. */
+function scanSound(token: string, userId: string, lastfmKey: string | undefined, scope: Scope = NO_SCOPE) {
+  const known = store.artistTags()
+  return runJob<SoundTrack & { Genres?: string[] }>(
+    jobs.sound,
+    async () => {
+      const done = new Set(store.trackSounds().filter((entry) => !entry.data || (entry.data as { v?: number }).v === SOUND_VERSION).map((entry) => entry.id))
+      const tracks = await libraryItems<SoundTrack & { Genres?: string[] }>(token, userId, '/Users/{user}/Items', { Recursive: 'true', IncludeItemTypes: 'Audio', Fields: SOUND_FIELDS }, scope.libraries)
+      return tracks.filter((track) => !done.has(track.Id) && !leftOut(scope, [...(track.Artists ?? []), track.AlbumArtist], track.Genres))
+    },
+    (track) => soundOf(token, track, lastfmKey, known),
+    (track) => ({ id: track.Id, title: track.Name ?? '', artist: track.Artists?.[0] ?? track.AlbumArtist ?? '' }),
+  )
+}
+
+/**
+ * Songs someone just played that weren't measured yet, done one after another in the background with their token (so
+ * the library fills in by itself as people listen, without an administrator's run).
+ */
+const soundQueue = new Map<string, string>()
+let soundRunning = false
+
+function queueSound(id: string, token: string) {
+  if (soundQueue.has(id) || jobs.sound.running || store.hasTrackSound(id)) return
+  soundQueue.set(id, token)
+  if (soundRunning) return
+  soundRunning = true
+  void (async () => {
+    const known = store.artistTags()
+    try {
+      while (soundQueue.size) {
+        const [next, nextToken] = soundQueue.entries().next().value as [string, string]
+        soundQueue.delete(next)
+        try {
+          const person = tokens.get(nextToken)?.person
+          if (!person || store.hasTrackSound(next)) continue
+          const item = await fetch(`${JELLYFIN_URL}/Users/${person.id}/Items/${next}?${new URLSearchParams({ Fields: SOUND_FIELDS })}`, {
+            headers: { Authorization: `MediaBrowser Token="${nextToken}"` },
+          })
+          if (!item.ok) continue
+          await soundOf(nextToken, (await item.json()) as SoundTrack, undefined, known)
+        } catch (error) {
+          console.warn(`Sound of ${next}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+      }
+    } finally {
+      soundRunning = false
+    }
+  })()
 }
 
 // ---- films and series in two languages (see languages.ts) ----
@@ -1219,10 +1311,10 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     }
   }
 
-  // /admin/jobs/<credits|artists|languages>: an admin's task on the whole library (POST starts, DELETE stops, GET tells
-  // how far it is): looking up every track's credits, fetching every artist's information into the caches, or filling
-  // in films and series in both languages.
-  const jobName = path.match(/^\/admin\/jobs\/(credits|artists|languages)$/)?.[1] as JobName | undefined
+  // /admin/jobs/<credits|artists|languages|sound>: an admin's task on the whole library (POST starts, DELETE stops, GET
+  // tells how far it is): looking up every track's credits, fetching every artist's information into the caches,
+  // filling in films and series in both languages, or measuring every song's sound and fetching its tags.
+  const jobName = path.match(/^\/admin\/jobs\/(credits|artists|languages|sound)$/)?.[1] as JobName | undefined
   if (jobName) {
     if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
     const job = jobs[jobName]
@@ -1240,7 +1332,11 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       }
       if (jobName === 'credits') void scanCredits(token, me.id, scope)
       else if (jobName === 'languages') void scanLanguages(token, me.id, isTmdbKey(body.tmdbKey) ? body.tmdbKey : undefined, scope.libraries)
-      else void scanArtists(token, me.id, typeof body.lastfmKey === 'string' && /^[0-9a-f]{32}$/i.test(body.lastfmKey) ? body.lastfmKey : undefined, scope)
+      else {
+        const lastfmKey = typeof body.lastfmKey === 'string' && /^[0-9a-f]{32}$/i.test(body.lastfmKey) ? body.lastfmKey : undefined
+        if (jobName === 'sound') void scanSound(token, me.id, lastfmKey, scope)
+        else void scanArtists(token, me.id, lastfmKey, scope)
+      }
     }
     if (request.method === 'DELETE') job.stop = true
     const { stop: _stop, ...state } = job
@@ -1441,6 +1537,8 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
         artist: text(body?.artist),
         album: text(body?.album),
       })
+      // A song not measured yet is measured now, in the background (for the mood mixes).
+      if (body?.kind === 'audio' && /^[0-9a-f]{32}$/i.test(key)) queueSound(key, tokenOf(request, url)!)
       return send(response, 204)
     }
     if (request.method === 'GET') {
@@ -1460,6 +1558,19 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     const signals = tasteSignals(store, me.id, timeZone)
     tasteCache.set(key, signals)
     return send(response, 200, signals)
+  }
+
+  // GET /music/sound: every measured song's sound (an array: bpm, pulse, key, minor 0/1, key clarity, loudness,
+  // dynamics, brightness, onsets; null when it couldn't be measured) and Last.fm tags, and every artist's tags.
+  if (path === '/music/sound' && request.method === 'GET') {
+    type Features = { bpm: number; pulse: number; key: number; minor: boolean; keyClarity: number; loudness: number; dynamics: number; brightness: number; onsets: number }
+    const tracks: Record<string, [number[] | null, string[]]> = {}
+    for (const entry of store.trackSounds()) {
+      const f = entry.data as Features | null
+      tracks[entry.id] = [f ? [f.bpm, f.pulse, f.key, f.minor ? 1 : 0, f.keyClarity, f.loudness, f.dynamics, f.brightness, f.onsets] : null, entry.tags]
+    }
+    const artists = Object.fromEntries(Object.entries(store.artistTags()).map(([id, entry]) => [id, entry.tags]))
+    return send(response, 200, { tracks, artists })
   }
 
   // POST /me/imports/:source {plays: [...]}: a part of the person's listening history from another service (Spotify),

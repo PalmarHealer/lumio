@@ -38,20 +38,27 @@ export function timeZone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 }
 
-/** The play log's numbers, shared by the mixes and the radios; null without the Lumio server. */
-export function tasteSignalsQuery(userId: string) {
+/** A GET to the Lumio server (null: no connection yet). */
+export type LumioGet = (path: string) => Promise<Response | null>
+
+/**
+ * The play log's numbers, shared by the mixes and the radios; null when the server doesn't answer. Without a connection
+ * yet it fails instead (not kept), so the next build asks again.
+ */
+export function tasteSignalsQuery(userId: string, get: LumioGet = lumioGet) {
   return {
     queryKey: ['taste-signals', userId, timeZone()],
     staleTime: 10 * 60_000,
     queryFn: async (): Promise<TasteSignals | null> => {
-      const response = await lumioGet(`/me/taste?tz=${encodeURIComponent(timeZone())}`).catch(() => null)
+      const response = await get(`/me/taste?tz=${encodeURIComponent(timeZone())}`).catch(() => undefined)
+      if (response === null) throw new Error('Not connected')
       return response?.ok ? ((await response.json()) as TasteSignals) : null
     },
   }
 }
 
-export function fetchTasteSignals(queryClient: QueryClient, userId: string) {
-  return queryClient.fetchQuery(tasteSignalsQuery(userId)).catch(() => null)
+export function fetchTasteSignals(queryClient: QueryClient, userId: string, get?: LumioGet) {
+  return queryClient.fetchQuery(tasteSignalsQuery(userId, get)).catch(() => null)
 }
 
 /** The parts of the day (as the server counts them): early morning, morning, afternoon, evening, night, late night. */

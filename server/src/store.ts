@@ -158,6 +158,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS plays_started ON plays (started_at);
       CREATE TABLE IF NOT EXISTS localized (item_id TEXT PRIMARY KEY, label TEXT NOT NULL, data TEXT NOT NULL, meta TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS localized_label ON localized (label);
+      CREATE TABLE IF NOT EXISTS track_sound (item_id TEXT PRIMARY KEY, data TEXT, tags TEXT, at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS artist_tags (artist_id TEXT PRIMARY KEY, name TEXT NOT NULL, tags TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS playlist_adds (playlist_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (playlist_id, item_id));
     `)
     // How a play went (music too): why it started and ended, where it came from, shuffle, from the device, buffering.
@@ -432,6 +434,35 @@ export class Store {
   playlistAdds(playlistId: string): Record<string, { person: Person; at: number }> {
     const rows = this.db.prepare('SELECT item_id, user_id, at FROM playlist_adds WHERE playlist_id = ?').all(playlistId) as Array<{ item_id: string; user_id: string; at: number }>
     return Object.fromEntries(rows.map((row) => [row.item_id, { person: this.person(row.user_id) ?? { id: row.user_id, name: '', imageTag: null }, at: row.at }]))
+  }
+
+  /** What a song sounds like (see sound-analysis.ts; null: couldn't be measured) and its Last.fm tags. */
+  setTrackSound(id: string, data: unknown, tags: string[]) {
+    this.db
+      .prepare('INSERT INTO track_sound (item_id, data, tags, at) VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET data = excluded.data, tags = excluded.tags, at = excluded.at')
+      .run(id, data === null ? null : JSON.stringify(data), JSON.stringify(tags), Date.now())
+  }
+
+  /** Every measured song: its features (null: couldn't be measured), tags and when. */
+  trackSounds(): Array<{ id: string; data: unknown; tags: string[]; at: number }> {
+    const rows = this.db.prepare('SELECT item_id, data, tags, at FROM track_sound').all() as Array<{ item_id: string; data: string | null; tags: string | null; at: number }>
+    return rows.map((row) => ({ id: row.item_id, data: row.data ? (JSON.parse(row.data) as unknown) : null, tags: row.tags ? (JSON.parse(row.tags) as string[]) : [], at: row.at }))
+  }
+
+  hasTrackSound(id: string) {
+    return !!this.db.prepare('SELECT 1 FROM track_sound WHERE item_id = ?').get(id)
+  }
+
+  setArtistTags(id: string, name: string, tags: string[]) {
+    this.db
+      .prepare('INSERT INTO artist_tags (artist_id, name, tags, at) VALUES (?, ?, ?, ?) ON CONFLICT(artist_id) DO UPDATE SET name = excluded.name, tags = excluded.tags, at = excluded.at')
+      .run(id, name, JSON.stringify(tags), Date.now())
+  }
+
+  /** Every artist's Last.fm tags, by artist id, with when they were fetched. */
+  artistTags(): Record<string, { tags: string[]; at: number }> {
+    const rows = this.db.prepare('SELECT artist_id, tags, at FROM artist_tags').all() as Array<{ artist_id: string; tags: string; at: number }>
+    return Object.fromEntries(rows.map((row) => [row.artist_id, { tags: JSON.parse(row.tags) as string[], at: row.at }]))
   }
 
   /** The credits looked up for these tracks (null: looked up, none found); tracks never looked up are left out. */

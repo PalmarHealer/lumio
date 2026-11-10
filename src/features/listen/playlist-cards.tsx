@@ -100,12 +100,12 @@ function DrawnCover({ playlist, className }: { playlist: OfficialPlaylist; class
       ? portraitImageUrl(api, leader, { fillHeight: 720 })
       : undefined
   const style: CoverStyle =
-    playlist.kind === 'genre' || playlist.kind === 'decade' ? 'mix' : playlist.kind === 'artist' || playlist.kind === 'daily' ? 'foto' : playlist.kind === 'chart' ? 'block' : 'stimmung'
+    playlist.kind === 'genre' || playlist.kind === 'decade' || playlist.kind === 'tag' ? 'mix' : playlist.kind === 'artist' || playlist.kind === 'daily' ? 'foto' : playlist.kind === 'chart' ? 'block' : 'stimmung'
   // The daylist changes colour with its title (through the day), as Spotify's does.
   const coverSeed = playlist.kind === 'daylist' ? playlist.title : playlist.slug
   const title = playlist.kind === 'artist' ? (playlist.artist?.Name ?? playlist.title) : playlist.kind === 'chart' ? t.charts : playlist.title
   const subtitle =
-    playlist.kind === 'artist' ? t.thisIs : playlist.kind === 'genre' || playlist.kind === 'decade' || playlist.kind === 'daily' ? undefined : playlist.kind === 'chart' ? playlist.title.replace(/^Charts\s*/, '') : t.forYou
+    playlist.kind === 'artist' ? t.thisIs : playlist.kind === 'genre' || playlist.kind === 'decade' || playlist.kind === 'tag' || playlist.kind === 'daily' ? undefined : playlist.kind === 'chart' ? playlist.title.replace(/^Charts\s*/, '') : t.forYou
 
   useEffect(() => {
     const element = canvas.current

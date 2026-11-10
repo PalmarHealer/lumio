@@ -7,6 +7,8 @@ import { useCategories } from '@/features/library/categories'
 import { defineMessages, getLocale, getLocaleTag, messagesFor } from '@/lib/i18n'
 import { fetchChartTracks, fetchSimilarArtists, homeChartCountry, sameName } from './external'
 import { localDate, madeForYou } from './mixes'
+import { useLumioFetch } from '@/features/social/social'
+import { fetchSound } from './sound'
 import { useRadioPlaylist } from './radio'
 import { useTasteFilter } from './taste'
 import { buildTasteModel, fetchTasteSignals, slotOf, type TasteModel } from './taste-model'
@@ -23,7 +25,7 @@ export interface OfficialPlaylist {
   tracks: BaseItemDto[]
   /** "This is …" playlists show the artist's photo on their cover. */
   artist?: BaseItemDto
-  kind: 'new' | 'top' | 'month' | 'rediscover' | 'genre' | 'decade' | 'artist' | 'chart' | 'radio' | 'daylist' | 'daily' | 'discover' | 'radar' | 'phase'
+  kind: 'new' | 'top' | 'month' | 'rediscover' | 'genre' | 'decade' | 'artist' | 'chart' | 'radio' | 'daylist' | 'daily' | 'discover' | 'radar' | 'phase' | 'mood' | 'tag'
   /**
    * Made for whoever opens it: the same address shows everyone their own songs (their top songs), as Spotify's "Your
    * top songs" do. Shown as "For <name>".
@@ -101,6 +103,9 @@ export function weightedShuffle<T>(items: T[], weight: (item: T) => number, seed
 export function useOfficialPlaylists() {
   const { api, session } = useAuthedSession()
   const queryClient = useQueryClient()
+  // Ready from the first render (the shared connection is set a moment later).
+  const lumioFetch = useLumioFetch()
+  const get = (path: string) => lumioFetch(path)
   const { categories, isLoading: categoriesLoading } = useCategories('listen')
   const views = categories.find((category) => category.id === 'music')?.views ?? []
   // The personal mixes follow the taste profile (what is left out of it doesn't count).
@@ -112,7 +117,7 @@ export function useOfficialPlaylists() {
     enabled: views.length > 0 && taste.ready,
     staleTime: 30 * 60_000,
     queryFn: async (): Promise<OfficialPlaylist[]> => {
-      const [lists, signals] = await Promise.all([
+      const [lists, signals, sound] = await Promise.all([
         Promise.all(
           views.map(
             async (view) =>
@@ -128,7 +133,8 @@ export function useOfficialPlaylists() {
               ).data.Items ?? [],
           ),
         ),
-        fetchTasteSignals(queryClient, session.userId),
+        fetchTasteSignals(queryClient, session.userId, get),
+        fetchSound(queryClient, get),
       ])
       const tracks = lists.flat()
       const now = Date.now()
@@ -137,7 +143,7 @@ export function useOfficialPlaylists() {
       const first = buildTasteModel(tracks, signals, taste.counts, now)
       const similar = await similarToFavourites(tracks, first).catch(() => new Set<string>())
       const model = similar.size ? buildTasteModel(tracks, signals, taste.counts, now, similar) : first
-      const mixes = await madeForYou({ tracks, model, now, userId: session.userId }, seeded)
+      const mixes = await madeForYou({ tracks, model, now, userId: session.userId }, sound, seeded)
       const playlists = buildPlaylists(tracks, t, taste.counts)
       // The charts come from Last.fm; a failure just leaves them out.
       const [code, country] = homeChartCountry()
@@ -146,7 +152,7 @@ export function useOfficialPlaylists() {
         chartPlaylist(tracks, t, 'chart-world', t.world),
       ]).catch(() => [])
       const [newest, ...rest] = playlists
-      return [...mixes.forYou, ...rest.filter((playlist) => playlist.kind === 'top'), ...(newest ? [newest] : []), ...mixes.mixes, ...rest.filter((playlist) => playlist.kind !== 'top'), ...charts.filter((playlist): playlist is OfficialPlaylist => !!playlist)]
+      return [...mixes.forYou, ...rest.filter((playlist) => playlist.kind === 'top'), ...(newest ? [newest] : []), ...mixes.moods, ...mixes.mixes, ...mixes.tags, ...rest.filter((playlist) => playlist.kind !== 'top'), ...charts.filter((playlist): playlist is OfficialPlaylist => !!playlist)]
     },
   })
   // Still loading while the libraries aren't known yet (the query waits for them), not only while it runs.

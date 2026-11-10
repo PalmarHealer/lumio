@@ -3,7 +3,9 @@ import { defineMessages, getLocale, getLocaleTag, messagesFor } from '@/lib/i18n
 import { artistsOf } from '@/lib/item-links'
 import { fetchArtistTags } from './external'
 import { assemble } from './mix-engine'
+import { moodMixes, slugOf, tagMixes } from './mood-mixes'
 import type { OfficialPlaylist } from './official'
+import type { SoundData } from './sound'
 import { artistIdsOf, slotOf, type DayPart, type TasteModel } from './taste-model'
 
 /**
@@ -378,14 +380,6 @@ export function phaseMix(context: Context): OfficialPlaylist | null {
 
 // ---- genre and decade mixes ----
 
-const slugify = (value: string) =>
-  value
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-
 /** A mix of a part of the library: mostly what they love in it, a quarter new to them; just a weighted shuffle for someone new. */
 function partMix(context: Context, pool: BaseItemDto[], seed: string) {
   const { model } = context
@@ -411,7 +405,7 @@ export function genreMixes(context: Context): OfficialPlaylist[] {
     .filter(([, list]) => list.length >= MIN_GENRE)
     .sort((a, b) => model.genre(b[0]) - model.genre(a[0]) || b[1].length - a[1].length)
     .map(([genre, list]) => ({
-      slug: `genre-${slugify(genre)}`,
+      slug: `genre-${slugOf(genre)}`,
       kind: 'genre' as const,
       title: t.genreTitle(genre),
       description: t.genreDescription(genre),
@@ -440,12 +434,15 @@ export function decadeMixes(context: Context): OfficialPlaylist[] {
     })
 }
 
-/** All made-for-you mixes, in the order the home page shows them. */
-export async function madeForYou(context: Omit<Context, 't'>, seededRandom: (seed: string) => () => number) {
+/** All made-for-you mixes, in the order the home page shows them (moods and tags need the songs' sound and tags). */
+export async function madeForYou(context: Omit<Context, 't'>, sound: SoundData, seededRandom: (seed: string) => () => number) {
   const full = { ...context, t: messagesFor(mixMessages) }
   const day = await daylist(full, seededRandom).catch(() => null)
+  const moodContext = { ...context, sound, day: localDate(context.now), week: weekOf(context.now, 0) }
   return {
     forYou: [day, ...dailyMixes(full), onRepeat(full), discoveries(full), phaseMix(full), newForYou(full), repeatRewind(full)].filter((entry): entry is OfficialPlaylist => !!entry),
+    moods: moodMixes(moodContext),
     mixes: [...genreMixes(full), ...decadeMixes(full)],
+    tags: tagMixes(moodContext),
   }
 }

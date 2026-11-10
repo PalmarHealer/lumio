@@ -28,6 +28,8 @@ import { Dialog, DialogClose, DialogContent, DialogTitle } from '@/components/ui
 import { useAuthedSession } from '@/features/auth/session'
 import { defineMessages, getLocaleTag, useLocale, useMessages } from '@/lib/i18n'
 import { titlePath } from '@/lib/item-links'
+import { slugOf, tagSlug } from './mood-mixes'
+import { useOfficialPlaylists } from './official'
 import { cn } from '@/lib/utils'
 import { useArtistLinks, useArtistRanks, useLastfmArtist, type ArtistLink } from './external'
 import { useArtistAlbums } from '@/features/items/queries'
@@ -102,6 +104,9 @@ export function ArtistAboutDialog({ artist, open, onOpenChange }: { artist: Base
   const current = shown % Math.max(1, images.length)
   const bio = useArtistBio(artist)
   const genres = [...new Set([...(artist.Genres ?? []), ...(lastfm.data?.tags ?? []).slice(0, 5)])]
+  const mixSlugs = useOfficialPlaylists()
+    .playlists.filter((playlist) => playlist.kind === 'genre' || playlist.kind === 'tag')
+    .map((playlist) => playlist.slug)
 
   const step = (by: number) => setShown((shown + by + images.length) % images.length)
   return (
@@ -191,11 +196,20 @@ export function ArtistAboutDialog({ artist, open, onOpenChange }: { artist: Base
           <div className="space-y-4">
             {genres.length > 0 && (
               <div className="flex flex-wrap gap-1.5">
-                {genres.map((genre) => (
-                  <span key={genre} className="rounded-full bg-foreground/10 px-2.5 py-1 text-xs font-medium capitalize">
-                    {genre}
-                  </span>
-                ))}
+                {genres.map((genre) => {
+                  // A genre or tag with its own mix leads there (e.g. "queer" to Queer Voices).
+                  const mix = mixSlugs.find((slug) => slug === `genre-${slugOf(genre)}` || slug === tagSlug(genre))
+                  const className = 'rounded-full bg-foreground/10 px-2.5 py-1 text-xs font-medium capitalize'
+                  return mix ? (
+                    <Link key={genre} to={`/listen/official/${mix}`} onClick={() => onOpenChange(false)} className={`${className} transition-colors hover:bg-foreground/20`}>
+                      {genre}
+                    </Link>
+                  ) : (
+                    <span key={genre} className={className}>
+                      {genre}
+                    </span>
+                  )
+                })}
               </div>
             )}
             <p className="whitespace-pre-line text-sm leading-relaxed text-foreground/85">{bio || t.noBio}</p>

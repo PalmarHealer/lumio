@@ -41,6 +41,10 @@ const messages = defineMessages({
     artistsHint:
       'Lädt für alle Künstler*innen vorab, was Lumio zu ihnen zeigt: Beschreibung (Last.fm, Epidemic Sound), Fotos, beliebte Songs, ähnliche Künstler*innen und Links. Danach erscheinen Künstlerseiten sofort. Etwa fünf Sekunden pro Künstler*in.',
     artistsStart: 'Infos vorladen',
+    sound: 'Klang und Tags',
+    soundHint:
+      'Misst jeden Song (Tempo, Tonart, Dur oder Moll, Energie, Dynamik, Helligkeit) an einem Ausschnitt, den Jellyfin kurz umwandelt, und holt die Tags von Song und Künstler*innen von Last.fm. Daraus entstehen die Stimmungs- und Tag-Mixe. Etwa zwei Sekunden pro Song; gespielte Songs werden auch so nach und nach gemessen.',
+    soundStart: 'Songs messen',
     stop: 'Anhalten',
     progress: (done: number, total: number) => `${done} von ${total}`,
     found: (found: number, failed: number) => `${found} mit Ergebnis${failed ? `, ${failed} fehlgeschlagen` : ''}`,
@@ -102,6 +106,10 @@ const messages = defineMessages({
     artistsHint:
       'Fetches ahead what Lumio shows about every artist: biography (Last.fm, Epidemic Sound), photos, popular songs, similar artists and links. Artist pages then open at once. About five seconds an artist.',
     artistsStart: 'Fetch information',
+    sound: 'Sound and tags',
+    soundHint:
+      'Measures every song (tempo, key, major or minor, energy, dynamics, brightness) from an excerpt Jellyfin briefly transcodes, and fetches the song\'s and artists\' tags from Last.fm. The mood and tag mixes are made from these. About two seconds a song; songs that are played get measured bit by bit anyway.',
+    soundStart: 'Measure songs',
     stop: 'Stop',
     progress: (done: number, total: number) => `${done} of ${total}`,
     found: (found: number, failed: number) => `${found} with results${failed ? `, ${failed} failed` : ''}`,
@@ -170,7 +178,7 @@ interface Stored {
   data?: TrackCredits | null
 }
 
-type JobName = 'credits' | 'artists' | 'languages'
+type JobName = 'credits' | 'artists' | 'languages' | 'sound'
 
 /** What the popup shows: a song's metadata, an artist whose information failed, or a film's or series' texts. */
 type Opened =
@@ -324,7 +332,7 @@ function JobSection({
   const control = useMutation({
     mutationFn: async (method: 'POST' | 'DELETE') => {
       // The artist task asks Last.fm with the app's key, the language task TMDb, unless the server has its own.
-      const keys = name === 'artists' ? { lastfmKey: ownKey('lastfm') } : name === 'languages' ? { tmdbKey: ownKey('tmdb') } : {}
+      const keys = name === 'artists' || name === 'sound' ? { lastfmKey: ownKey('lastfm') } : name === 'languages' ? { tmdbKey: ownKey('tmdb') } : {}
       const body = method === 'POST' ? { libraries, ...exclusions, ...keys } : undefined
       const response = await lumioSend(method, `/admin/jobs/${name}`, body)
       if (!response?.ok) throw new Error('Unavailable')
@@ -668,6 +676,7 @@ export function MetadataPage() {
         </Section>
       )}
       <JobSection name="artists" title={t.artists} hint={t.artistsHint} start={t.artistsStart} secondsEach={5} libraries={libraries} exclusions={exclusions} onOpen={setOpened} />
+      <JobSection name="sound" title={t.sound} hint={t.soundHint} start={t.soundStart} secondsEach={2} libraries={libraries} exclusions={exclusions} onOpen={setOpened} />
 
       <BrowseSection onOpen={setOpened} />
 

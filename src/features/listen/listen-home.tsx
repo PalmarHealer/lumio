@@ -41,6 +41,8 @@ const messages = defineMessages({
     radios: 'Radio-Sender für dich',
     forYou: 'Für dich gemacht',
     mixes: 'Deine Mixe',
+    moods: 'Für jede Stimmung',
+    tags: 'Nach Tags',
     fromLibrary: 'Aus der Bibliothek',
     yourPlaylists: 'Deine Playlists',
     newAlbums: 'Neue Alben',
@@ -61,6 +63,8 @@ const messages = defineMessages({
     radios: 'Radio stations for you',
     forYou: 'Made for you',
     mixes: 'Your mixes',
+    moods: 'For every mood',
+    tags: 'By tag',
     fromLibrary: 'From the library',
     yourPlaylists: 'Your playlists',
     newAlbums: 'New albums',
@@ -104,6 +108,8 @@ export function ListenHome() {
   const official = useOfficialPlaylists()
   const forYou = official.playlists.filter((playlist) => FOR_YOU.has(playlist.kind))
   const mixes = official.playlists.filter((playlist) => playlist.kind === 'genre' || playlist.kind === 'decade')
+  const moods = official.playlists.filter((playlist) => playlist.kind === 'mood')
+  const tags = official.playlists.filter((playlist) => playlist.kind === 'tag')
   // The newest songs, the charts and a few "Best of" (the charts first: they are rarer).
   const fromLibrary = [
     ...official.playlists.filter((playlist) => playlist.kind === 'new' || playlist.kind === 'chart'),
@@ -152,6 +158,13 @@ export function ListenHome() {
           ))}
         </CardRow>
       )}
+      {!!moods.length && (
+        <CardRow title={t.moods}>
+          {moods.map((playlist) => (
+            <OfficialCard key={playlist.slug} playlist={playlist} />
+          ))}
+        </CardRow>
+      )}
       {!!mixes.length && (
         <CardRow title={t.mixes}>
           {mixes.slice(0, 12).map((playlist) => (
@@ -175,6 +188,13 @@ export function ListenHome() {
         </CardRow>
       )}
       <MusicRow title={t.newAlbums} items={newest.data} loading={newest.isLoading && musicViews.length > 0} />
+      {!!tags.length && (
+        <CardRow title={t.tags}>
+          {tags.slice(0, 12).map((playlist) => (
+            <OfficialCard key={playlist.slug} playlist={playlist} />
+          ))}
+        </CardRow>
+      )}
       {!!fromLibrary.length && (
         <CardRow title={t.fromLibrary}>
           {fromLibrary.slice(0, 12).map((playlist) => (

@@ -4,6 +4,8 @@ export const loginMessages = defineMessages({
   de: {
     signInTo: 'Bei deinem Jellyfin-Server anmelden',
     server: 'Server',
+    checkingServer: 'Server wird gesucht …',
+    noServer: 'Unter dieser Adresse antwortet kein Jellyfin-Server.',
     withQuickConnect: 'Mit Quick Connect anmelden',
     withPassword: 'Mit Passwort anmelden',
     or: 'oder',
@@ -28,6 +30,8 @@ export const loginMessages = defineMessages({
   en: {
     signInTo: 'Sign in to your Jellyfin server',
     server: 'Server',
+    checkingServer: 'Looking for the server …',
+    noServer: 'No Jellyfin server answers at this address.',
     withQuickConnect: 'Sign in with Quick Connect',
     withPassword: 'Sign in with password',
     or: 'or',

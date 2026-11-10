@@ -65,7 +65,9 @@ export function LoginPage() {
   const { session } = useSession()
   // As typed; "jelly.example.org" becomes https:// (or http:// when only that answers) before anything connects.
   const [serverInput, setServerInput] = useState(DEFAULT_SERVER_URL)
-  const { address: serverUrl } = useServerAddress(serverInput)
+  const { address: serverUrl, reachable, resolving } = useServerAddress(serverInput)
+  // With an address to type, the ways to sign in wait until a Jellyfin server answers there.
+  const serverReady = config.serverLocked || reachable
   const [mode, setMode] = useState<'quick-connect' | 'password'>('quick-connect')
   const t = useMessages(loginMessages)
   const { appName, logo } = useBranding()
@@ -79,7 +81,7 @@ export function LoginPage() {
   const quickConnectEnabled = useQuery({
     queryKey: ['quick-connect-enabled', serverUrl],
     queryFn: () => isQuickConnectEnabled(serverUrl),
-    enabled: URL.canParse(serverUrl),
+    enabled: serverReady && URL.canParse(serverUrl),
     retry: false,
   })
 
@@ -112,9 +114,9 @@ export function LoginPage() {
       {/* The desktop app's window is moved by its top edge (index.css). */}
       <div data-titlebar aria-hidden className="fixed inset-x-0 top-0 h-14" />
       <Card className="w-full max-w-sm">
-        <CardHeader>
+        <CardHeader className="justify-items-center text-center">
           <CardTitle className="text-2xl">
-            {logo ? <img src={logo} alt={appName} className="h-10 w-auto max-w-56 object-contain" /> : appName}
+            {logo ? <img src={logo} alt={appName} className="mx-auto h-10 w-auto max-w-56 object-contain" /> : appName}
           </CardTitle>
           <CardDescription>{t.signInTo}</CardDescription>
         </CardHeader>
@@ -133,10 +135,21 @@ export function LoginPage() {
                 value={serverInput}
                 onChange={(e) => setServerInput(e.target.value)}
               />
+              {serverInput.trim() && !reachable && (
+                <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                  {resolving ? (
+                    <>
+                      <IconLoader2 className="size-4 animate-spin" /> {t.checkingServer}
+                    </>
+                  ) : (
+                    t.noServer
+                  )}
+                </p>
+              )}
             </div>
           )}
 
-          {sso.length > 0 && (
+          {serverReady && sso.length > 0 && (
             <div className="grid gap-2">
               {sso.map((provider) => (
                 <Button key={provider.id} size="lg" onClick={() => window.location.assign(`${serverUrl}/sso/OID/start/${encodeURIComponent(provider.id)}`)}>
@@ -151,9 +164,9 @@ export function LoginPage() {
             </div>
           )}
 
-          {showPassword ? <PasswordForm serverUrl={serverUrl} /> : showQuickConnect ? <QuickConnectPanel serverUrl={serverUrl} /> : null}
+          {!serverReady ? null : showPassword ? <PasswordForm serverUrl={serverUrl} /> : showQuickConnect ? <QuickConnectPanel serverUrl={serverUrl} /> : null}
 
-          {quickConnectEnabled.data && passwordAllowed && (
+          {serverReady && quickConnectEnabled.data && passwordAllowed && (
             <>
               <Separator />
               <Button variant="ghost" onClick={() => setMode(showPassword ? 'quick-connect' : 'password')}>

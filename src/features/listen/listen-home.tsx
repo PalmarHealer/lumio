@@ -1,4 +1,5 @@
 import { IconMicrophone, IconMicrophone2, IconPlayerPauseFilled, IconPlayerPlayFilled } from '@tabler/icons-react'
+import { useQuery } from '@tanstack/react-query'
 import { useEffect, useState, type ReactNode } from 'react'
 import { Link } from '@/components/link'
 import { FadeImage } from '@/components/media/fade-image'
@@ -20,6 +21,8 @@ import { LikedCover, OfficialCard, OfficialCover, PlaylistCard, PlaylistCover } 
 import { useFollowedArtists, useLikedSongs, usePlaylists, usePlaylistTracks } from './playlists'
 import { usePodcast } from './podcasts'
 import { useListeningStats } from './profiles'
+import { useLumioFetch } from '@/features/social/social'
+import { tasteSignalsQuery } from './taste-model'
 import { RadioCard } from './radio-card'
 import { useRecentSources } from './recent'
 import { useNewestAlbums, useRecentAlbums } from './queries'
@@ -95,6 +98,35 @@ const FOR_YOU = new Set<OfficialPlaylist['kind']>(['daylist', 'daily', 'month', 
 
 /** How many tiles the greeting grid holds. */
 const QUICK_TILES = 8
+/** What the grid can show. */
+const QUICK_KINDS = /^(album|artist|playlist|official|liked|podcast)(:|$)/
+/** Played from for at least this many (faded) minutes lately to count as heavy rotation. */
+const HEAVY_MINUTES = 10
+
+/**
+ * The greeting grid: half of it the last things played from, the rest what was played from a lot lately (heavy
+ * rotation, by minutes listened over the last weeks), topped up with more recent ones. Ordered by both: the latest
+ * and the most played lead.
+ */
+function quickPicks(recent: string[], heavy: Record<string, { w: number; t: number }> | undefined, fallback: string[]) {
+  const picks: string[] = []
+  const add = (source: string) => {
+    if (picks.length < QUICK_TILES && QUICK_KINDS.test(source) && !picks.includes(source)) picks.push(source)
+  }
+  const rotation = Object.entries(heavy ?? {})
+    .filter(([, entry]) => entry.w >= HEAVY_MINUTES)
+    .sort((a, b) => b[1].w - a[1].w)
+    .map(([source]) => source)
+  for (const source of recent.slice(0, QUICK_TILES / 2)) add(source)
+  for (const source of rotation) add(source)
+  for (const source of [...recent, ...fallback]) add(source)
+  const most = Math.max(1, ...picks.map((source) => heavy?.[source]?.w ?? 0))
+  const score = (source: string) => {
+    const index = recent.indexOf(source)
+    return (index < 0 ? 0 : 0.5 ** (index / 2)) + (heavy?.[source]?.w ?? 0) / most
+  }
+  return picks.map((source) => ({ source, score: score(source) })).sort((a, b) => b.score - a.score).map((pick) => pick.source)
+}
 
 /** Listen's start page: a greeting with quick access to what was played last, then rows of music and audiobooks. */
 export function ListenHome() {
@@ -129,9 +161,12 @@ export function ListenHome() {
   const rowTitle = artistsRow === 'top' ? t.topArtists : artistsRow === 'followed' ? t.followedArtists : t.newArtists
   // Radios around the artists listened to most lately (or followed).
   const radioArtists = (topArtists.length ? topArtists : followedArtists).slice(0, 8)
-  // The grid: what was played from most recently (any kind), topped up with recently played albums.
+  // The grid: what was played from most recently and what was played a lot lately, topped up with recent albums.
   const sources = useRecentSources()
-  const quick = [...new Set([...sources, ...(recent.data ?? []).map((album) => `album:${album.Id}`)])].slice(0, QUICK_TILES)
+  const { session } = useAuthedSession()
+  const lumioFetch = useLumioFetch()
+  const signals = useQuery(tasteSignalsQuery(session.userId, (path) => lumioFetch(path)))
+  const quick = quickPicks(sources, signals.data?.sources, (recent.data ?? []).map((album) => `album:${album.Id}`))
 
   useEffect(() => {
     if (!recent.isLoading) markAppReady()

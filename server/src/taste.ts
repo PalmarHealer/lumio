@@ -12,6 +12,11 @@ export interface TasteSignals {
   /** The time zone the day parts are in. */
   timeZone: string
   tracks: Record<string, TrackSignals>
+  /**
+   * What they played from lately (the player's source keys, e.g. `playlist:<id>`): minutes listened, fading with a
+   * half-life of a week, and the last time (ms). For the home grid's "heavy rotation".
+   */
+  sources: Record<string, { w: number; t: number }>
 }
 
 export interface TrackSignals {
@@ -48,6 +53,8 @@ const DAY = 24 * 60 * 60_000
 const SHORT_HALF_LIFE = 14 * DAY
 const LONG_HALF_LIFE = 182 * DAY
 const SLOT_HALF_LIFE = 91 * DAY
+const SOURCE_HALF_LIFE = 7 * DAY
+const SOURCE_HORIZON = 60 * DAY
 /** Older plays say too little to be worth reading. */
 const HORIZON = 3 * 365 * DAY
 const JELLYFIN_ID = /^[0-9a-f]{32}$/i
@@ -85,5 +92,12 @@ export function tasteSignals(store: Store, userId: string, timeZone: string, now
     entry.l = round(entry.l)
     entry.d = entry.d.map(round)
   }
-  return { at: now, timeZone, tracks }
+  const sources: Record<string, { w: number; t: number }> = {}
+  for (const play of store.sourceRows(userId, now - SOURCE_HORIZON)) {
+    const entry = (sources[play.source] ??= { w: 0, t: 0 })
+    entry.w += (play.seconds / 60) * 0.5 ** (Math.max(0, now - play.startedAt) / SOURCE_HALF_LIFE)
+    entry.t = Math.max(entry.t, play.startedAt)
+  }
+  for (const entry of Object.values(sources)) entry.w = round(entry.w)
+  return { at: now, timeZone, tracks, sources }
 }

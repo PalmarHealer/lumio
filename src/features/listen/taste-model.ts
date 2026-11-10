@@ -29,6 +29,8 @@ export interface TasteSignals {
   at: number
   timeZone: string
   tracks: Record<string, TrackSignals>
+  /** What was played from lately (source keys): minutes, fading with a half-life of a week, and the last time. */
+  sources?: Record<string, { w: number; t: number }>
 }
 
 const HOUR = 60 * 60_000

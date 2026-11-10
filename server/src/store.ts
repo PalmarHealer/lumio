@@ -391,6 +391,14 @@ export class Store {
     return rows.map((row) => ({ key: row.item_key, startedAt: row.started_at, seconds: row.seconds, reasonEnd: row.reason_end }))
   }
 
+  /** What someone played from (album, playlist …) since a moment: the player's source per play, and how long it ran. */
+  sourceRows(userId: string, since: number) {
+    const rows = this.db
+      .prepare("SELECT source, started_at, seconds FROM plays WHERE user_id = ? AND started_at >= ? AND (source LIKE '%:%' OR source = 'liked') AND source NOT LIKE 'import:%'")
+      .all(userId, since) as Array<{ source: string; started_at: number; seconds: number }>
+    return rows.map((row) => ({ source: row.source, startedAt: row.started_at, seconds: row.seconds }))
+  }
+
   /** The distinct songs someone heard before a moment (key, and title and artist for imported ones). */
   songsBefore(userId: string, before: number) {
     return this.db

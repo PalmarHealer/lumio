@@ -1,6 +1,7 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
 import { ModeTile } from '@/components/app-switcher'
 import { FadeImage } from '@/components/media/fade-image'
+import { useBranding } from '@/features/admin/branding'
 import { defineMessages, useMessages } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { useArtistPhoto } from './artist-photo'
@@ -36,10 +37,15 @@ export function RadioCover({ artist, className }: { artist: BaseItemDto; classNa
     .filter((other, position, list) => other.Id !== artist.Id && list.findIndex((entry) => entry.Id === other.Id) === position)
     .slice(0, 3)
   const h = hue(artist.Id ?? '')
+  const { avatar } = useBranding('listen')
   const [left, right] = similar
   return (
     <div className={cn('relative size-full overflow-hidden @container', className)} style={{ background: `oklch(0.78 0.1 ${h})` }}>
-      <ModeTile mode="listen" className="absolute left-[6%] top-[6%] size-[clamp(14px,11cqw,26px)] rounded-full" />
+      {avatar ? (
+        <img src={avatar} alt="" className="absolute left-[6%] top-[6%] size-[clamp(14px,11cqw,26px)] rounded-full object-cover" />
+      ) : (
+        <ModeTile mode="listen" className="absolute left-[6%] top-[6%] size-[clamp(14px,11cqw,26px)] rounded-full" />
+      )}
       <span className="absolute right-[6%] top-[6%] text-[clamp(9px,7cqw,14px)] font-black tracking-widest text-black/80">RADIO</span>
       {[left, right].map(
         (side, index) =>

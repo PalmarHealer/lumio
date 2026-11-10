@@ -78,7 +78,7 @@ export function PlaylistCover({ playlist, tracks, className }: { playlist: BaseI
 /**
  * The cover of an official playlist, drawn after the Cover-Werkstatt designs (see `official-covers.ts`): genre mixes,
  * "This is …" and the made-for-you playlists each have their own style, the same within each kind. The corner dot
- * carries the platform's initial.
+ * carries the platform account's picture, or its initial without one.
  */
 export function OfficialCover({ playlist, className }: { playlist: OfficialPlaylist; className?: string }) {
   // Radios have their own cover (the artist with similar ones around).
@@ -88,7 +88,7 @@ export function OfficialCover({ playlist, className }: { playlist: OfficialPlayl
 
 function DrawnCover({ playlist, className }: { playlist: OfficialPlaylist; className?: string }) {
   const { api } = useAuthedSession()
-  const { appName } = useBranding('listen')
+  const { appName, avatar } = useBranding('listen')
   const t = useMessages(messages)
   const canvas = useRef<HTMLCanvasElement>(null)
   // The artist is known only by id here (no image tags): asked for straight away; a missing photo leaves the gradient.
@@ -109,12 +109,13 @@ function DrawnCover({ playlist, className }: { playlist: OfficialPlaylist; class
     if (!element) return
     let cancelled = false
     let photo: HTMLImageElement | null = null
+    let markImage: HTMLImageElement | null = null
     const draw = () => {
       if (cancelled || !element.clientWidth) return
       // Sharp on high-density screens, never bigger than the design grid.
       const size = Math.min(1080, Math.round(element.clientWidth * window.devicePixelRatio))
       if (element.width !== size) element.width = element.height = size
-      drawCover(element, { style, seed: playlist.slug, title, subtitle, mark: appName, photo })
+      drawCover(element, { style, seed: playlist.slug, title, subtitle, mark: appName, markImage, photo })
     }
     void coverFontsReady().then(draw)
     if (photoUrl) {
@@ -125,13 +126,21 @@ function DrawnCover({ playlist, className }: { playlist: OfficialPlaylist; class
       }
       image.src = photoUrl
     }
+    if (avatar) {
+      const image = new Image()
+      image.onload = () => {
+        markImage = image
+        void coverFontsReady().then(draw)
+      }
+      image.src = avatar
+    }
     const observer = new ResizeObserver(() => void coverFontsReady().then(draw))
     observer.observe(element)
     return () => {
       cancelled = true
       observer.disconnect()
     }
-  }, [style, playlist.slug, title, subtitle, appName, photoUrl])
+  }, [style, playlist.slug, title, subtitle, appName, avatar, photoUrl])
 
   return <canvas ref={canvas} role="img" aria-label={playlist.title} className={cn('block size-full', className)} />
 }

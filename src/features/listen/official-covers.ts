@@ -22,6 +22,8 @@ export interface CoverSpec {
   subtitle?: string
   /** One letter in a corner dot: the platform's mark. */
   mark?: string
+  /** The platform account's picture, filling the corner dot instead of the letter. */
+  markImage?: HTMLImageElement | null
   photo?: HTMLImageElement | null
 }
 
@@ -202,9 +204,19 @@ function photo(ctx: CanvasRenderingContext2D, image: HTMLImageElement | null | u
   ctx.restore()
 }
 
-function cornerMark(ctx: CanvasRenderingContext2D, text: string | undefined, x: number, y: number, fill: string, ink: string) {
-  if (!text) return
+function cornerMark(ctx: CanvasRenderingContext2D, text: string | undefined, image: HTMLImageElement | null | undefined, x: number, y: number, fill: string, ink: string) {
   const r = S * 0.034
+  if (image?.naturalWidth) {
+    ctx.save()
+    ctx.beginPath()
+    ctx.arc(x, y, r, 0, Math.PI * 2)
+    ctx.clip()
+    const scale = (2 * r) / Math.min(image.naturalWidth, image.naturalHeight)
+    ctx.drawImage(image, x - (image.naturalWidth * scale) / 2, y - (image.naturalHeight * scale) / 2, image.naturalWidth * scale, image.naturalHeight * scale)
+    ctx.restore()
+    return
+  }
+  if (!text) return
   ctx.fillStyle = fill
   ctx.beginPath()
   ctx.arc(x, y, r, 0, Math.PI * 2)
@@ -292,7 +304,7 @@ function drawMix(ctx: CanvasRenderingContext2D, spec: CoverSpec, p: Palette, see
     ctx.fillStyle = rgba(p.ink, 0.72)
     fillLine(ctx, spec.subtitle, x, top - S * 0.03, S * 0.78)
   }
-  cornerMark(ctx, spec.mark, S * 0.075, S * 0.075, p.ink, p.bg)
+  cornerMark(ctx, spec.mark, spec.markImage, S * 0.075, S * 0.075, p.ink, p.bg)
 }
 
 function drawStimmung(ctx: CanvasRenderingContext2D, spec: CoverSpec, p: Palette, seed: number) {
@@ -324,7 +336,7 @@ function drawStimmung(ctx: CanvasRenderingContext2D, spec: CoverSpec, p: Palette
     ctx.fillStyle = rgba(p.ink, 0.6)
     fillLine(ctx, spec.subtitle, x, top - S * 0.035, S * 0.82)
   }
-  cornerMark(ctx, spec.mark, S * 0.075, S * 0.075, p.ink, p.bg)
+  cornerMark(ctx, spec.mark, spec.markImage, S * 0.075, S * 0.075, p.ink, p.bg)
 }
 
 function drawFoto(ctx: CanvasRenderingContext2D, spec: CoverSpec, p: Palette, seed: number) {
@@ -362,7 +374,7 @@ function drawFoto(ctx: CanvasRenderingContext2D, spec: CoverSpec, p: Palette, se
     bar(spec.subtitle.toUpperCase(), size, y - fitted.size * 0.86 - size * 0.42, SUB_FONT, 900, '#ffffff', '#111111')
   }
   fitted.lines.forEach((line, i) => bar(line, fitted.size, y + i * lh, family, weight, p.accent, p.ink))
-  cornerMark(ctx, spec.mark, S * 0.075, S * 0.075, '#ffffff', '#111111')
+  cornerMark(ctx, spec.mark, spec.markImage, S * 0.075, S * 0.075, '#ffffff', '#111111')
 }
 
 /** Block: a band of colour on top with the title set large, the picture (the chart's number one) below. */
@@ -387,7 +399,7 @@ function drawBlock(ctx: CanvasRenderingContext2D, spec: CoverSpec, p: Palette, s
     ctx.fillStyle = rgba(p.ink, 0.8)
     fillLine(ctx, spec.subtitle.toUpperCase(), x, band - S * 0.05, S * 0.86)
   }
-  cornerMark(ctx, spec.mark, S * 0.93, S * 0.075, p.ink, p.accent)
+  cornerMark(ctx, spec.mark, spec.markImage, S * 0.93, S * 0.075, p.ink, p.accent)
 }
 
 const DRAW: Record<CoverStyle, typeof drawMix> = { mix: drawMix, stimmung: drawStimmung, foto: drawFoto, block: drawBlock }

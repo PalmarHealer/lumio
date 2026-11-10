@@ -1,5 +1,5 @@
 import { getImageApi } from '@jellyfin/sdk/lib/utils/api/image-api'
-import { IconLayoutDashboard, IconTags } from '@tabler/icons-react'
+import { IconAdjustments, IconLayoutDashboard, IconTags } from '@tabler/icons-react'
 import { shellMessages } from '@/components/messages'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { useAuthedSession } from '@/features/auth/session'
@@ -17,17 +17,19 @@ const ADMIN_PAGES = [
   { path: '/metadata', labelKey: 'metadata', icon: IconTags },
 ] as const
 
-/** Where an administrator can go: Lumio's server-wide settings, then Jellyfin's dashboard pages. */
+/** Where an administrator can go: Lumio's server-wide settings (one entry, the rest is reached from there), then Jellyfin's dashboard pages. */
 export function useAdminLinks() {
   const { session } = useAuthedSession()
   const user = useUserConfiguration()
   const t = useMessages(shellMessages)
-  const pages = useSettingsPages().filter((page) => page.admin)
+  const firstAdminPage = useSettingsPages().find((page) => page.admin)
   if (!user.data?.Policy?.IsAdministrator) return []
   // Behind Lumio (same address) Jellyfin's pages open in place, and leaving them comes back here; elsewhere in a new tab.
   const sameOrigin = session.serverUrl.replace(/\/+$/, '') === window.location.origin
   return [
-    ...pages.map(({ to, label, icon }) => ({ key: to, label, icon, to, href: undefined, external: false })),
+    ...(firstAdminPage
+      ? [{ key: 'lumio', label: t.lumioSettings, icon: IconAdjustments, to: firstAdminPage.to, href: undefined, external: false }]
+      : []),
     ...ADMIN_PAGES.map(({ path, labelKey, icon }) => ({
       key: path,
       label: t[labelKey],

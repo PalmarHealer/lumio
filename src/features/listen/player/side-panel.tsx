@@ -1008,7 +1008,7 @@ export function LyricsView({ track, big }: { track: BaseItemDto; big: boolean })
           {line.text || '♪'}
         </p>
       ))}
-      <p className="pt-4 text-xs text-white/60">{t.lyricsFrom(lyricsSourceName(lyrics.data?.source ?? 'jellyfin'))}</p>
+      <p className="pt-4 text-xs text-white/60">{t.lyricsFrom(lyrics.data?.sourceName ?? lyricsSourceName(lyrics.data?.source ?? 'jellyfin'))}</p>
     </div>
   )
 }

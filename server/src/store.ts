@@ -480,6 +480,12 @@ export class Store {
     return row ? { data: JSON.parse(row.data) as unknown, source: row.source, at: row.at } : null
   }
 
+  /** Every track with kept lyrics: whether they are synced, and where they came from. */
+  lyricsIndex(): Record<string, { synced: boolean; source: string }> {
+    const rows = this.db.prepare("SELECT item_id, json_extract(data, '$.synced') AS synced, source FROM lyrics").all() as Array<{ item_id: string; synced: number | null; source: string }>
+    return Object.fromEntries(rows.map((row) => [row.item_id, { synced: !!row.synced, source: row.source }]))
+  }
+
   setLyrics(id: string, data: unknown, source: string) {
     this.db
       .prepare('INSERT INTO lyrics (item_id, data, source, at) VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET data = excluded.data, source = excluded.source, at = excluded.at')

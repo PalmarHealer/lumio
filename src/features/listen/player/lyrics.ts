@@ -20,6 +20,8 @@ export interface Lyrics {
   synced: boolean
   /** 'jellyfin', 'lrclib' or a plugin's provider id (see lyricsSourceName). */
   source: string
+  /** How the source calls itself, when it isn't one Lumio knows (lyrics a tool added on the server). */
+  sourceName?: string
 }
 
 /** "[01:23.45] text" lines of an LRC file; lines without a timestamp are skipped when any line has one. */
@@ -49,8 +51,9 @@ export function lyricsOptions(api: Api, item: BaseItemDto | undefined) {
     queryKey: ['lyrics', item?.Id],
     // Podcasts have no lyrics.
     enabled: !!item?.Id && !externalOf(item),
-    // Lyrics don't change: kept (also across restarts, see query-persist) as long as the saved data is.
-    staleTime: Infinity,
+    // Lyrics don't change: kept (also across restarts, see query-persist) as long as the saved data is. "None" is asked
+    // again after a while: a provider, or an admin's tool, may have found them since.
+    staleTime: (query) => (query.state.data ? Infinity : 12 * 60 * 60_000),
     gcTime: 30 * 24 * 60 * 60_000,
     retry: false,
     queryFn: async (): Promise<Lyrics | null> => {

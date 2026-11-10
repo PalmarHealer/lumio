@@ -1575,16 +1575,22 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     return send(response, 200, { tracks, artists })
   }
 
+  // GET /admin/lyrics: every track with kept lyrics ({id: {synced, source}}), for tools that fill the gaps.
+  if (path === '/admin/lyrics' && request.method === 'GET') {
+    if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
+    return send(response, 200, store.lyricsIndex())
+  }
+
   // GET /music/lyrics/:id: a track's lyrics as a source outside Jellyfin (lrclib, a plugin's) gave them once.
-  // PUT /music/lyrics/:id {lines: [{time?, text}], synced, source}: kept for everyone. Anyone may fill a gap or turn
-  // plain lyrics into synced ones; only administrators replace what is there.
+  // PUT /music/lyrics/:id {lines: [{time?, text}], synced, source, sourceName?}: kept for everyone. Anyone may fill a
+  // gap or turn plain lyrics into synced ones; only administrators replace what is there.
   const lyrics = path.match(/^\/music\/lyrics\/([0-9a-f-]{32,36})$/i)
   if (lyrics) {
     const id = lyrics[1]!.toLowerCase()
     const stored = store.lyrics(id)
     if (request.method === 'GET') return stored ? send(response, 200, { ...(stored.data as object), source: stored.source }) : send(response, 404, { error: 'No lyrics' })
     if (request.method === 'PUT') {
-      const body = await readJson<{ lines?: unknown; synced?: unknown; source?: unknown }>(request).catch(() => null)
+      const body = await readJson<{ lines?: unknown; synced?: unknown; source?: unknown; sourceName?: unknown }>(request).catch(() => null)
       const source = typeof body?.source === 'string' && /^[a-z0-9][a-z0-9_.-]{0,59}$/i.test(body.source) ? body.source : null
       if (!source || !Array.isArray(body?.lines) || !body.lines.length || body.lines.length > 2000) return send(response, 400, { error: 'Bad lyrics' })
       const lines = (body.lines as Array<{ time?: unknown; text?: unknown }>).map((line) => ({
@@ -1594,7 +1600,8 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       const synced = body.synced === true && lines.some((line) => line.time !== undefined)
       const upgrade = !!stored && synced && !(stored.data as { synced?: boolean }).synced
       if (stored && !upgrade && !isAdmin(tokenOf(request, url))) return send(response, 409, { error: 'Lyrics are kept already' })
-      store.setLyrics(id, { lines, synced }, source)
+      const sourceName = typeof body?.sourceName === 'string' && body.sourceName.trim() ? body.sourceName.trim().slice(0, 60) : undefined
+      store.setLyrics(id, { lines, synced, ...(sourceName ? { sourceName } : {}) }, source)
       return send(response, 204)
     }
   }

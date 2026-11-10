@@ -62,6 +62,8 @@ export function useBranding(mode?: AppMode) {
     logo: (light && config.logoLight) || config.logo,
     modeLabel: mode ? own?.label?.trim() || DEFAULT_MODE_LABELS[mode] : undefined,
     modeLogo: (light && own?.logoLight) || own?.logo,
+    /** The platform account's picture (Listen). */
+    avatar: (light && own?.avatarLight) || own?.avatar,
     /** The header shows the app's label only, not the instance's name. */
     hideName: !!own?.hideName,
     config,

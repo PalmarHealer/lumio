@@ -97,6 +97,18 @@ export function BrandingPage() {
                 onLightChange={(logoLight) => editMode({ logoLight })}
                 previewClassName="h-10 w-32"
               />
+              {mode === 'listen' && (
+                <ImageRow
+                  label={t.platformAvatar}
+                  hint={t.platformAvatarHint}
+                  value={own.avatar}
+                  light={own.avatarLight}
+                  maxSize={512}
+                  onChange={(avatar) => editMode({ avatar })}
+                  onLightChange={(avatarLight) => editMode({ avatarLight })}
+                  previewClassName="size-10 rounded-full"
+                />
+              )}
             </Fragment>
           )
         })}

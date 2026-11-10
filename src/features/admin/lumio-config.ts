@@ -52,6 +52,10 @@ export interface ModeBranding {
   logo?: string
   /** This app's logo for the light look (optional). */
   logoLight?: string
+  /** Listen only: picture of the platform's own account (owner of the official playlists); else its mark. */
+  avatar?: string
+  /** That picture for the light look (optional). */
+  avatarLight?: string
   /** Shows only the app's label (with its switcher) in the header, without the instance's name. */
   hideName?: boolean
   /** This app's accent as #rrggbb (Watch: buttons and highlights; Listen: also its play buttons); else the overall one. */

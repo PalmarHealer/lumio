@@ -33,7 +33,7 @@ const messages = defineMessages({
  */
 export function PlatformPage() {
   const t = useMessages(messages)
-  const { appName, logo } = useBranding('listen')
+  const { appName, logo, avatar } = useBranding('listen')
   const { playlists, isLoading } = useOfficialPlaylists()
   const rows: Array<{ title: string; kinds: OfficialPlaylist['kind'][] }> = [
     { title: t.madeForYou, kinds: ['top', 'month', 'new', 'rediscover'] },
@@ -46,7 +46,13 @@ export function PlatformPage() {
       <div className="pt-14" style={{ background: tintWash('color-mix(in srgb, var(--color-listen) 45%, black)') }}>
         <div className="flex flex-col gap-6 px-4 pb-6 pt-10 sm:flex-row sm:items-end sm:px-8">
           <div className="grid size-48 shrink-0 place-items-center overflow-hidden rounded-full bg-background shadow-2xl shadow-black/50 sm:size-56">
-            {logo ? <img src={logo} alt="" className="size-2/3 object-contain" /> : <ModeTile mode="listen" className="size-full rounded-full [&_svg]:size-1/2" />}
+            {avatar ? (
+              <img src={avatar} alt="" className="size-full object-cover" />
+            ) : logo ? (
+              <img src={logo} alt="" className="size-2/3 object-contain" />
+            ) : (
+              <ModeTile mode="listen" className="size-full rounded-full [&_svg]:size-1/2" />
+            )}
           </div>
           <div className="min-w-0 space-y-3">
             <p className="text-sm font-medium">{t.profile}</p>

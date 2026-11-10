@@ -60,11 +60,11 @@ export function AppBrand({ mode, className, collapsibleName }: { mode: AppMode; 
       <Link to={modeHome(mode)} className="flex min-w-0 items-center gap-2 text-lg font-semibold tracking-tight outline-none focus-visible:ring-2 focus-visible:ring-ring" aria-label={`${appName} ${modeLabel}`}>
         {modeLogo ? (
           <img src={modeLogo} alt="" className="h-7 w-auto min-w-0 max-w-44 object-contain" />
+        ) : logo ? (
+          <img src={logo} alt="" className="h-7 w-auto min-w-0 max-w-40 object-contain" />
         ) : hideName ? (
           // Only the app's own mark; its name follows as the switcher.
           <ModeTile mode={mode} />
-        ) : logo ? (
-          <img src={logo} alt="" className="h-7 w-auto min-w-0 max-w-40 object-contain" />
         ) : (
           <>
             <ModeTile mode={mode} />
@@ -76,29 +76,29 @@ export function AppBrand({ mode, className, collapsibleName }: { mode: AppMode; 
           </>
         )}
       </Link>
-      {!modeLogo &&
-        (switchable ? (
-          <Popover open={open} onOpenChange={setOpen}>
-            <PopoverTrigger
-              aria-label={t.switchApp}
-              title={t.switchApp}
-              className={cn(
-                'flex shrink-0 items-center gap-0.5 rounded-md px-1.5 py-1 text-lg font-semibold tracking-tight outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring',
-                MODE_STYLE[mode].text,
-              )}
-            >
-              {modeLabel}
-              <IconChevronDown className="size-4 opacity-70" />
-            </PopoverTrigger>
-            <PopoverContent align="start" className="w-72 p-1.5">
-              {APP_MODES.map((entry) => (
-                <ModeEntry key={entry} mode={entry} current={entry === mode} description={t[entry]} onPick={() => pick(entry)} />
-              ))}
-            </PopoverContent>
-          </Popover>
-        ) : (
-          <span className={cn('text-lg font-semibold tracking-tight', MODE_STYLE[mode].text)}>{modeLabel}</span>
-        ))}
+      {switchable ? (
+        <Popover open={open} onOpenChange={setOpen}>
+          <PopoverTrigger
+            aria-label={t.switchApp}
+            title={t.switchApp}
+            className={cn(
+              'flex shrink-0 items-center gap-0.5 rounded-md px-1.5 py-1 text-lg font-semibold tracking-tight outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring',
+              MODE_STYLE[mode].text,
+            )}
+          >
+            {/* An app's own logo already says which app it is: then only the arrow opens the switcher. */}
+            {!modeLogo && modeLabel}
+            <IconChevronDown className="size-4 opacity-70" />
+          </PopoverTrigger>
+          <PopoverContent align="start" className="w-72 p-1.5">
+            {APP_MODES.map((entry) => (
+              <ModeEntry key={entry} mode={entry} current={entry === mode} description={t[entry]} onPick={() => pick(entry)} />
+            ))}
+          </PopoverContent>
+        </Popover>
+      ) : (
+        !modeLogo && <span className={cn('text-lg font-semibold tracking-tight', MODE_STYLE[mode].text)}>{modeLabel}</span>
+      )}
     </div>
   )
 }

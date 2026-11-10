@@ -311,10 +311,10 @@ function OwnerByline({ userId }: { userId: string }) {
 
 /** The platform as an owner: the instance's mark and name, like "Spotify" under its own playlists; opens its profile. */
 function PlatformByline() {
-  const { appName } = useBranding('listen')
+  const { appName, avatar } = useBranding('listen')
   return (
     <Link to="/listen/platform" className="flex items-center gap-1.5 font-bold text-foreground hover:underline">
-      <ModeTile mode="listen" className="size-5 rounded-full" /> {appName}
+      {avatar ? <img src={avatar} alt="" className="size-5 rounded-full object-cover" /> : <ModeTile mode="listen" className="size-5 rounded-full" />} {appName}
     </Link>
   )
 }

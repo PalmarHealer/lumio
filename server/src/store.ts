@@ -7,7 +7,7 @@ import type { Label, Localized, LocalizedMeta } from './languages.ts'
  * What the Lumio server keeps (SQLite, one file): the people who used it (name and picture tag as Jellyfin reported
  * them, so others can see who they are), who follows whom, each person's privacy choices, what they last played, and
  * their Lumio settings that follow the account (the app decides which; the server keeps them as one JSON object),
- * the credits looked up for the library's tracks (see credits.ts), and films' and series' texts and pictures in both
+ * the credits looked up for the library's tracks (see credits.ts), lyrics found outside Jellyfin, and films' and series' texts and pictures in both
  * languages (see languages.ts), shared by everyone.
  */
 export interface Privacy {
@@ -160,6 +160,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS localized_label ON localized (label);
       CREATE TABLE IF NOT EXISTS track_sound (item_id TEXT PRIMARY KEY, data TEXT, tags TEXT, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS artist_tags (artist_id TEXT PRIMARY KEY, name TEXT NOT NULL, tags TEXT NOT NULL, at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS lyrics (item_id TEXT PRIMARY KEY, data TEXT NOT NULL, source TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS playlist_adds (playlist_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (playlist_id, item_id));
     `)
     // How a play went (music too): why it started and ended, where it came from, shuffle, from the device, buffering.
@@ -471,6 +472,18 @@ export class Store {
   artistTags(): Record<string, { tags: string[]; at: number }> {
     const rows = this.db.prepare('SELECT artist_id, tags, at FROM artist_tags').all() as Array<{ artist_id: string; tags: string; at: number }>
     return Object.fromEntries(rows.map((row) => [row.artist_id, { tags: JSON.parse(row.tags) as string[], at: row.at }]))
+  }
+
+  /** A track's lyrics as an outside source gave them once (kept for good, so they stay when the source goes away). */
+  lyrics(id: string): { data: unknown; source: string; at: number } | null {
+    const row = this.db.prepare('SELECT data, source, at FROM lyrics WHERE item_id = ?').get(id) as { data: string; source: string; at: number } | undefined
+    return row ? { data: JSON.parse(row.data) as unknown, source: row.source, at: row.at } : null
+  }
+
+  setLyrics(id: string, data: unknown, source: string) {
+    this.db
+      .prepare('INSERT INTO lyrics (item_id, data, source, at) VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET data = excluded.data, source = excluded.source, at = excluded.at')
+      .run(id, JSON.stringify(data), source, Date.now())
   }
 
   /** The credits looked up for these tracks (null: looked up, none found); tracks never looked up are left out. */

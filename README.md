@@ -256,6 +256,11 @@ export default function setup(lumio) {
   `home:hero`, `home:<row id>`, `item:ratings`, `item:links`.
 - Events: `navigate`, `item`, `playback:start`, `playback:stop`.
 - `lumio.jellyfin` gives the signed-in session (`api`, `serverUrl`, `userId`, `accessToken`, `isAdmin`).
+- Lyrics providers: `lumio.addLyricsProvider({ id, name, find })`. `find(track)` gets `{ id, title, artists, album,
+  albumArtist, duration, musicBrainzTrackId, isrc }` and returns `{ lrc, plain }` (either may be missing) or null.
+  Providers are asked in order after Jellyfin and lrclib, for songs that have no synced lyrics yet. What one finds is
+  kept on the Lumio server for everyone, so each song is asked about once and keeps its lyrics if the provider later
+  stops working. `find` runs in the browser: the source has to allow cross-origin requests.
 - Plugins are code, so in a browser they only run for the server this Lumio belongs to, not for one a visitor signs in
   to by address. Lumio's apps run the plugins of the server their user picked.
 

@@ -1,6 +1,7 @@
 import type { Api } from '@jellyfin/sdk'
 import { useEffect, useRef, useSyncExternalStore } from 'react'
 import { getLocale, type Locale } from '@/lib/i18n'
+import { addLyricsProvider, type LyricsProvider } from '@/features/listen/player/lyrics-providers'
 import type { PluginEntry } from './lumio-config'
 
 /**
@@ -83,6 +84,11 @@ export interface LumioPluginApi {
   /** A page of the settings (e.g. an admin tool), listed in their navigation. */
   addSettingsPage(page: PluginSettingsPage): Dispose
   hide(target: HideTarget): Dispose
+  /**
+   * A source of song lyrics, asked (after Jellyfin and lrclib) about songs that have none yet; what it finds is kept
+   * on the Lumio server, so it is asked once per song.
+   */
+  addLyricsProvider(provider: LyricsProvider): Dispose
   /** Changes data before it is shown, e.g. 'homeRows' (the rows of the home page). */
   transform<T>(name: string, fn: (value: T, context?: Record<string, unknown>) => T): Dispose
   on(event: PluginEvent, handler: (payload: unknown) => void): Dispose
@@ -221,6 +227,9 @@ function createApi(disposers: Dispose[]): LumioPluginApi {
           return index < 0 ? current : { ...current, hidden: current.hidden.filter((_, i) => i !== index) }
         }),
       )
+    },
+    addLyricsProvider(provider) {
+      return track(addLyricsProvider(provider))
     },
     transform(name, fn) {
       const generic = fn as (value: unknown, context?: Record<string, unknown>) => unknown

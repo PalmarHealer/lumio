@@ -79,7 +79,7 @@ export async function lumioGet(path: string): Promise<Response | null> {
 }
 
 /** A request with a JSON body (or none) to the Lumio server outside React; null when there is no connection yet. */
-export async function lumioSend(method: 'POST' | 'DELETE', path: string, body?: unknown): Promise<Response | null> {
+export async function lumioSend(method: 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown): Promise<Response | null> {
   if (!connection) return null
   return fetch(`${connection.base}${path}`, {
     method,

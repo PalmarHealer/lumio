@@ -156,11 +156,13 @@ const RELAY_SERVICES: Record<string, RelayService> = {
     ttl: 180 * 24 * HOUR,
     spacing: 120,
   },
-  // lrclib: lyrics. A song's lyrics don't change: kept half a year; "none found" is asked again after a week.
+  // lrclib: lyrics (an exact match, else a search). A song's lyrics don't change: kept half a year; "none found" is
+  // asked again after a week.
   lyrics: {
     base: 'https://lrclib.net/',
-    paths: /^api\/get$/,
-    ttl: (status) => (status === 404 ? 7 * 24 * HOUR : 180 * 24 * HOUR),
+    paths: /^api\/(get|search)$/,
+    // A search that finds nothing answers 200 with an empty list, so searches are asked again after a week too.
+    ttl: (status, path) => (status === 404 || path === 'api/search' ? 7 * 24 * HOUR : 180 * 24 * HOUR),
     spacing: 100,
     headers: { 'User-Agent': USER_AGENT },
     keep: (status) => status < 400 || status === 404,
@@ -1571,6 +1573,30 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     }
     const artists = Object.fromEntries(Object.entries(store.artistTags()).map(([id, entry]) => [id, entry.tags]))
     return send(response, 200, { tracks, artists })
+  }
+
+  // GET /music/lyrics/:id: a track's lyrics as a source outside Jellyfin (lrclib, a plugin's) gave them once.
+  // PUT /music/lyrics/:id {lines: [{time?, text}], synced, source}: kept for everyone. Anyone may fill a gap or turn
+  // plain lyrics into synced ones; only administrators replace what is there.
+  const lyrics = path.match(/^\/music\/lyrics\/([0-9a-f-]{32,36})$/i)
+  if (lyrics) {
+    const id = lyrics[1]!.toLowerCase()
+    const stored = store.lyrics(id)
+    if (request.method === 'GET') return stored ? send(response, 200, { ...(stored.data as object), source: stored.source }) : send(response, 404, { error: 'No lyrics' })
+    if (request.method === 'PUT') {
+      const body = await readJson<{ lines?: unknown; synced?: unknown; source?: unknown }>(request).catch(() => null)
+      const source = typeof body?.source === 'string' && /^[a-z0-9][a-z0-9_.-]{0,59}$/i.test(body.source) ? body.source : null
+      if (!source || !Array.isArray(body?.lines) || !body.lines.length || body.lines.length > 2000) return send(response, 400, { error: 'Bad lyrics' })
+      const lines = (body.lines as Array<{ time?: unknown; text?: unknown }>).map((line) => ({
+        ...(typeof line?.time === 'number' && Number.isFinite(line.time) && line.time >= 0 ? { time: line.time } : {}),
+        text: typeof line?.text === 'string' ? line.text.slice(0, 500) : '',
+      }))
+      const synced = body.synced === true && lines.some((line) => line.time !== undefined)
+      const upgrade = !!stored && synced && !(stored.data as { synced?: boolean }).synced
+      if (stored && !upgrade && !isAdmin(tokenOf(request, url))) return send(response, 409, { error: 'Lyrics are kept already' })
+      store.setLyrics(id, { lines, synced }, source)
+      return send(response, 204)
+    }
   }
 
   // POST /me/imports/:source {plays: [...]}: a part of the person's listening history from another service (Spotify),

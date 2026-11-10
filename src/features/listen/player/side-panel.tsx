@@ -22,6 +22,7 @@ import { defineMessages, getLocaleTag, useLocale, useMessages } from '@/lib/i18n
 import { portraitImageUrl } from '@/lib/images'
 import { cn } from '@/lib/utils'
 import { useLyrics } from './lyrics'
+import { lyricsSourceName } from './lyrics-providers'
 import { playerBarMessages } from './messages'
 import { currentTrack, music, useMusic, type QueueKind } from './music-player'
 import { closeListenPanel, openListenPanel, RIGHT_LIMITS, setListenLayout, setListenPanelExpanded, setListenPanelPeek, toggleListenPanel, type ListenPanel, useListenLayout, useListenPanel } from './panel'
@@ -1007,7 +1008,7 @@ export function LyricsView({ track, big }: { track: BaseItemDto; big: boolean })
           {line.text || '♪'}
         </p>
       ))}
-      <p className="pt-4 text-xs text-white/60">{t.lyricsFrom(lyrics.data?.source === 'lrclib' ? 'LRCLIB' : 'Jellyfin')}</p>
+      <p className="pt-4 text-xs text-white/60">{t.lyricsFrom(lyricsSourceName(lyrics.data?.source ?? 'jellyfin'))}</p>
     </div>
   )
 }

@@ -1,7 +1,7 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
 import { ContextMenu } from '@base-ui/react/context-menu'
 import { IconDots, IconLoader2, IconPlayerPauseFilled, IconPlayerPlayFilled, IconSearch, IconX } from '@tabler/icons-react'
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router'
 import { Link } from '@/components/link'
 import { FadeImage } from '@/components/media/fade-image'
@@ -14,7 +14,9 @@ import { currentTrack, music, useMusic } from '@/features/listen/player/music-pl
 import { usePodcastSearch } from '@/features/listen/podcasts'
 import { TrackMenuItems } from '@/features/listen/track-menu'
 import { portraitImageUrl } from '@/lib/images'
-import { itemHref, SQUARE_TYPES } from '@/lib/item-links'
+import { artistHref } from '@/features/listen/credits'
+import { TrackArtists } from '@/features/listen/track-artists'
+import { artistsOf, itemHref, SQUARE_TYPES } from '@/lib/item-links'
 import { inMode, useAppMode } from '@/lib/app-mode'
 import { useMessages } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -91,7 +93,16 @@ export function HeaderSearch({ persistent = false }: { persistent?: boolean }) {
       key: item.Id!,
       href: itemHref(item),
       title: displayName(item),
-      meta: [types[item.Type ?? ''], item.Type === 'Episode' ? item.SeriesName : item.Type === 'MusicAlbum' ? item.AlbumArtist : item.ProductionYear].filter(Boolean).join(' · '),
+      meta: [
+        types[item.Type ?? ''],
+        item.Type === 'Episode'
+          ? item.SeriesName
+          : item.Type === 'MusicAlbum' || item.Type === 'Audio'
+            ? artistsOf(item).map((artist) => artist.name).join(', ')
+            : item.ProductionYear,
+      ]
+        .filter(Boolean)
+        .join(' · '),
       image: portraitImageUrl(api, item, { fillHeight: 120 }),
       shape: item.Type === 'MusicArtist' ? ('round' as const) : SQUARE_TYPES.has(item.Type ?? '') || item.Type === 'Playlist' ? ('square' as const) : ('poster' as const),
     })),
@@ -311,6 +322,10 @@ export function HeaderSearch({ persistent = false }: { persistent?: boolean }) {
               onRemove={showingRecent ? () => recent.remove(entry.key) : undefined}
               // The field loses the focus to the menu; the list stays open meanwhile.
               onMenuOpen={() => setOpenOn(pathname)}
+              onLeave={() => {
+                close()
+                input.current?.blur()
+              }}
             />
           ))}
           {!showingRecent && entries.length > 0 && (
@@ -343,6 +358,7 @@ function ResultRow({
   onPlay,
   onRemove,
   onMenuOpen,
+  onLeave,
 }: {
   index: number
   entry: SearchEntry
@@ -354,8 +370,11 @@ function ResultRow({
   onPlay?: () => void
   onRemove?: () => void
   onMenuOpen: () => void
+  /** An artist's link was followed: the search closes as when a result is chosen. */
+  onLeave: () => void
 }) {
   const t = useMessages(searchMessages)
+  const types: Record<string, string> = useMessages(typeLabels)
   const state = useMusic()
   const shape = entry.shape === 'poster' ? 'aspect-[2/3] rounded' : entry.shape === 'round' ? 'aspect-square rounded-full' : 'aspect-square rounded'
   const { target } = entry
@@ -373,25 +392,51 @@ function ResultRow({
       onMouseEnter={onHover}
       className={cn('group/result relative flex items-center rounded-md transition-colors', active ? 'bg-foreground/10' : 'hover:bg-foreground/[0.07]')}
     >
+      {/* Covers the whole row behind its content, so the artists' own links can sit inside it (links can't nest). */}
       <Link
         to={entry.href}
         viewTransition
+        aria-label={entry.title}
         // Arrow keys move through the options from the input (aria-activedescendant); Tab leaves the search.
         tabIndex={-1}
         onClick={(event) => {
           event.preventDefault()
           onChoose()
         }}
-        className="flex min-w-0 flex-1 items-center gap-3 p-2 outline-none"
-      >
+        className="absolute inset-0 rounded-md outline-none"
+      />
+      <div className="pointer-events-none relative flex min-w-0 flex-1 items-center gap-3 p-2">
         <div className={cn('w-11 shrink-0 overflow-hidden bg-muted', shape)}>
           {entry.image && <FadeImage src={entry.image} alt="" className="size-full object-cover" />}
         </div>
         <div className="min-w-0">
           <p className={cn('truncate text-[15px] font-medium', current && 'text-listen')}>{entry.title}</p>
-          <p className="truncate text-sm text-muted-foreground">{entry.meta}</p>
+          <p className="truncate text-sm text-muted-foreground">
+            {item?.Type === 'Audio' || item?.Type === 'MusicAlbum' ? (
+              <>
+                {types[item.Type]} ·{' '}
+                {/* Only the names take clicks; the rest of the line still opens the result. */}
+                <span className="pointer-events-auto" onClick={(event) => (event.target as Element).closest('a') && onLeave()}>
+                {item.Type === 'Audio' ? (
+                  <TrackArtists track={item} />
+                ) : (
+                  artistsOf(item).map((artist, index) => (
+                    <Fragment key={artist.id ?? artist.name}>
+                      {index > 0 && ', '}
+                      <Link to={artistHref(artist)} className="hover:text-foreground hover:underline">
+                        {artist.name}
+                      </Link>
+                    </Fragment>
+                  ))
+                )}
+                </span>
+              </>
+            ) : (
+              entry.meta
+            )}
+          </p>
         </div>
-      </Link>
+      </div>
       {onPlay && (
         <button
           type="button"
@@ -409,7 +454,7 @@ function ResultRow({
         </button>
       )}
       {(menu || onRemove) && (
-        <div className="flex shrink-0 items-center gap-0.5 pr-2">
+        <div className="relative flex shrink-0 items-center gap-0.5 pr-2">
           {menu && (
             <DropdownMenu onOpenChange={(open) => open && onMenuOpen()}>
               <DropdownMenuTrigger

@@ -39,6 +39,7 @@ import { useHeldByDownload } from './download-ui'
 import { useUnavailable } from './availability'
 import { MediaAdminMenu } from '@/features/admin/media-admin'
 import { displayName } from '@/lib/unscanned'
+import { MissingCover } from './missing-cover'
 
 const messages = defineMessages({
   de: {
@@ -144,7 +145,7 @@ export function AlbumView({ item }: { item: BaseItemDto }) {
             label={item.Name ?? ''}
             className="size-48 shrink-0 overflow-hidden rounded-md bg-muted shadow-2xl shadow-black/50 sm:size-56"
           >
-            {cover && <FadeImage src={cover} alt="" className="size-full object-cover" />}
+            {cover ? <FadeImage src={cover} alt="" className="size-full object-cover" /> : <MissingCover type={item.Type} iconClassName="size-1/3" stroke={1.25} />}
           </ImageLightbox>
           <div className="min-w-0 space-y-3">
             <p className="text-sm font-medium">{kindOf(list.length, t, isBook)}</p>
@@ -357,7 +358,7 @@ export function TrackTableRow({
             )}
           </span>
           <span className="flex min-w-0 items-center gap-3">
-            {cover && <span className="size-10 shrink-0 overflow-hidden rounded bg-muted">{image && <FadeImage src={image} alt="" className="size-full object-cover" />}</span>}
+            {cover && <span className="size-10 shrink-0 overflow-hidden rounded bg-muted">{image ? <FadeImage src={image} alt="" className="size-full object-cover" /> : <MissingCover type={track.Type} />}</span>}
             <span className="min-w-0">
               <span className={cn('block truncate', isCurrent ? 'text-listen' : 'text-foreground')}>{displayName(track)}</span>
               {/* Keeps its line when there are no artists yet, so every row is as tall. */}

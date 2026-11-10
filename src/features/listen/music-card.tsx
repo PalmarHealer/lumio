@@ -1,7 +1,7 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
 import { BaseItemKind, ItemSortBy, SortOrder } from '@jellyfin/sdk/lib/generated-client/models'
 import { getLibraryApi } from '@jellyfin/sdk/lib/utils/api/library-api'
-import { IconMicrophone2, IconPlayerPauseFilled, IconPlayerPlayFilled } from '@tabler/icons-react'
+import { IconPlayerPauseFilled, IconPlayerPlayFilled } from '@tabler/icons-react'
 import { useQueryClient } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { Link } from '@/components/link'
@@ -21,6 +21,7 @@ import { ContextMenu } from '@base-ui/react/context-menu'
 import { DropdownMenuContent } from '@/components/ui/dropdown-menu'
 import { AlbumMenuItems, ArtistMenuItems } from './library-menu'
 import { TrackArtists } from './track-artists'
+import { MissingCover } from './missing-cover'
 
 const messages = defineMessages({
   de: { artist: 'Künstler', play: (name: string) => `${name} abspielen`, pause: (name: string) => `${name} pausieren` },
@@ -143,9 +144,7 @@ export function MusicCard({ item, className, subtitle }: { item: BaseItemDto; cl
         image ? (
           <FadeImage src={image} alt="" loading="lazy" className="size-full object-cover" />
         ) : (
-          <div className="grid size-full place-items-center text-muted-foreground">
-            <IconMicrophone2 className="size-1/3" stroke={1.25} />
-          </div>
+          <MissingCover type={item.Type} iconClassName="size-1/3" stroke={1.25} />
         )
       }
     />

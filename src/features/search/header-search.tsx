@@ -24,6 +24,7 @@ import { searchMessages, typeLabels } from './messages'
 import { canPlay, usePlayResult } from './play-result'
 import { useRecentSearches, type SearchEntry, type SearchTarget } from './recent-searches'
 import { displayName } from '@/lib/unscanned'
+import { MissingCover } from '@/features/listen/missing-cover'
 
 const TYPE_ORDER = ['Movie', 'Series', 'BoxSet', 'MusicArtist', 'MusicAlbum', 'Playlist', 'AudioBook', 'Book', 'Episode', 'Audio']
 const DEBOUNCE_MS = 200
@@ -407,7 +408,11 @@ function ResultRow({
       />
       <div className="pointer-events-none relative flex min-w-0 flex-1 items-center gap-3 p-2">
         <div className={cn('w-11 shrink-0 overflow-hidden bg-muted', shape)}>
-          {entry.image && <FadeImage src={entry.image} alt="" className="size-full object-cover" />}
+          {entry.image ? (
+            <FadeImage src={entry.image} alt="" className="size-full object-cover" />
+          ) : (
+            entry.target.kind === 'item' && ['MusicArtist', 'MusicAlbum', 'Audio'].includes(entry.target.type) && <MissingCover type={entry.target.type} />
+          )}
         </div>
         <div className="min-w-0">
           <p className={cn('truncate text-[15px] font-medium', current && 'text-listen')}>{entry.title}</p>

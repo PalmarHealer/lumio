@@ -8,7 +8,6 @@ import {
   IconChevronRight,
   IconFolder,
   IconFolderOpen,
-  IconMicrophone2,
   IconPinnedFilled,
   IconPlus,
   IconVolume,
@@ -50,6 +49,7 @@ import { useFollowedArtists, useLikedSongs, useListenLibrary, usePlaylistActions
 import { useTrackDrop } from './track-drag'
 import { useArtistPhoto } from './artist-photo'
 import { useDownloadedKeys } from './player/downloads'
+import { MissingCover } from './missing-cover'
 
 const messages = defineMessages({
   de: {
@@ -833,9 +833,7 @@ function ItemEntry({ item, compact, subtitle, round, ...extra }: { item: BaseIte
         image ? (
           <FadeImage src={image} alt="" className="size-full object-cover" />
         ) : (
-          <div className="grid size-full place-items-center bg-muted text-muted-foreground">
-            <IconMicrophone2 className="size-1/2" stroke={1.5} />
-          </div>
+          <MissingCover type={item.Type} />
         )
       }
     />

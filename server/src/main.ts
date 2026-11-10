@@ -13,6 +13,7 @@ import { creditsOfRecording, lookupCredits, sameName, searchRecordings, type Fai
 import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, type Privacy } from './store.ts'
 import { tasteSignals, type TasteSignals } from './taste.ts'
 import { SOUND_VERSION } from './sound-analysis.ts'
+import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
 import { LANGS, detectLanguage, localizeTitle, type Lang, type LanguageDeps, type LocalImage, type LocalImageKind, type Localized, type LocalizedMeta, type Texts, type VideoItem } from './languages.ts'
@@ -47,6 +48,13 @@ const SSO_PROVIDERS = (process.env.SSO_PROVIDERS ?? '')
     return { id: id.trim(), label: label.join(':').trim() || id.trim() }
   })
   .filter((provider) => /^[\w.-]+$/.test(provider.id))
+/**
+ * Searching songs by their lyrics, in Meilisearch (e.g. the one the Jellyfin plugin uses, in an index of Lumio's own):
+ * its address and a key that may write and search that index. Without both, the search is off.
+ */
+const MEILI_URL = process.env.MEILI_URL?.trim()
+const MEILI_KEY = process.env.MEILI_KEY?.trim()
+const MEILI_LYRICS_INDEX = process.env.MEILI_LYRICS_INDEX?.trim() || 'lumio_lyrics'
 const PORT = Number(process.env.PORT ?? 8097)
 const DATA_DIR = process.env.DATA_DIR ?? './data'
 /** Lumio's own apps, which carry the pages themselves: Android (Capacitor) is https://localhost, desktop app://lumio. */
@@ -175,6 +183,7 @@ if (!JELLYFIN_URL) {
 }
 
 const store = new Store(DATA_DIR)
+const lyricsIndex = MEILI_URL && MEILI_KEY ? lyricsSearch(MEILI_URL, MEILI_KEY, MEILI_LYRICS_INDEX) : null
 
 // ---- authentication: the user's own Jellyfin token ----
 
@@ -725,7 +734,7 @@ async function creditsFor(id: string, meta: TrackMeta): Promise<TrackCredits | n
   return lookup
 }
 
-type JobName = 'credits' | 'artists' | 'languages' | 'sound'
+type JobName = 'credits' | 'artists' | 'languages' | 'sound' | 'lyrics'
 
 /** The administrators' tasks on the library, each running on its own (one run at a time). */
 const jobs: Record<JobName, JobState & { stop?: boolean }> = {
@@ -733,6 +742,7 @@ const jobs: Record<JobName, JobState & { stop?: boolean }> = {
   artists: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
   languages: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
   sound: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
+  lyrics: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
 }
 
 /**
@@ -997,6 +1007,84 @@ function queueSound(id: string, token: string) {
   })()
 }
 
+// ---- finding songs by their lyrics (see lyrics-search.ts) ----
+
+/**
+ * A song's lyrics as the app shows them: Jellyfin's (embedded, .lrc files, a lyrics plugin's), else what the server
+ * kept from a source outside Jellyfin. Null when there are none.
+ */
+async function songLyrics(token: string, id: string): Promise<string[] | null> {
+  const response = await fetch(`${JELLYFIN_URL}/Audio/${id}/Lyrics`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal: AbortSignal.timeout(15_000) })
+  if (response.ok) {
+    const lines = ((await response.json()) as { Lyrics?: Array<{ Text?: string | null }> }).Lyrics?.map((line) => line.Text ?? '') ?? []
+    if (lines.some((line) => line.trim())) return lines
+  } else if (response.status !== 404) throw new Error(`Jellyfin ${response.status}`)
+  const kept = store.lyrics(id.toLowerCase())?.data as { lines?: Array<{ text?: string }> } | undefined
+  const lines = kept?.lines?.map((line) => line.text ?? '') ?? []
+  return lines.some((line) => line.trim()) ? lines : null
+}
+
+/** Puts every song's lyrics into the search index that isn't there yet (songs Jellyfin and the server have none for are skipped at once). */
+function scanLyrics(token: string, userId: string, scope: Scope = NO_SCOPE) {
+  type LyricsTrack = Track & { HasLyrics?: boolean }
+  return runJob<LyricsTrack>(
+    jobs.lyrics,
+    async () => {
+      if (!lyricsIndex) throw new Error('Meilisearch is not set up (MEILI_URL, MEILI_KEY)')
+      await lyricsIndex.load()
+      const kept = store.lyricsIndex()
+      const tracks = await libraryItems<LyricsTrack>(token, userId, '/Users/{user}/Items', { Recursive: 'true', IncludeItemTypes: 'Audio', Fields: 'Genres' }, scope.libraries)
+      // Jellyfin says which songs have lyrics (older versions don't: then each is asked).
+      const knows = tracks.some((track) => track.HasLyrics !== undefined)
+      return tracks.filter(
+        (track) =>
+          (!knows || track.HasLyrics || kept[track.Id.toLowerCase()]) && !lyricsIndex.has(track.Id) && !leftOut(scope, [...(track.Artists ?? []), track.AlbumArtist], track.Genres),
+      )
+    },
+    async (track) => {
+      const lines = await songLyrics(token, track.Id)
+      if (lines) await lyricsIndex!.put([{ id: track.Id, lines }])
+      return !!lines
+    },
+    (track) => ({ id: track.Id, title: track.Name ?? '', artist: track.Artists?.[0] ?? track.AlbumArtist ?? '' }),
+  )
+}
+
+/** Songs someone played that aren't in the lyrics index yet, put in one after another with their token. */
+const lyricsQueue = new Map<string, string>()
+let lyricsRunning = false
+/** When songs were last found without lyrics (asked again a day later, not on every play). */
+const withoutLyrics = new Map<string, number>()
+
+function queueLyrics(id: string, token: string) {
+  if (!lyricsIndex || lyricsQueue.has(id) || jobs.lyrics.running || Date.now() - (withoutLyrics.get(id) ?? 0) < 24 * HOUR) return
+  lyricsQueue.set(id, token)
+  if (lyricsRunning) return
+  lyricsRunning = true
+  void (async () => {
+    try {
+      await lyricsIndex.load()
+      while (lyricsQueue.size) {
+        const [next, nextToken] = lyricsQueue.entries().next().value as [string, string]
+        lyricsQueue.delete(next)
+        if (lyricsIndex.has(next)) continue
+        try {
+          const lines = await songLyrics(nextToken, next)
+          if (lines) await lyricsIndex.put([{ id: next, lines }])
+          else withoutLyrics.set(next, Date.now())
+        } catch (error) {
+          console.warn(`Lyrics of ${next}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+    } catch (error) {
+      console.warn(`Lyrics index: ${error instanceof Error ? error.message : String(error)}`)
+      lyricsQueue.clear()
+    } finally {
+      lyricsRunning = false
+    }
+  })()
+}
+
 // ---- films and series in two languages (see languages.ts) ----
 
 /** TMDb and Jellyfin as the language task reads them, with the caller's token (and the app's TMDb key, if it has one). */
@@ -1124,7 +1212,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
   if (path === '/public' && request.method === 'GET') {
     // Which outside services this server has keys for: the app asks them through it then (it needs no keys of its own).
     const services = Object.fromEntries((['lastfm', 'concerts', 'tmdb'] as const).map((name) => [name, !!RELAY_SERVICES[name]?.key?.value]))
-    return send(response, 200, { sso: SSO_PROVIDERS, proxy: PROXY_JELLYFIN, services, passwordLogin: !DISABLE_PASSWORD_LOGIN })
+    return send(response, 200, { sso: SSO_PROVIDERS, proxy: PROXY_JELLYFIN, services, passwordLogin: !DISABLE_PASSWORD_LOGIN, lyricsSearch: !!lyricsIndex })
   }
   // Lumio's apps from the newest GitHub Release: the list (download dialog, update checks), and each file by its kind
   // (the browser is sent on to it, so a link here always gives the newest).
@@ -1313,10 +1401,11 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     }
   }
 
-  // /admin/jobs/<credits|artists|languages|sound>: an admin's task on the whole library (POST starts, DELETE stops, GET
-  // tells how far it is): looking up every track's credits, fetching every artist's information into the caches,
-  // filling in films and series in both languages, or measuring every song's sound and fetching its tags.
-  const jobName = path.match(/^\/admin\/jobs\/(credits|artists|languages|sound)$/)?.[1] as JobName | undefined
+  // /admin/jobs/<credits|artists|languages|sound|lyrics>: an admin's task on the whole library (POST starts, DELETE
+  // stops, GET tells how far it is): looking up every track's credits, fetching every artist's information into the
+  // caches, filling in films and series in both languages, measuring every song's sound and fetching its tags, or
+  // putting every song's lyrics into the search index.
+  const jobName = path.match(/^\/admin\/jobs\/(credits|artists|languages|sound|lyrics)$/)?.[1] as JobName | undefined
   if (jobName) {
     if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
     const job = jobs[jobName]
@@ -1333,6 +1422,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
         genres: texts(body.excludeGenres),
       }
       if (jobName === 'credits') void scanCredits(token, me.id, scope)
+      else if (jobName === 'lyrics') void scanLyrics(token, me.id, scope)
       else if (jobName === 'languages') void scanLanguages(token, me.id, isTmdbKey(body.tmdbKey) ? body.tmdbKey : undefined, scope.libraries)
       else {
         const lastfmKey = typeof body.lastfmKey === 'string' && /^[0-9a-f]{32}$/i.test(body.lastfmKey) ? body.lastfmKey : undefined
@@ -1540,7 +1630,11 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
         album: text(body?.album),
       })
       // A song not measured yet is measured now, in the background (for the mood mixes).
-      if (body?.kind === 'audio' && /^[0-9a-f]{32}$/i.test(key)) queueSound(key, tokenOf(request, url)!)
+      if (body?.kind === 'audio' && /^[0-9a-f]{32}$/i.test(key)) {
+        queueSound(key, tokenOf(request, url)!)
+        // And its lyrics go into the search index.
+        queueLyrics(key, tokenOf(request, url)!)
+      }
       return send(response, 204)
     }
     if (request.method === 'GET') {
@@ -1573,6 +1667,27 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     }
     const artists = Object.fromEntries(Object.entries(store.artistTags()).map(([id, entry]) => [id, entry.tags]))
     return send(response, 200, { tracks, artists })
+  }
+
+  // GET /music/lyrics-search?q=…: songs whose lyrics have these words ({items, snippets: {id: lines around the match}}),
+  // only those the person may see (Jellyfin is asked for them with their token). 404 when the search is off.
+  if (path === '/music/lyrics-search' && request.method === 'GET') {
+    if (!lyricsIndex) return send(response, 404, { error: 'Lyrics search is off' })
+    const query = (url.searchParams.get('q') ?? '').trim().slice(0, 200)
+    if (query.length < 3) return send(response, 200, { items: [], snippets: {} })
+    try {
+      const hits = await lyricsIndex.search(query, 30)
+      if (!hits.length) return send(response, 200, { items: [], snippets: {} })
+      const params = new URLSearchParams({ Ids: hits.map((hit) => hit.id).join(','), Fields: 'PrimaryImageAspectRatio', EnableUserData: 'true' })
+      const found = await fetch(`${JELLYFIN_URL}/Users/${me.id}/Items?${params}`, { headers: { Authorization: `MediaBrowser Token="${tokenOf(request, url)}"` }, signal: AbortSignal.timeout(15_000) })
+      if (!found.ok) return send(response, 502, { error: `Jellyfin ${found.status}` })
+      const byId = new Map((((await found.json()) as { Items?: Array<{ Id: string }> }).Items ?? []).map((item) => [item.Id, item]))
+      // In Meilisearch's order (the best match first).
+      const visible = hits.filter((hit) => byId.has(hit.id))
+      return send(response, 200, { items: visible.map((hit) => byId.get(hit.id)), snippets: Object.fromEntries(visible.map((hit) => [hit.id, hit.snippet])) })
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Failed' })
+    }
   }
 
   // GET /admin/lyrics: every track with kept lyrics ({id: {synced, source}}), for tools that fill the gaps.
@@ -1608,6 +1723,8 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       if (stored && !upgrade && !isAdmin(tokenOf(request, url))) return send(response, 409, { error: 'Lyrics are kept already' })
       const sourceName = typeof body?.sourceName === 'string' && body.sourceName.trim() ? body.sourceName.trim().slice(0, 60) : undefined
       store.setLyrics(id, { lines, synced, ...(sourceName ? { sourceName } : {}) }, source)
+      // Searchable at once.
+      void lyricsIndex?.put([{ id, lines: lines.map((line) => line.text) }]).catch((error: unknown) => console.warn(`Lyrics index: ${error instanceof Error ? error.message : String(error)}`))
       return send(response, 204)
     }
   }

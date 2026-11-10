@@ -6,6 +6,7 @@ import { PodcastSearchRow } from '@/features/listen/podcast-pages'
 import { useAppMode } from '@/lib/app-mode'
 import { useMessages } from '@/lib/i18n'
 import { HeaderSearch } from './header-search'
+import { LyricsSearchSection } from './lyrics-search'
 import { groupTitles, searchMessages } from './messages'
 
 const GROUPS: Array<{ type: keyof (typeof groupTitles)['de']; shape?: 'poster' | 'landscape' }> = [
@@ -55,7 +56,8 @@ export function SearchPage() {
       {groups.map((group) => (
         <MediaRow key={group.type} title={titles[group.type]} items={group.items} shape={group.shape} />
       ))}
-      {/* Listen also searches the podcast directory. */}
+      {/* Listen also finds songs by their lyrics, and searches the podcast directory. */}
+      {mode === 'listen' && term && <LyricsSearchSection term={term} />}
       {mode === 'listen' && term && <PodcastSearchRow term={term} />}
     </div>
   )

@@ -299,6 +299,7 @@ export function TrackTableRow({
   onPlay,
   cover,
   extra,
+  note,
   onRemove,
 }: {
   track: BaseItemDto
@@ -308,6 +309,8 @@ export function TrackTableRow({
   cover?: boolean
   /** A column before the length, e.g. the play count. */
   extra?: ReactNode
+  /** A line under the artists, e.g. where the search found the song's lyrics. */
+  note?: ReactNode
   /** For a playlist's own entries: removes this one from the playlist. */
   onRemove?: () => void
 }) {
@@ -366,6 +369,7 @@ export function TrackTableRow({
                 {/* All of them, with the featured artists (as Spotify lists them on an album too). */}
                 <TrackArtists track={track} stopPropagation />
               </span>
+              {note}
             </span>
           </span>
           {extra !== undefined && <span className="hidden min-w-0 justify-end text-right text-sm tabular-nums text-muted-foreground sm:flex max-md:hidden">{extra}</span>}

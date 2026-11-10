@@ -8,6 +8,8 @@ export interface PublicConfig {
   proxy: boolean
   /** Whether the sign-in page offers a Jellyfin password form (off: SSO and Quick Connect only). */
   passwordLogin?: boolean
+  /** Whether songs can be found by their lyrics (the server has Meilisearch). */
+  lyricsSearch?: boolean
 }
 
 /** What the Lumio server tells before anyone is signed in; nothing when there is no Lumio server. */

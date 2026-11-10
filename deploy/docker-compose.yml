@@ -25,6 +25,10 @@ services:
       # LASTFM_API_KEY: ""
       # TICKETMASTER_API_KEY: ""
       # TMDB_API_KEY: ""
+      # Optional: finding songs by their lyrics, in the Meilisearch the Jellyfin plugin uses (a key for Lumio's index
+      # only, see docs/SETUP.md).
+      # MEILI_URL: http://meilisearch:7700
+      # MEILI_KEY: ""
     volumes:
       - lumio-data:/data
     # Only your reverse proxy needs to reach it; publish the port only without one.

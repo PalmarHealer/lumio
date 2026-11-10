@@ -107,6 +107,20 @@ Lumio searches through Jellyfin. The [Meilisearch plugin](https://github.com/arn
 makes that search fast and forgiving (typos, partial words), for Lumio and every other app. Run a `meilisearch`
 container in the stack and give Jellyfin `MEILI_URL` and `MEILI_MASTER_KEY`, as the plugin's README describes.
 
+The same Meilisearch lets Listen's search find songs by a line of their lyrics (a section "In lyrics"). Lumio keeps
+them in an index of its own (`lumio_lyrics`, or `MEILI_LYRICS_INDEX`) and needs a key for just that index, not the
+master key. Create it once (inside the stack, with the master key):
+
+```sh
+curl -X POST http://meilisearch:7700/keys   -H "Authorization: Bearer $MEILI_MASTER_KEY" -H "Content-Type: application/json"   -d '{"name":"lumio","actions":["search","documents.add","documents.get","indexes.create","indexes.get","settings.update"],"indexes":["lumio_lyrics"],"expiresAt":null}'
+```
+
+and give Lumio `MEILI_URL` and the returned `key` as `MEILI_KEY`. Then fill the index once under Administration →
+Metadata → *Lyrics search*: it takes the lyrics Jellyfin has (embedded, `.lrc` files, a lyrics plugin's) and the ones
+Lumio kept from lrclib. Songs played later, and lyrics Lumio finds later, are added by themselves. Meilisearch only
+ever hears from Lumio's server; what it finds is checked against Jellyfin, so people only see songs from libraries they
+may open.
+
 ### Skipping intros and credits (Intro Skipper)
 
 Lumio offers "Skip intro" / "Skip credits" (or skips by itself, set per user under Settings → Controls) wherever

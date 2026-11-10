@@ -14,6 +14,7 @@ import { LanguageDialog, useLocalizedChanged, type AdminLocalized } from './lang
 import { ArtistMetadataDialog, TrackMetadataDialog, type TrackCredits, type TrackMetaInfo } from './metadata-dialogs'
 import { useIsAdmin, useSaveConfig } from './use-admin-config'
 import { hasService, ownKey } from '@/lib/services'
+import { usePublicConfig } from '@/lib/public-config'
 import { toast } from 'sonner'
 
 const messages = defineMessages({
@@ -45,6 +46,10 @@ const messages = defineMessages({
     soundHint:
       'Misst jeden Song (Tempo, Tonart, Dur oder Moll, Energie, Dynamik, Helligkeit) an einem Ausschnitt, den Jellyfin kurz umwandelt, und holt die Tags von Song und Künstler*innen von Last.fm. Daraus entstehen die Stimmungs- und Tag-Mixe. Etwa zwei Sekunden pro Song; gespielte Songs werden auch so nach und nach gemessen.',
     soundStart: 'Songs messen',
+    lyrics: 'Liedtext-Suche',
+    lyricsHint:
+      'Legt die Liedtexte aller Songs in Meilisearch ab, damit die Suche Songs auch über eine Zeile ihres Textes findet: was Jellyfin hat (eingebettet, .lrc-Dateien, Lyrics-Plugins) und was Lumio von außerhalb gespeichert hat. Songs ohne Liedtext werden übersprungen; gespielte Songs kommen auch so nach und nach dazu. Braucht MEILI_URL und MEILI_KEY am Lumio-Server.',
+    lyricsStart: 'Liedtexte aufnehmen',
     stop: 'Anhalten',
     progress: (done: number, total: number) => `${done} von ${total}`,
     found: (found: number, failed: number) => `${found} mit Ergebnis${failed ? `, ${failed} fehlgeschlagen` : ''}`,
@@ -110,6 +115,10 @@ const messages = defineMessages({
     soundHint:
       'Measures every song (tempo, key, major or minor, energy, dynamics, brightness) from an excerpt Jellyfin briefly transcodes, and fetches the song\'s and artists\' tags from Last.fm. The mood and tag mixes are made from these. About two seconds a song; songs that are played get measured bit by bit anyway.',
     soundStart: 'Measure songs',
+    lyrics: 'Lyrics search',
+    lyricsHint:
+      'Puts every song\'s lyrics into Meilisearch, so the search also finds songs by a line of their lyrics: what Jellyfin has (embedded, .lrc files, lyrics plugins) and what Lumio kept from outside. Songs without lyrics are skipped; songs that are played get added bit by bit anyway. Needs MEILI_URL and MEILI_KEY on the Lumio server.',
+    lyricsStart: 'Add lyrics',
     stop: 'Stop',
     progress: (done: number, total: number) => `${done} of ${total}`,
     found: (found: number, failed: number) => `${found} with results${failed ? `, ${failed} failed` : ''}`,
@@ -178,7 +187,7 @@ interface Stored {
   data?: TrackCredits | null
 }
 
-type JobName = 'credits' | 'artists' | 'languages' | 'sound'
+type JobName = 'credits' | 'artists' | 'languages' | 'sound' | 'lyrics'
 
 /** What the popup shows: a song's metadata, an artist whose information failed, or a film's or series' texts. */
 type Opened =
@@ -584,6 +593,7 @@ function LanguageReviewSection({ running, onOpen }: { running: boolean; onOpen: 
 /** Administration: the tasks that fill in the library from outside (they run on the Lumio server), and their results. */
 export function MetadataPage() {
   const t = useMessages(messages)
+  const publicConfig = usePublicConfig().data
   const locale = getLocaleTag(useLocale())
   const isAdmin = useIsAdmin()
   const config = useLumioConfig().data ?? {}
@@ -677,6 +687,9 @@ export function MetadataPage() {
       )}
       <JobSection name="artists" title={t.artists} hint={t.artistsHint} start={t.artistsStart} secondsEach={5} libraries={libraries} exclusions={exclusions} onOpen={setOpened} />
       <JobSection name="sound" title={t.sound} hint={t.soundHint} start={t.soundStart} secondsEach={2} libraries={libraries} exclusions={exclusions} onOpen={setOpened} />
+      {publicConfig?.lyricsSearch && (
+        <JobSection name="lyrics" title={t.lyrics} hint={t.lyricsHint} start={t.lyricsStart} secondsEach={0.1} libraries={libraries} exclusions={exclusions} onOpen={setOpened} />
+      )}
 
       <BrowseSection onOpen={setOpened} />
 

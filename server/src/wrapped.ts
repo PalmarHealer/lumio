@@ -95,7 +95,7 @@ export function validTimeZone(name: string | null) {
 const formatters = new Map<string, Intl.DateTimeFormat>()
 
 /** A moment's year, month (0-based), day, hour and weekday (0 = Monday) in a time zone. */
-function partsIn(at: number, timeZone: string) {
+export function partsIn(at: number, timeZone: string) {
   let format = formatters.get(timeZone)
   if (!format) {
     format = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', weekday: 'short', hourCycle: 'h23' })

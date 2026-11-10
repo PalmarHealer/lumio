@@ -214,6 +214,14 @@ export async function fetchSimilarArtists(name: string): Promise<string[]> {
   return (data.similarartists?.artist ?? []).map((artist) => artist.name)
 }
 
+/** An artist's tags on Last.fm (genres, moods), most used first; empty without Last.fm. */
+export async function fetchArtistTags(name: string): Promise<string[]> {
+  if (!hasService('lastfm')) return []
+  type Response = { toptags?: { tag?: Array<{ name: string; count?: number | string }> } }
+  const data = await lastfm<Response>({ method: 'artist.gettoptags', artist: name })
+  return (data.toptags?.tag ?? []).filter((tag) => Number(tag.count ?? 0) >= 10).map((tag) => tag.name.toLowerCase())
+}
+
 // ---- an artist's links (MusicBrainz) ----
 
 export interface ArtistLink {

@@ -381,6 +381,14 @@ export class Store {
       .all(userId, before) as Array<{ artist: string | null; subtitle: string | null; first: number }>
   }
 
+  /** Someone's song plays since a moment (imported ones too), for the taste signals the mixes are built from. */
+  tasteRows(userId: string, since: number) {
+    const rows = this.db
+      .prepare("SELECT item_key, started_at, seconds, reason_end FROM plays WHERE user_id = ? AND kind = 'audio' AND started_at >= ?")
+      .all(userId, since) as Array<{ item_key: string; started_at: number; seconds: number; reason_end: string | null }>
+    return rows.map((row) => ({ key: row.item_key, startedAt: row.started_at, seconds: row.seconds, reasonEnd: row.reason_end }))
+  }
+
   /** The distinct songs someone heard before a moment (key, and title and artist for imported ones). */
   songsBefore(userId: string, before: number) {
     return this.db

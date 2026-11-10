@@ -603,8 +603,12 @@ export function setAutoplayProvider(next: typeof autoplay) {
   autoplay = next
 }
 
-/** How many autoplay songs are kept decided ahead, once the collection has run out. */
+/**
+ * How many autoplay songs are kept decided ahead, once the collection has run out: below `AUTOPLAY_AHEAD` it tops up
+ * to `AUTOPLAY_FILL`, so between 10 and 20 are always lined up.
+ */
 const AUTOPLAY_AHEAD = 10
+const AUTOPLAY_FILL = 20
 
 /** Autoplay songs lined up after the current track. */
 const autoplayAhead = () => state.entries.slice(state.index + 1).filter((item) => item.kind === 'autoplay').length
@@ -612,7 +616,7 @@ const autoplayAhead = () => state.entries.slice(state.index + 1).filter((item) =
 const contextAhead = () => state.entries.slice(state.index + 1).filter((item) => item.kind === 'context').length
 
 /**
- * Once nothing of the collection is left to play, keeps `AUTOPLAY_AHEAD` similar songs lined up after everything
+ * Once nothing of the collection is left to play, keeps 10–20 similar songs lined up after everything
  * else (the user's queue still plays first). They are not the user's queue: clearing it leaves them.
  */
 async function extendQueue() {
@@ -620,11 +624,11 @@ async function extendQueue() {
   if (state.index < 0 || contextAhead() > 0 || autoplayAhead() >= AUTOPLAY_AHEAD) return
   extending = true
   try {
-    for (let attempt = 0; attempt < 3 && autoplayAhead() < AUTOPLAY_AHEAD; attempt++) {
+    for (let attempt = 0; attempt < 3 && autoplayAhead() < AUTOPLAY_FILL; attempt++) {
       const known = new Set(state.queue.map((item) => item.Id))
       const more = (await autoplay(state.queue)).filter((item) => item.Id && !known.has(item.Id))
       if (!more.length) break
-      const add = more.slice(0, AUTOPLAY_AHEAD - autoplayAhead() + 5)
+      const add = more.slice(0, AUTOPLAY_FILL - autoplayAhead())
       setState({ queue: [...state.queue, ...add], entries: [...state.entries, ...add.map(() => entry('autoplay'))] })
     }
   } catch {

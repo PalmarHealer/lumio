@@ -11,6 +11,7 @@ import { isPrivateAddress } from './addresses.ts'
 import { latestApps } from './apps.ts'
 import { creditsOfRecording, lookupCredits, sameName, searchRecordings, type Failure, type JobState, type TrackCredits, type TrackMeta } from './credits.ts'
 import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, type Privacy } from './store.ts'
+import { tasteSignals, type TasteSignals } from './taste.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
 import { LANGS, detectLanguage, localizeTitle, type Lang, type LanguageDeps, type LocalImage, type LocalImageKind, type Localized, type LocalizedMeta, type Texts, type VideoItem } from './languages.ts'
 
@@ -206,6 +207,8 @@ function tokenOf(request: IncomingMessage, url: URL) {
 // ---- live updates (server-sent events) ----
 
 const streams = new Map<string, Set<ServerResponse>>()
+/** The taste signals last made per person and time zone (see GET /me/taste). */
+const tasteCache = new Map<string, TasteSignals>()
 
 function push(userId: string, event: string, data: unknown) {
   for (const response of streams.get(userId) ?? []) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
@@ -1445,6 +1448,18 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       const before = Number(url.searchParams.get('before')) || undefined
       return send(response, 200, store.plays(me.id, limit, before))
     }
+  }
+
+  // GET /me/taste?tz=: the person's listening per song (plays now and over time, skips, times of day), which the app
+  // builds its mixes and radios from. Made at most every two minutes.
+  if (path === '/me/taste' && request.method === 'GET') {
+    const timeZone = validTimeZone(url.searchParams.get('tz'))
+    const key = `${me.id}|${timeZone}`
+    const cached = tasteCache.get(key)
+    if (cached && Date.now() - cached.at < 2 * 60_000) return send(response, 200, cached)
+    const signals = tasteSignals(store, me.id, timeZone)
+    tasteCache.set(key, signals)
+    return send(response, 200, signals)
   }
 
   // POST /me/imports/:source {plays: [...]}: a part of the person's listening history from another service (Spotify),

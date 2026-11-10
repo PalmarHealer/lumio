@@ -13,7 +13,7 @@ import { itemHref } from '@/lib/item-links'
 import { cn } from '@/lib/utils'
 import { CardRow, MusicRow, usePlayCollection } from './music-card'
 import { FollowedPodcastsRow } from './podcast-pages'
-import { useOfficialPlaylist, useOfficialPlaylists } from './official'
+import { useOfficialPlaylist, useOfficialPlaylists, type OfficialPlaylist } from './official'
 import { playCircle } from './play-circle'
 import { music, START, useMusic } from './player/music-player'
 import { LikedCover, OfficialCard, OfficialCover, PlaylistCard, PlaylistCover } from './playlist-cards'
@@ -39,7 +39,9 @@ const messages = defineMessages({
     pause: (name: string) => `${name} pausieren`,
     recent: 'Zuletzt gehört',
     radios: 'Radio-Sender für dich',
-    forYou: 'Deine Mixe',
+    forYou: 'Für dich gemacht',
+    mixes: 'Deine Mixe',
+    fromLibrary: 'Aus der Bibliothek',
     yourPlaylists: 'Deine Playlists',
     newAlbums: 'Neue Alben',
     topArtists: 'Deine meistgehörten Künstler',
@@ -57,7 +59,9 @@ const messages = defineMessages({
     pause: (name: string) => `Pause ${name}`,
     recent: 'Recently played',
     radios: 'Radio stations for you',
-    forYou: 'Your mixes',
+    forYou: 'Made for you',
+    mixes: 'Your mixes',
+    fromLibrary: 'From the library',
     yourPlaylists: 'Your playlists',
     newAlbums: 'New albums',
     topArtists: 'Your most played artists',
@@ -82,6 +86,9 @@ function useGreeting(t: (typeof messages)['de']) {
   return t[part]
 }
 
+/** The made-for-you kinds of official playlists (the first row). */
+const FOR_YOU = new Set<OfficialPlaylist['kind']>(['daylist', 'daily', 'month', 'discover', 'phase', 'radar', 'rediscover', 'top'])
+
 /** How many tiles the greeting grid holds. */
 const QUICK_TILES = 8
 
@@ -95,6 +102,13 @@ export function ListenHome() {
   const newest = useNewestAlbums(musicViews)
   const audiobooks = useNewestAlbums(bookViews)
   const official = useOfficialPlaylists()
+  const forYou = official.playlists.filter((playlist) => FOR_YOU.has(playlist.kind))
+  const mixes = official.playlists.filter((playlist) => playlist.kind === 'genre' || playlist.kind === 'decade')
+  // The newest songs, the charts and a few "Best of" (the charts first: they are rarer).
+  const fromLibrary = [
+    ...official.playlists.filter((playlist) => playlist.kind === 'new' || playlist.kind === 'chart'),
+    ...official.playlists.filter((playlist) => playlist.kind === 'artist'),
+  ]
   const playlists = usePlaylists()
   const greeting = useGreeting(t)
   const stats = useListeningStats()
@@ -130,10 +144,17 @@ export function ListenHome() {
         </div>
         <WrappedBanner />
       </section>
-      {/* The platform's own playlists, then the user's. */}
-      {(official.isLoading || official.playlists.length > 0) && (
+      {/* The platform's own playlists (made for the listener first), then the user's. */}
+      {(official.isLoading || forYou.length > 0) && (
         <CardRow title={t.forYou} loading={official.isLoading}>
-          {official.playlists.slice(0, 12).map((playlist) => (
+          {forYou.map((playlist) => (
+            <OfficialCard key={playlist.slug} playlist={playlist} />
+          ))}
+        </CardRow>
+      )}
+      {!!mixes.length && (
+        <CardRow title={t.mixes}>
+          {mixes.slice(0, 12).map((playlist) => (
             <OfficialCard key={playlist.slug} playlist={playlist} />
           ))}
         </CardRow>
@@ -154,6 +175,13 @@ export function ListenHome() {
         </CardRow>
       )}
       <MusicRow title={t.newAlbums} items={newest.data} loading={newest.isLoading && musicViews.length > 0} />
+      {!!fromLibrary.length && (
+        <CardRow title={t.fromLibrary}>
+          {fromLibrary.slice(0, 12).map((playlist) => (
+            <OfficialCard key={playlist.slug} playlist={playlist} />
+          ))}
+        </CardRow>
+      )}
       <MusicRow title={rowTitle} items={rowArtists} loading={stats.isLoading || followed.isLoading || (artistsRow === 'new' && newestArtists.isLoading && musicViews.length > 0)} />
       <FollowedPodcastsRow />
       <MusicRow title={t.audiobooks} items={audiobooks.data} loading={audiobooks.isLoading && bookViews.length > 0} />

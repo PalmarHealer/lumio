@@ -11,21 +11,27 @@ import { defineMessages, getLocale, messagesFor } from '@/lib/i18n'
 import { artistsOf } from '@/lib/item-links'
 import { fetchSimilarArtists, sameName } from './external'
 import type { OfficialPlaylist } from './official'
+import { assemble } from './mix-engine'
+import { localDate } from './mixes'
 import { seeded, weightedShuffle } from './official'
 import { music } from './player/music-player'
-import { countsForTaste, NO_EXCLUSIONS, tasteWeight, useTasteFilter } from './taste'
+import { countsForTaste, NO_EXCLUSIONS, useTasteFilter } from './taste'
+import { buildTasteModel, fetchTasteSignals } from './taste-model'
 
 /**
  * Radio, as Spotify's: an artist's songs mixed with songs of artists who make similar music (Last.fm's similar
  * artists, as far as the library has them; otherwise artists sharing their genres), leaning towards what the listener
- * likes. Each listener has their own radio of an artist, made anew every day (the same all day). Also what keeps music
- * going when the queue runs out ("autoplay"): more of what was just played.
+ * likes (the taste model: plays now and over time, hearts, skips; what just played steps back) and with a third of songs
+ * they haven't heard yet. Each listener has their own radio of an artist, made anew every day at midnight (the same all
+ * day, on every device). Also what keeps music going when the queue runs out ("autoplay"): more of what was just
+ * played, drawn anew each time.
  */
 const RADIO_SIZE = 50
 /** Songs of the artist itself in a radio, the rest from similar artists. */
 const OWN_SHARE = 0.4
-const SIMILAR_ARTISTS = 8
-const DAY = 24 * 60 * 60_000
+/** Songs the listener hasn't heard yet. */
+const NEW_SHARE = 0.3
+const SIMILAR_ARTISTS = 10
 
 const fields = [ItemFields.PrimaryImageAspectRatio, ItemFields.Genres]
 
@@ -83,40 +89,35 @@ interface RadioOptions {
   counts?: (track: BaseItemDto) => boolean
 }
 
-/** Builds a radio around an artist: their songs and similar artists' songs, interleaved, leaning towards the taste. */
+/**
+ * Builds a radio around an artist: their songs and similar artists' songs, the artist every third song or so; known
+ * favourites weighted by love, new songs by how near they are to the taste.
+ */
 export async function buildRadio(api: Api, userId: string, queryClient: QueryClient, artist: { id: string; name: string; genres?: string[] }, options: RadioOptions = {}) {
   const seed = options.seed ?? String(Math.random())
   const counts = options.counts ?? (() => true)
-  const [own, similar] = await Promise.all([artistTracks(api, userId, artist.id, 200), similarArtists(api, userId, queryClient, artist, seed)])
+  const [own, similar, signals] = await Promise.all([
+    artistTracks(api, userId, artist.id, 200),
+    similarArtists(api, userId, queryClient, artist, seed),
+    fetchTasteSignals(queryClient, userId),
+  ])
   const others = (await Promise.all(similar.map((entry) => artistTracks(api, userId, entry.Id!, 40)))).flat()
-  const pick = (list: BaseItemDto[], part: string) =>
-    weightedShuffle(
-      list.filter((track) => track.Id && !options.exclude?.has(track.Id)),
-      (track) => tasteWeight(track, counts),
-      `${seed}:${part}`,
-    )
-  const ownPart = pick(own, 'own').slice(0, Math.round(RADIO_SIZE * OWN_SHARE))
-  // From the similar artists: no more than eight songs each, so one of them doesn't take over.
-  const perArtist = new Map<string, number>()
-  const otherPart = pick(others, 'others')
-    .filter((track) => {
-      const key = artistsOf(track)[0]?.id ?? ''
-      perArtist.set(key, (perArtist.get(key) ?? 0) + 1)
-      return perArtist.get(key)! <= 8
-    })
-    .slice(0, RADIO_SIZE - ownPart.length)
-  // Interleave, so the artist comes back every few songs.
-  const mixed: BaseItemDto[] = []
-  const seen = new Set<string>()
-  for (let i = 0; mixed.length < RADIO_SIZE && (i < ownPart.length || i < otherPart.length * 2); i++) {
-    for (const track of [ownPart[i], otherPart[i * 2], otherPart[i * 2 + 1]]) {
-      if (track?.Id && !seen.has(track.Id)) {
-        seen.add(track.Id)
-        mixed.push(track)
-      }
-    }
-  }
-  return { tracks: mixed, similar }
+  const model = buildTasteModel([...own, ...others], signals, counts, Date.now())
+  const ownIds = new Set(own.map((track) => track.Id))
+  const otherTracks = others.filter((track) => !ownIds.has(track.Id))
+  const known = (list: BaseItemDto[]) => list.filter(model.known)
+  const fresh = (list: BaseItemDto[]) => list.filter((track) => !model.known(track))
+  const tracks = assemble(
+    [
+      { tracks: known(own), weight: model.love, share: OWN_SHARE * (1 - NEW_SHARE) },
+      { tracks: fresh(own), weight: (track) => 0.3 + model.novelty(track), share: OWN_SHARE * NEW_SHARE },
+      { tracks: known(otherTracks), weight: model.love, share: (1 - OWN_SHARE) * (1 - NEW_SHARE) },
+      { tracks: fresh(otherTracks), weight: (track) => 0.3 + model.novelty(track), share: (1 - OWN_SHARE) * NEW_SHARE },
+    ],
+    // The artist itself may come back every third song; a similar one at most six times.
+    { size: RADIO_SIZE, seed, exclude: options.exclude, maxPerArtist: 6, artistGap: 2, artistLimit: (id) => (id === artist.id ? RADIO_SIZE : undefined) },
+  )
+  return { tracks, similar }
 }
 
 /** The library's artists most like one (for a radio's cover). */
@@ -133,7 +134,7 @@ export function useSimilarLibraryArtists(artist: BaseItemDto | undefined) {
 
 /** Today's radio of an artist for this listener: its query, shared by the page, the cards and "Go to radio". */
 function radioQuery(api: Api, userId: string, queryClient: QueryClient, artist: BaseItemDto, taste: ReturnType<typeof useTasteFilter>) {
-  const day = Math.floor(Date.now() / DAY)
+  const day = localDate(Date.now())
   return {
     queryKey: ['radio-playlist', userId, artist.Id, day, taste.key, getLocale()],
     staleTime: 60 * 60_000,
@@ -197,5 +198,5 @@ export async function continuation(api: Api, userId: string, queryClient: QueryC
   const exclude = new Set(played.map((track) => track.Id!).filter(Boolean))
   const random = seeded(`${userId}:${Date.now()}`)
   const { tracks } = await buildRadio(api, userId, queryClient, { id: artist.id, name: artist.name, genres: last.Genres ?? undefined }, { exclude, counts, seed: String(random()) })
-  return tracks.slice(0, 20)
+  return tracks.slice(0, 25)
 }

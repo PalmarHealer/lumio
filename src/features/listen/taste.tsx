@@ -26,12 +26,6 @@ export function countsForTaste(track: BaseItemDto, exclusions: TasteExclusions, 
   return !artists.some((artist) => artist.Id && exclusions.artists.includes(artist.Id))
 }
 
-/** How much a track says about the user's taste: plays and the heart; 0 when it doesn't count. */
-export function tasteWeight(track: BaseItemDto, counts: (track: BaseItemDto) => boolean) {
-  if (!counts(track)) return 0
-  return Math.min(4, Math.log2(1 + (track.UserData?.PlayCount ?? 0))) + (track.UserData?.IsFavorite ? 2 : 0)
-}
-
 /** The user's exclusions, and changing them. */
 export function useTasteExclusions() {
   const { settings, update } = useLocalSettings()

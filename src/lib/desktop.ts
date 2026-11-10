@@ -44,6 +44,8 @@ interface LumioDesktop {
   checkUpdate?(): Promise<UpdateCheck>
   /** The app's version. Older apps lack it. */
   getVersion?(): Promise<string>
+  /** The window was minimized or hidden in the tray. Older apps lack it. */
+  onWindowHidden?(handler: () => void): () => void
 }
 
 export const desktop = (): LumioDesktop | undefined => (typeof window === 'undefined' ? undefined : (window as { lumioDesktop?: LumioDesktop }).lumioDesktop)

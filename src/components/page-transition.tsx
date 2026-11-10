@@ -3,8 +3,11 @@ import { useLocation, useNavigationType } from 'react-router'
 
 const supportsViewTransitions = typeof document !== 'undefined' && 'startViewTransition' in document
 
-/** Sections with their own navigation: moving between their sub-pages keeps the frame and only swaps the content. */
-const SECTIONS = ['/settings', '/listen/wrapped']
+/**
+ * Sections with their own navigation: moving between their sub-pages keeps the frame and only swaps the content. The
+ * player is one too: on to the next episode, its fullscreen frame must stay (a new one would end the fullscreen).
+ */
+const SECTIONS = ['/settings', '/listen/wrapped', '/play']
 
 /** Scroll positions of pages left, by history entry, for frames that scroll in a panel of their own (Listen). */
 const positions = new Map<string, number>()

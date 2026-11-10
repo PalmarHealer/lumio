@@ -1,6 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { lazy, Suspense, useEffect, useRef } from 'react'
-import { Navigate, useNavigate, useParams } from 'react-router'
+import { Navigate, useLocation, useNavigate, useParams } from 'react-router'
 import { useAuthedSession } from '@/features/auth/session'
 import { albumTracksOptions, useItem } from '@/features/items/queries'
 import { itemHref } from '@/lib/item-links'
@@ -18,7 +18,10 @@ const AUDIO_TYPES = new Set(['Audio', 'AudioBook'])
 export function PlayEntry() {
   const { id = '' } = useParams()
   const item = useItem(id)
-  if (item.isLoading) return <div className="h-svh bg-black" />
+  // On to the next episode from the player: it is a video, so the player stays while it loads (replacing it with the
+  // black page would end the fullscreen).
+  const continuing = !!(useLocation().state as { continuing?: boolean } | null)?.continuing
+  if (item.isLoading && !continuing) return <div className="h-svh bg-black" />
   if (item.data && AUDIO_TYPES.has(item.data.Type ?? '')) return <MusicHandoff key={id} id={id} />
   return (
     <Suspense fallback={<div className="h-svh bg-black" />}>

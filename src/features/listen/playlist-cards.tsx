@@ -100,7 +100,19 @@ function DrawnCover({ playlist, className }: { playlist: OfficialPlaylist; class
       ? portraitImageUrl(api, leader, { fillHeight: 720 })
       : undefined
   const style: CoverStyle =
-    playlist.kind === 'genre' || playlist.kind === 'decade' || playlist.kind === 'tag' ? 'mix' : playlist.kind === 'artist' || playlist.kind === 'daily' ? 'foto' : playlist.kind === 'chart' ? 'block' : 'stimmung'
+    playlist.kind === 'genre' || playlist.kind === 'decade' || playlist.kind === 'tag'
+      ? 'mix'
+      : playlist.kind === 'artist' || playlist.kind === 'daily'
+        ? 'foto'
+        : playlist.kind === 'chart'
+          ? 'block'
+          : playlist.kind === 'mood'
+            ? 'stimmung'
+            : playlist.kind === 'daylist'
+              ? 'daylist'
+              : 'emblem'
+  // Moods pick their colours by name, the Made-for-you playlists their sign by kind.
+  const motif = playlist.kind === 'mood' ? playlist.slug : playlist.kind
   // The daylist changes colour with its title (through the day), as Spotify's does.
   const coverSeed = playlist.kind === 'daylist' ? playlist.title : playlist.slug
   const title = playlist.kind === 'artist' ? (playlist.artist?.Name ?? playlist.title) : playlist.kind === 'chart' ? t.charts : playlist.title
@@ -118,7 +130,7 @@ function DrawnCover({ playlist, className }: { playlist: OfficialPlaylist; class
       // Sharp on high-density screens, never bigger than the design grid.
       const size = Math.min(1080, Math.round(element.clientWidth * window.devicePixelRatio))
       if (element.width !== size) element.width = element.height = size
-      drawCover(element, { style, seed: coverSeed, title, subtitle, mark: appName, markImage, photo })
+      drawCover(element, { style, seed: coverSeed, title, subtitle, mark: appName, markImage, photo, motif })
     }
     void coverFontsReady().then(draw)
     if (photoUrl) {
@@ -143,7 +155,7 @@ function DrawnCover({ playlist, className }: { playlist: OfficialPlaylist; class
       cancelled = true
       observer.disconnect()
     }
-  }, [style, coverSeed, title, subtitle, appName, avatar, photoUrl])
+  }, [style, motif, coverSeed, title, subtitle, appName, avatar, photoUrl])
 
   return <canvas ref={canvas} role="img" aria-label={playlist.title} className={cn('block size-full', className)} />
 }

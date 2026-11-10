@@ -60,16 +60,43 @@ const clamp = (value: number) => Math.max(0, Math.min(1, value))
 /** How near a value is to a centre (1 there, about 0.6 one width away). */
 const near = (value: number, centre: number, width: number) => Math.exp(-0.5 * ((value - centre) / width) ** 2)
 
-function qualities(f: SoundFeatures) {
-  const loud = clamp((f.loudness + 22) / 14)
-  const bright = clamp((f.brightness - 800) / 1200)
-  const busy = clamp((f.onsets - 2.5) / 2.5)
-  const energy = 0.55 * loud + 0.25 * busy + 0.2 * bright
+/**
+ * Where a song stands in the library (0–1, by rank): today's masters are all loud and bright, so only the comparison
+ * with the other songs tells the calm ones from the driving ones.
+ */
+function rankers(features: SoundFeatures[]) {
+  const ranker = (values: number[]) => {
+    const sorted = [...values].sort((a, b) => a - b)
+    return (value: number) => {
+      if (sorted.length < 20) return 0.5
+      let low = 0
+      let high = sorted.length
+      while (low < high) {
+        const mid = (low + high) >> 1
+        if (sorted[mid]! < value) low = mid + 1
+        else high = mid
+      }
+      return low / sorted.length
+    }
+  }
+  return {
+    loud: ranker(features.map((f) => f.loudness)),
+    bright: ranker(features.map((f) => f.brightness)),
+    busy: ranker(features.map((f) => f.onsets)),
+    build: ranker(features.map((f) => f.dynamics)),
+    pulse: ranker(features.map((f) => f.pulse)),
+  }
+}
+
+type Rankers = ReturnType<typeof rankers>
+
+function qualities(f: SoundFeatures, rank: Rankers) {
+  const bright = rank.bright(f.brightness)
+  const energy = 0.5 * rank.loud(f.loudness) + 0.3 * rank.busy(f.onsets) + 0.2 * bright
   // Major and clearly so reads happier; an unclear key says little either way.
   const major = f.minor ? 0.5 - 0.5 * f.keyClarity : 0.5 + 0.5 * f.keyClarity
   // Quiet-loud movement (builds, drops) carries the epic, "motivation" feel.
-  const build = clamp((f.dynamics - 1.5) / 4)
-  return { energy, bright, major, build, pulse: clamp(f.pulse * 1.3), bpm: f.bpm }
+  return { energy, bright, major, build: rank.build(f.dynamics), pulse: rank.pulse(f.pulse), bpm: f.bpm }
 }
 
 type Mood = 'running' | 'cozy' | 'sad' | 'motivation' | 'upbeat'
@@ -88,12 +115,12 @@ const MOODS: Record<Mood, MoodSpec> = {
     tags: /^(running|workout|gym|training|cardio|drum and bass|dnb|hardstyle|energetic|power)$/,
   },
   cozy: {
-    sound: (q) => 0.35 * (1 - q.energy) + 0.25 * near(q.bpm, 85, 20) + 0.2 * (1 - q.bright) + 0.2 * (0.5 + 0.5 * q.major),
+    sound: (q) => 0.35 * (1 - q.energy) + 0.2 * near(q.bpm, 85, 20) + 0.15 * (1 - q.bright) + 0.15 * (1 - q.pulse) + 0.15 * (0.5 + 0.5 * q.major),
     tags: /^(cozy|cosy|chill|chillout|mellow|acoustic|lo-fi|lofi|soft|relaxing|calm|singer-songwriter|folk|jazz|coffee|rainy day|winter|warm|bedroom pop)$/,
     slots: [0, 0, 0, 0.6, 1, 0.8, 0.3, 0.2, 0.2, 0.8, 1, 0.8],
   },
   sad: {
-    sound: (q) => 0.4 * (1 - q.major) + 0.3 * (1 - q.energy) + 0.2 * near(q.bpm, 75, 20) + 0.1 * (1 - q.bright),
+    sound: (q) => 0.35 * (1 - q.major) + 0.3 * (1 - q.energy) + 0.15 * near(q.bpm, 75, 20) + 0.1 * (1 - q.pulse) + 0.1 * (1 - q.bright),
     tags: /^(sad|melancholic|melancholy|heartbreak|depressing|depressive|emotional|breakup|sad songs|tearjerker|grief|lonely)$/,
     slots: [0, 0, 0, 0.3, 0.8, 1, 0, 0, 0, 0.3, 0.8, 1],
   },
@@ -115,6 +142,8 @@ interface Context {
   tracks: BaseItemDto[]
   model: TasteModel
   sound: SoundData
+  /** How the library's measured songs rank (filled in by moodMixes). */
+  rank?: Rankers
   now: number
   userId: string
   day: string
@@ -131,8 +160,9 @@ function tagScore(tags: { own: string[]; artists: string[] }, pattern: RegExp) {
 function moodScore(context: Context, mood: MoodSpec, track: BaseItemDto) {
   const f = context.sound.features(track)
   const tags = tagScore(context.sound.tags(track), mood.tags)
+  const q = f && context.rank ? qualities(f, context.rank) : null
   // The sound decides most; a fitting tag adds to it (and alone, without a measurement, carries less far).
-  const base = f ? 0.75 * mood.sound(qualities(f)) + 0.35 * tags : 0.75 * tags
+  const base = q ? 0.75 * mood.sound(q) + 0.35 * tags : 0.75 * tags
   if (!mood.slots) return clamp(base)
   let fitting = 0
   let total = 0
@@ -144,7 +174,8 @@ function moodScore(context: Context, mood: MoodSpec, track: BaseItemDto) {
   return clamp(base * (1 + 0.3 * (total > 0.2 ? fitting / total : 0)))
 }
 
-export function moodMixes(context: Context): OfficialPlaylist[] {
+export function moodMixes(input: Context): OfficialPlaylist[] {
+  const context = { ...input, rank: rankers(input.tracks.map(input.sound.features).filter((f): f is SoundFeatures => !!f)) }
   const { tracks, model, userId, day } = context
   const t = messagesFor(moodMessages)
   // Without measurements and tags there is nothing to tell moods by.

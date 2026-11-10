@@ -45,6 +45,7 @@ import { useBackLayer } from '@/lib/back'
 import { useTouch } from '@/lib/use-media-query'
 import { holdAppFullscreen, inNativeApp } from '@/lib/native-app'
 import { inCapacitor, onPipEvents, setAutoPip } from '@/lib/capacitor'
+import { desktop } from '@/lib/desktop'
 import { startAfterIntro, useMediaSegments } from './segments'
 import { fitLabels } from './labels'
 import { SettingsPanel } from './settings-panel'
@@ -646,6 +647,18 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
       else if (action === 'close') video.current?.pause()
     })
   }, [settings.skipBackSeconds, settings.skipForwardSeconds])
+  // The desktop app: minimizing the window (or hiding it in the tray) pauses a film or episode, unless it floats in
+  // picture in picture. Music and audio items play on.
+  const pipNow = useRef(pip)
+  useEffect(() => {
+    pipNow.current = pip
+  })
+  useEffect(() => {
+    if (isAudio) return
+    return desktop()?.onWindowHidden?.(() => {
+      if (!pipNow.current) pauseForSleep.current()
+    })
+  }, [isAudio])
   const togglePip = useCallback(() => {
     const el = video.current
     if (!el) return

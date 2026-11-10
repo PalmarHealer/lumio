@@ -144,6 +144,10 @@ function createWindow({ show }) {
     if (closeAction === 'minimize') window?.minimize()
     else window?.hide()
   })
+  // Minimized or hidden in the tray: the page hears of it (a film or episode pauses there; music plays on).
+  const tellHidden = () => window?.webContents.send('desktop:window-hidden')
+  window.on('minimize', tellHidden)
+  window.on('hide', tellHidden)
   window.on('closed', () => (window = null))
   void window.loadURL(startUrl())
   return window

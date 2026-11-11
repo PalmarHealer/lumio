@@ -13,8 +13,11 @@ const SAVE_AFTER_MS = 2000
 /** Restoring may hold the first render this long at most; a slow disk mustn't slow the start down. */
 export const RESTORE_TIMEOUT_MS = 400
 
-/** Queries not worth keeping: typed searches, answers that change by the minute, and what the browser measures itself. */
-const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos'])
+/**
+ * Queries not worth keeping: typed searches, answers that change by the minute, what the browser measures itself, and
+ * the mixer's whole-track analyses (tens of kilobytes a song; the server has them at hand).
+ */
+const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'track-mix'])
 
 interface Saved {
   savedAt: number

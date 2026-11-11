@@ -13,7 +13,7 @@ import {
   IconUsersPlus,
   IconWorld,
 } from '@tabler/icons-react'
-import { useState, type ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { Navigate, useNavigate, useParams } from 'react-router'
 import { ModeTile } from '@/components/app-switcher'
 import { Link } from '@/components/link'
@@ -42,6 +42,8 @@ import { AddToPlaylist } from './library-menu'
 import { TasteMenuItem } from './taste'
 import { DownloadButton, DownloadMenuItem } from './download-ui'
 import { useHeldByDownload } from './download-ui'
+import { MixerBadge, MixerMenuItems, SortBuildDialog } from './mixer/mixer-ui'
+import { useMixInfo, usePlaylistMixer } from './mixer/queries'
 
 const messages = defineMessages({
   de: {
@@ -77,6 +79,7 @@ const messages = defineMessages({
     likedEmpty: 'Songs, die du mit dem Herz markierst, landen hier.',
     madeFor: (name: string) => `Von ${name}`,
     madeForPrefix: 'Für',
+    tempoKey: 'Tempo · Tonart',
   },
   en: {
     playlist: 'Playlist',
@@ -111,11 +114,14 @@ const messages = defineMessages({
     likedEmpty: 'Songs you like with the heart end up here.',
     madeFor: (name: string) => `By ${name}`,
     madeForPrefix: 'For',
+    tempoKey: 'Tempo · key',
   },
 })
 
 interface CollectionProps {
   kind: string
+  /** A mark beside the kind (a mixer playlist's). */
+  badge?: ReactNode
   title: string
   cover: ReactNode
   /** Owner and stats line under the title. */
@@ -142,7 +148,7 @@ interface CollectionProps {
 }
 
 /** The layout shared by playlists, official playlists and liked songs: header, actions, track table with albums. */
-export function Collection({ kind, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel }: CollectionProps) {
+export function Collection({ kind, badge, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel }: CollectionProps) {
   const t = useMessages(messages)
   // Dragging reorders right away; the server's order replaces it once it has saved the move.
   const [reordered, setReordered] = useState<{ from: BaseItemDto[]; order: BaseItemDto[] } | null>(null)
@@ -182,7 +188,10 @@ export function Collection({ kind, title, cover, byline, description, tracks: lo
             <div className="size-48 shrink-0 overflow-hidden rounded-md bg-muted shadow-2xl shadow-black/50 sm:size-56">{cover}</div>
           )}
           <div className="min-w-0 space-y-3">
-            <p className="text-sm font-medium">{kind}</p>
+            <p className="flex items-center gap-2 text-sm font-medium">
+              {kind}
+              {badge}
+            </p>
             {onEdit ? (
               <button type="button" onClick={() => onEdit('title')} className="block text-left outline-none focus-visible:ring-2 focus-visible:ring-ring">
                 <h1 className="line-clamp-2 text-4xl font-black leading-none tracking-tight text-balance sm:text-6xl xl:text-7xl">{title}</h1>
@@ -333,8 +342,15 @@ export function PlaylistPage() {
   const [editing, setEditing] = useState<'title' | 'cover' | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [sharing, setSharing] = useState(false)
+  const [building, setBuilding] = useState(false)
+  const mixer = usePlaylistMixer(id)
+  const mixing = mixer.data?.on === true
   const shareInfo = infos.data?.find((info) => info.playlist.Id === id)
   const adds = usePlaylistAdds(id, (shareInfo?.editors.length ?? 0) > 1).data
+  // A mixer playlist shows each song's tempo and key (what its transitions are planned with) where a shared one shows
+  // who added it.
+  const trackIds = useMemo(() => (tracks.data ?? []).map((track) => track.Id ?? ''), [tracks.data])
+  const mixInfo = useMixInfo(trackIds, mixing && (shareInfo?.editors.length ?? 0) <= 1)
 
   if (playlist.isError) return <Navigate to="/listen" replace />
   const item = playlist.data
@@ -370,12 +386,13 @@ export function PlaylistPage() {
         description={item?.Overview ?? undefined}
         cover={item ? <PlaylistCover playlist={item} tracks={list} /> : null}
         byline={owner ? <OwnerByline userId={owner} /> : null}
+        badge={mixing ? <MixerBadge /> : undefined}
         tracks={list}
         loading={tracks.isLoading}
         source={`playlist:${id}`}
         empty={canEdit ? t.empty : undefined}
-        extras={addedBy}
-        extraLabel={t.addedBy}
+        extras={addedBy ?? (mixing ? mixInfo : undefined)}
+        extraLabel={addedBy ? t.addedBy : t.tempoKey}
         onRemove={canEdit ? (track) => track.PlaylistItemId && actions.remove.mutate({ playlistId: id, entryIds: [track.PlaylistItemId] }) : undefined}
         onMove={canEdit ? (track, index) => track.PlaylistItemId && actions.move.mutate({ playlistId: id, entryId: track.PlaylistItemId, index }) : undefined}
         onEdit={mine && item ? setEditing : undefined}
@@ -394,6 +411,7 @@ export function PlaylistPage() {
                 <AddToPlaylist tracks={async () => list} label={t.addToOtherPlaylist} exclude={id} />
                 <DownloadMenuItem downloadKey={`playlist:${id}`} name={item?.Name ?? ''} items={tracks.data} collection={item} />
                 <TasteMenuItem kind="playlists" id={id} />
+                {canEdit && <MixerMenuItems playlistId={id} trackCount={list.length} onBuild={() => setBuilding(true)} />}
                 {mine && (
                   <>
                     <DropdownMenuSeparator />
@@ -427,6 +445,8 @@ export function PlaylistPage() {
           focus={editing === 'cover' ? 'none' : 'name'}
         />
       )}
+
+      {canEdit && <SortBuildDialog playlistId={id} tracks={list} open={building} onOpenChange={setBuilding} />}
 
       {mine && <PlaylistShareDialog playlistId={id} editors={editors} open={sharing} onOpenChange={setSharing} />}
 

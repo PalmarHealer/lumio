@@ -27,6 +27,7 @@ import { EpisodePage, PodcastPage, PodcastsPage, SavedEpisodesPage } from '@/fea
 import { FollowListPage, ProfilePage as ListenProfilePage } from '@/features/listen/profile-page'
 import { ListenShell } from '@/features/listen/listen-shell'
 import { MusicPlayerHost } from '@/features/listen/player/music-host'
+import { MixerHost } from '@/features/listen/mixer/mixer-host'
 import { VideoDownloadsHost } from '@/features/player/video-download-ui'
 import { PlayEntry } from '@/features/listen/player/play-entry'
 import { DetailPage } from '@/features/items/detail-page'
@@ -86,12 +87,13 @@ function RootLayout() {
   )
 }
 
-/** The Lumio server connection (and the video downloads) exist only while someone is signed in. */
+/** The Lumio server connection (and the video downloads, the mixer mode) exist only while someone is signed in. */
 function SocialHostWhenSignedIn() {
   return useSession().session ? (
     <>
       <SocialHost />
       <VideoDownloadsHost />
+      <MixerHost />
     </>
   ) : null
 }

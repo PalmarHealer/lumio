@@ -1,4 +1,4 @@
-import { bufferDeckKind, createBufferDeck, type BufferDeckKind } from './buffer-deck'
+import { bufferDeckKind, createBufferDeck, tempoChangeKind } from './buffer-deck'
 import { bSettled, deckPlan, withBrake } from './deck-schedule'
 import { asPlayed, createDeck, createMaster, limiterLatency, resetDeck, releaseEcho, scheduleTransition, type LimiterStats } from './engine'
 import type { Transition } from './types'
@@ -37,12 +37,8 @@ const LIMITER_LEAD_S = 0.05
 /** Rendered before the timeline's 0 and dropped: the stretchers' changes must be scheduled this far ahead (≥ 140 ms). */
 const STRETCH_LEAD_S = 0.5
 
-/**
- * How a deck whose tempo changes is played (see buffer-deck.ts): with pitch kept (`stretch`), or `exact` (the pitch
- * follows the tempo). Decks at rate 1 always play exactly.
- */
-export let tempoChangeKind: BufferDeckKind = 'stretch'
-export const setTempoChangeKind = (kind: BufferDeckKind) => (tempoChangeKind = kind)
+/** How decks whose tempo changes are played: buffer-deck.ts' setting (re-exported for the editor and demos). */
+export { setTempoChangeKind } from './buffer-deck'
 
 /** A buffer's channels as two (a mono file plays on both sides). */
 const stereo = (buffer: AudioBuffer) => [buffer.getChannelData(0), buffer.getChannelData(Math.min(1, buffer.numberOfChannels - 1))] as Float32Array<ArrayBuffer>[]

@@ -23,8 +23,13 @@ import { downloadedAudioUrl, downloadId, isDownloaded, setDownloadQuality, setDo
 import { DIRECT_FORMATS } from './quality'
 import { setSleepHandler, sleepsAfterTrack, stopsAfterTrack } from './sleep-timer'
 import type { Transition } from '../mixer/types'
-import { asPlayed, brakeRateAt, createDeck, createMaster, freezeDeck, handoverPoint, rateAt, rateEaseSeconds, rampAt, releaseEcho, resetDeck, scheduleTransition, type Deck, type Master } from '../mixer/engine'
-import { currentPlayLead, keepAligned, learnPlayLead, waitForCue, wakeAfter } from './deck-sync'
+import { asPlayed, createDeck, createMaster, freezeDeck, handoverPoint, rampAt, releaseEcho, resetDeck, scheduleTransition, type Deck, type Master } from '../mixer/engine'
+import { bSettled, deckPlan, positionAt, rateOf, timeOfAdvance, trackSpan, withBrake, type DeckPlan } from '../mixer/deck-schedule'
+import { bufferDeckKind, tempoChangeKind, type BufferDeckKind } from '../mixer/buffer-deck'
+import { mono } from '../mixer/xcorr'
+import { currentPlayLead, followPlan, learnPlayLead, waitForCue, wakeAfter } from './deck-sync'
+import { calibratedStart, closeSide, crossfade, locateElement, medianStart, openSide, type BufferSide, type Located } from './mix-buffers'
+import { blobSlice, streamSlice, type Slice } from './slices'
 
 /**
  * Listen's player: one <audio> element for the whole app, so music keeps playing while the user moves between pages
@@ -1194,21 +1199,21 @@ const RETIRE_S = 0.03
 /** How long an echo may ring on after its deck has gone (after a transition), or after one was called off. */
 const ECHO_TAIL_S = 6
 const ABORT_TAIL_S = 0.5
-/** The brake on an element: its rate is stepped this often (media elements have no rate ramps). */
-const BRAKE_STEP_S = 0.04
-/** The slowest a media element plays. */
-const MIN_ELEMENT_RATE = 0.0625
-/** A negative `bIn` goes down to this (B's position is `bIn + t · rate` throughout: its top comes at t = -bIn / rate). */
-const MIN_B_IN = -2
-
-/** When B's element starts (transition time): at once, or with a negative `bIn` when `bIn + t · rate` reaches 0. */
-const bDelay = (transition: Transition) => Math.max(0, -transition.bIn) / transition.rate
-
-/**
- * Where A and B belong together in time: A's position and B's position at the same moment. Usually A's `aOut` and
- * B's `bIn`; with a negative `bIn`, B's start (position 0) lines up with A `-bIn / rate` seconds after `aOut`.
- */
-const anchors = (transition: Transition) => ({ a: transition.aOut + bDelay(transition), b: Math.max(0, transition.bIn) })
+/** Buffered: A is located in its slice this long before the cue (recording, matching, the stretcher's lead). */
+const BUFFER_ARM_S = 5
+/** A's sound moves to its buffer this long before t = 0 (at least `MIN_HANDOVER_LEAD_S` ahead of now). */
+const HANDOVER_LEAD_S = 1
+const MIN_HANDOVER_LEAD_S = 0.3
+/** B hands back to its element this long after it plays at its own tempo again, within at most `HANDBACK_SPAN_S`. */
+const HANDBACK_AFTER_S = 0.5
+const HANDBACK_SPAN_S = 8
+const HANDBACK_ATTEMPTS = 4
+/** B's slice is lined up this many times (their median). */
+const B_CALIBRATIONS = 3
+/** The element must play within this of the buffer before the sound goes back to it. */
+const HANDBACK_TOLERANCE_S = 0.002
+/** Slices reach this much further than the decks play. */
+const SLICE_MARGIN_S = 1
 
 interface Plan {
   fromUid: string
@@ -1220,6 +1225,11 @@ interface Plan {
   transition: Transition | null
   /** Preset 'none': B follows A's real end (its `aOut` is kept on the element's own duration). */
   backToBack: boolean
+  /** Buffers ready for the transition (A's slice, still to be lined up when armed; B's side), or null: without. */
+  buffered: { sliceA: Slice; sideB: BufferSide; kindA: BufferDeckKind } | null
+  /** The buffers being loaded (to call off), and whether B's element is being lined up (it plays muted meanwhile). */
+  loading: AbortController | null
+  calibrating: boolean
   /** B's element (once loading), its play session, and whether it came from the device (and the cache key then). */
   element: HTMLAudioElement | null
   sessionId: string
@@ -1244,8 +1254,20 @@ interface Running {
   stops: Array<() => void>
   /** B's start error was learned from already (only the first start teaches, not a resume). */
   learned: boolean
-  /** B's element was started (with a negative `bIn` it starts only `-bIn / rate` seconds into the transition). */
+  /** B's element was started (at `bAt`). */
   bStarted: boolean
+  /** What the elements follow: the decks' plans (without buffers: straight, no loops); A's with its brake. */
+  planA: DeckPlan
+  planB: DeckPlan
+  /** When A's brake starts (its pitch falls from then on), or null. */
+  brake: number | null
+  /** The buffers the decks sound from (null: the elements play it), and when A's sound moved there. */
+  sides: { a: BufferSide; b: BufferSide } | null
+  handoverLead: number
+  /** When B plays straight at its own tempo again (transition time). */
+  settled: number
+  /** A is gone; B is still on its buffer until it hands back. */
+  trailing: boolean
 }
 
 let transitionProvider: TransitionProvider | null = null
@@ -1377,10 +1399,19 @@ function release(url: string, keep?: string) {
 /** A track starts on `element`: its deck (if any) back to neutral, or onto the graph now if transitions are possible. */
 function prepareDeck(element: HTMLAudioElement) {
   element.preservesPitch = true
+  elementGains.get(element)?.gain.cancelScheduledValues(0)
+  if (elementGains.get(element)) elementGains.get(element)!.gain.value = 1
   const deck = decks.get(element)
   if (deck) safely(() => resetDeck(deck))
   else if (transitionProvider) attach(element)
 }
+
+const elementGains = new WeakMap<HTMLAudioElement, GainNode>()
+
+/** An element's own gain into its deck (a stand-in for one off the graph, which no transition uses). */
+const elementGain = (element: HTMLAudioElement) => elementGains.get(element) ?? new GainNode(context!)
+/** Where a buffer deck joins an element's deck (its input, beside the element's own gain). */
+const elementInput = (element: HTMLAudioElement) => decks.get(element)!.input
 
 /** Puts an element on the graph (only CORS-loaded audio, and only while the audio clock runs). */
 function attach(element: HTMLAudioElement): Deck | null {
@@ -1392,8 +1423,11 @@ function attach(element: HTMLAudioElement): Deck | null {
     // At its volume before any sound goes through (the element may be playing already, at full volume on the graph).
     deck.level.gain.value = state.muted ? 0 : volumeOf(element)
     const source = context.createMediaElementSource(element)
-    source.connect(deck.input)
+    // The element's own way into the deck: 0 while a transition's buffer plays its sound instead.
+    const gain = new GainNode(context)
+    source.connect(gain).connect(deck.input)
     deck.source = source
+    elementGains.set(element, gain)
     decks.set(element, deck)
     applyVolume()
     return deck
@@ -1522,6 +1556,9 @@ function planCheck() {
     status: 'asking',
     transition: null,
     backToBack: false,
+    buffered: null,
+    loading: null,
+    calibrating: false,
     element: null,
     sessionId: crypto.randomUUID(),
     offline: false,
@@ -1546,12 +1583,14 @@ function planCheck() {
     })
 }
 
-/** A transition the player can play: for this pair, inside A, at a rate a media element plays well. */
+/** A transition the player can play (contract v2): for this pair, inside A, at rates a media element plays well. */
 function usable(transition: Transition, from: BaseItemDto, to: BaseItemDto) {
   const duration = ticksToSeconds(from.RunTimeTicks ?? 0)
-  const { aOut, bIn, length, rate } = transition
-  if (![bIn, length, rate].every(Number.isFinite) || transition.from !== from.Id || transition.to !== to.Id) return false
-  if (bIn < MIN_B_IN || length < 0 || rate < 0.5 || rate > 2) return false
+  const { aOut, bAt, bIn, length } = transition
+  if (transition.v !== 2 || transition.from !== from.Id || transition.to !== to.Id) return false
+  if (![bAt, bIn, length].every(Number.isFinite) || bAt < 0 || bIn < 0 || length < 0) return false
+  const rates = [...(transition.rateA ?? []), ...(transition.rateB ?? [])]
+  if (!rates.every((keyframe) => Number.isFinite(keyframe.t) && keyframe.v >= 0.5 && keyframe.v <= 2)) return false
   // Back to back follows A's real end, whatever its cue says now.
   if (transition.preset === 'none') return true
   return Number.isFinite(aOut) && aOut > 0 && (!duration || aOut < duration)
@@ -1563,6 +1602,7 @@ function dropPlan() {
   plan = null
   if (!old) return
   old.cancelCue()
+  dropBuffered(old)
   const element = old.element
   if (element && element !== audio && running?.a !== element && running?.b !== element) unload(element)
 }
@@ -1596,7 +1636,8 @@ function mixerTick() {
     return
   }
   if (current.status === 'planned' && position >= transition.aOut - PRELOAD_S && !running && standbyFree()) void preload(current)
-  if (current.status === 'ready' && !element.paused && position >= transition.aOut - ARM_S && !sleepsAfterTrack()) arm(current)
+  const armAt = transition.aOut - (current.buffered ? BUFFER_ARM_S : ARM_S)
+  if (current.status === 'ready' && !current.calibrating && !element.paused && position >= armAt && !sleepsAfterTrack()) arm(current)
 }
 
 /** Whether the standby element may take the next track (no transition's tail is still on it). */
@@ -1634,20 +1675,21 @@ async function preload(p: Plan) {
   p.offline = !!(downloaded ?? cached)
   p.cacheKey = cached ? key : null
   trackGains.set(element, gainFactorOf(gain))
-  // (Loading resets the rate; B plays at its own during the overlap, keeping its pitch.)
   element.preservesPitch = true
-  element.playbackRate = transition.rate
   const deck = attach(element)
   if (!deck || !safely(() => resetDeck(deck))) return fail()
+  elementGain(element).gain.value = 1
   applyVolume()
   try {
-    await parked(element, anchors(transition).b)
+    await parked(element, Math.max(0, transition.bIn))
   } catch {
     return fail()
   }
   if (plan !== p) return
   p.status = 'ready'
   mixerTick()
+  // The buffers for a sample-exact transition load meanwhile; until they are ready it would play without.
+  void loadBuffered(p)
 }
 
 /** Waits until an element stands at `at`, paused, with enough data to play on at once. */
@@ -1677,117 +1719,183 @@ function parked(element: HTMLAudioElement, at: number) {
   })
 }
 
-/** Close to the cue: times B's start (a little early, by the time an element takes to start). */
+/** Close to the cue: times the transition's start (buffered: lines the slice up with A first, a little earlier). */
 function arm(p: Plan) {
   const element = audio
   if (!element || !p.transition) return
   p.status = 'armed'
+  if (p.buffered) return void beginBuffered(p)
   p.cancelCue = waitForCue(context, element, p.transition.aOut, currentPlayLead(), (late) => begin(p, late))
 }
 
-/** The cue: B starts and the transition runs. */
+/** The cue, without buffers: both elements play the transition (straight, no loops), A's element sets the clock. */
 function begin(p: Plan, late: number) {
   const a = audio
   const b = p.element
   const transition = p.transition
-  const deckA = a ? decks.get(a) : undefined
-  const deckB = b ? decks.get(b) : undefined
   if (plan !== p || p.status !== 'armed') return
   p.cancelCue = () => {}
   const ended = p.backToBack && !!a?.ended
-  if (!a || !b || !transition || !deckA || !deckB || !context || context.state !== 'running' || (a.paused && !ended) || (late > TOO_LATE_S && !p.backToBack)) {
+  if (!a || !b || !transition || !decks.get(a) || !decks.get(b) || !context || context.state !== 'running' || (a.paused && !ended) || (late > TOO_LATE_S && !p.backToBack)) {
     // No transition after all: the track ends plainly.
     p.status = 'none'
     if (b) unload(b)
     return
   }
+  dropBuffered(p)
   plan = null
   // t = 0 is when A reaches aOut: in `lead` seconds when on time, in the past when late (B then starts further in).
   const toCue = ended ? 0 : (transition.aOut - a.currentTime) / (a.playbackRate || 1)
-  b.preservesPitch = true
-  b.playbackRate = transition.rate
+  startRunning(p, a, b, context.currentTime + toCue, null)
+}
+
+/**
+ * The cue, buffered: where in A's slice A's element plays is measured (it plays at rate 1 now), which sets the clock
+ * exactly; then A's sound moves to its buffer a little before t = 0 and B's comes from its buffer from `bAt`. If A
+ * can't be found in its slice, or it is too late for it, the transition plays without buffers.
+ */
+async function beginBuffered(p: Plan) {
+  const a = audio
+  const buffered = p.buffered
+  const transition = p.transition
+  const source = a ? decks.get(a)?.source : null
+  if (!a || !buffered || !transition || !source || !context) return
+  const ctx = context
+  const located = await locateElement(ctx, source, a, { slice: buffered.sliceA, mono: mono(buffered.sliceA.channels) }).catch(() => null)
+  if (plan !== p || p.status !== 'armed' || p.buffered !== buffered) return
+  const fallBack = () => {
+    dropBuffered(p)
+    p.status = 'ready'
+    mixerTick()
+  }
+  if (!located || a.paused || ctx.state !== 'running') return fallBack()
+  buffered.sliceA.start = calibratedStart(located, ctx.sampleRate)
+  // A plays at rate 1 into the transition: t = 0 is when it reaches aOut, counted from the located frame.
+  const zero = located.frame / ctx.sampleRate + (transition.aOut - located.position)
+  const sideA = await openSide(ctx, elementInput(a), buffered.sliceA, buffered.kindA).catch(() => null)
+  if (plan !== p || p.buffered !== buffered) return void (sideA && closeSide(sideA))
+  if (!sideA || zero - ctx.currentTime < sideA.deck.latency + MIN_HANDOVER_LEAD_S) {
+    if (sideA) closeSide(sideA)
+    return fallBack()
+  }
+  plan = null
+  p.cancelCue = () => {}
+  startRunning(p, a, p.element!, zero, { a: sideA, b: buffered.sideB })
+  p.buffered = null
+}
+
+/**
+ * The transition starts (its t = 0 at context time `zero`). With `sides` the decks' sound comes from their buffers
+ * (paths and loops as planned, see mix-buffers.ts) while the elements play on muted; without, the elements play it
+ * themselves, straight (no loops) at the rate curves.
+ */
+function startRunning(p: Plan, a: HTMLAudioElement, b: HTMLAudioElement, zero: number, sides: Running['sides']) {
+  const ctx = context!
+  const transition = p.transition!
+  const straight = (plan: DeckPlan): DeckPlan => (sides ? plan : { ...plan, lane: { start: plan.lane.start, path: [] } })
+  const braked = withBrake(transition, straight(deckPlan(transition, 'a')))
   const r: Running = {
     plan: p,
     transition,
     a,
     b,
-    start: context.currentTime + toCue,
+    start: zero,
     pausedAt: null,
-    // Never before B sounds (a negative bIn starts it late).
-    handover: Math.max(handoverPoint(transition), bDelay(transition)),
+    handover: handoverPoint(transition),
     handedOver: false,
     stops: [],
     learned: false,
     bStarted: false,
+    planA: braked.plan,
+    planB: straight(deckPlan(transition, 'b')),
+    brake: braked.semitones ? transition.effects.find((effect) => effect.kind === 'brake')!.at : null,
+    sides,
+    handoverLead: 0,
+    settled: bSettled(transition),
+    trailing: false,
   }
   running = r
   cancelEase()
-  // The limiter acts from now on (B isn't sounding yet) until the transition is over.
+  // The limiter acts from now on (B isn't sounding yet) until B plays alone at its own tempo again.
   master?.engage(true)
-  const from = Math.max(0, context.currentTime - r.start)
-  if (!safely(() => scheduleTransition({ a: deckA, b: deckB }, transition, r.start, { from }))) return abortRunning()
+  b.preservesPitch = true
+  elementGain(b).gain.value = sides ? 0 : 1
+  const deckA = decks.get(a)!
+  const deckB = decks.get(b)!
+  const from = Math.max(0, ctx.currentTime - zero)
+  if (!safely(() => scheduleTransition({ a: deckA, b: deckB }, transition, zero, { from }))) return abortRunning()
+  if (sides) {
+    // A's sound moves to its buffer (lined up to the sample) a little before t = 0; B's buffer starts at bAt.
+    r.handoverLead = Math.max(-HANDOVER_LEAD_S, ctx.currentTime - zero + sides.a.deck.latency + 0.05)
+    sides.a.deck.play(r.planA, r.handoverLead, transition.length, zero, braked.semitones)
+    crossfade(elementGain(a).gain, sides.a.gain.gain, zero + r.handoverLead)
+    sides.b.gain.gain.setValueAtTime(1, zero + Math.max(0, transition.bAt))
+    sides.b.deck.play(r.planB, Math.max(0, transition.bAt), r.settled + HANDBACK_AFTER_S + HANDBACK_SPAN_S, zero)
+  }
   follow(r)
 }
 
-/**
- * Starts B's element on its cue: at once when it starts at the transition's start (the cue that began it was already
- * early by the play lead), otherwise timed on A's position like the transition's own cue. Late (a sleeping tab, a
- * resume): B is moved to where it should be by then.
- */
-function startB(r: Running) {
-  const { transition, a, b } = r
-  const anchor = anchors(transition)
-  const go = () => {
-    if (running !== r || r.pausedAt !== null || r.bStarted) return
-    const lead = currentPlayLead()
-    const behind = (a.currentTime - anchor.a) / (a.playbackRate || 1) + lead
-    if (behind > 0.01 && !r.plan.backToBack) b.currentTime = anchor.b + transition.rate * behind
-    r.bStarted = true
-    void b.play().catch(() => running === r && !r.handedOver && abortRunning())
-  }
-  if (anchor.a <= transition.aOut || r.plan.backToBack) return go()
-  r.stops.push(waitForCue(context, a, anchor.a, currentPlayLead(), go))
-}
-
-/** Starts what a running transition does over time, from where it is now: B's alignment, the brake, handover, end. */
+/** Starts what a running transition does over time, from where it is now: the elements on their plans, the timers. */
 function follow(r: Running) {
   const ctx = context!
   const { transition } = r
   const now = () => ctx.currentTime - r.start
-  const brake = transition.effects.find((effect) => effect.kind === 'brake')
+  const muted = !!r.sides
   if (!r.bStarted) startB(r)
-  const anchor = anchors(transition)
-  r.stops.push(
-    keepAligned(ctx, {
-      a: r.a,
-      b: r.b,
-      aOut: anchor.a,
-      bIn: anchor.b,
-      rate: transition.rate,
-      // A braking deck's position no longer says where the beat is.
-      active: () => !brake || now() < brake.at,
-      onStart: (error) => {
-        if (r.learned) return
-        r.learned = true
-        learnPlayLead(error)
-      },
-    }),
-  )
-  if (!r.handedOver) r.stops.push(wakeAfter(ctx, r.handover - now(), () => handOver(r)))
-  r.stops.push(wakeAfter(ctx, transition.length - now(), () => finishRunning(r)))
-  if (!brake) return
-  let cancel = () => {}
-  r.stops.push(() => cancel())
-  const step = () => {
-    if (running !== r || r.pausedAt !== null) return
-    const local = now() - brake.at
-    if (local >= 0) {
-      r.a.preservesPitch = false
-      r.a.playbackRate = Math.max(MIN_ELEMENT_RATE, brakeRateAt(local, brake.length))
-    }
-    if (local < brake.length) cancel = wakeAfter(ctx, local < 0 ? -local : BRAKE_STEP_S, step)
+  else r.stops.push(followB(r))
+  // A follows its plan (muted: only once its sound comes from the buffer; until then it plays untouched at rate 1).
+  const followA = () =>
+    r.stops.push(
+      followPlan(ctx, {
+        element: r.a,
+        clock: now,
+        position: (t) => positionAt(r.planA, t),
+        rate: (t) => rateOf(r.planA, t),
+        pitchFollows: r.brake === null ? undefined : (t) => t >= r.brake!,
+        muted,
+      }),
+    )
+  if (!r.trailing) {
+    if (!muted || now() >= r.handoverLead + 0.05) followA()
+    else r.stops.push(wakeAfter(ctx, r.handoverLead + 0.05 - now(), followA))
   }
-  step()
+  if (!r.handedOver) r.stops.push(wakeAfter(ctx, r.handover - now(), () => handOver(r)))
+  if (!r.trailing) r.stops.push(wakeAfter(ctx, transition.length - now(), () => finishRunning(r)))
+  if (r.sides) r.stops.push(wakeAfter(ctx, r.settled + HANDBACK_AFTER_S - now(), () => void handBack(r)))
+}
+
+/** B's element starts at `bAt` (audible without buffers; muted with them, its sound comes from its buffer). */
+function startB(r: Running) {
+  const ctx = context!
+  const { transition, b } = r
+  const go = () => {
+    if (running !== r || r.pausedAt !== null || r.bStarted) return
+    const lead = currentPlayLead()
+    const t = ctx.currentTime - r.start + lead
+    if (t - transition.bAt > 0.01) b.currentTime = positionAt(r.planB, t)
+    r.bStarted = true
+    void b.play().catch(() => running === r && !r.handedOver && abortRunning())
+    r.stops.push(followB(r))
+  }
+  const wait = r.start + transition.bAt - currentPlayLead() - ctx.currentTime
+  if (wait <= 0.002) return go()
+  r.stops.push(wakeAfter(ctx, wait, go))
+}
+
+function followB(r: Running) {
+  const ctx = context!
+  return followPlan(ctx, {
+    element: r.b,
+    clock: () => ctx.currentTime - r.start,
+    position: (t) => positionAt(r.planB, t),
+    rate: (t) => rateOf(r.planB, t),
+    muted: !!r.sides,
+    onStart: (error) => {
+      if (r.learned || r.sides) return
+      r.learned = true
+      learnPlayLead(error)
+    },
+  })
 }
 
 /** B is louder now: it becomes the track playing (UI, reports, media session); A plays on until the overlap ends. */
@@ -1819,28 +1927,92 @@ function handOver(r: Running) {
   void extendQueue().then(() => cacheAhead())
 }
 
-/** The overlap is over: A is gone (its echo may ring out), B plays on as a plain deck, easing back to its own tempo. */
+/**
+ * A is gone (its echo may ring out). Without buffers B plays on as a plain deck, its rate easing back along its plan;
+ * with them B stays on its buffer (muted element following) until it plays at its own tempo, then hands back.
+ */
 function finishRunning(r: Running) {
-  if (running !== r) return
+  if (running !== r || r.trailing) return
   if (!r.handedOver) {
     handOver(r)
     if (running !== r) return
   }
-  running = null
   for (const stop of r.stops) stop()
+  r.stops = []
+  r.sides?.a.deck.stopAt(context!.currentTime)
   retire(r.a, ECHO_TAIL_S)
   const deckB = decks.get(r.b)
   if (deckB) safely(() => resetDeck(deckB, deckB.ctx.currentTime, SETTLE_S))
-  // B alone and neutral again: the limiter lets go (once its release has run out).
-  if (deckB) master?.engage(false, deckB.ctx.currentTime + SETTLE_S)
-  if (r.transition.rate !== 1) easeRate(r.b, r.transition)
-  else r.b.playbackRate = 1
+  if (r.sides) {
+    r.trailing = true
+    follow(r)
+    return
+  }
+  running = null
+  // B alone and neutral again: the limiter lets go once B is back at its own tempo (its release run out).
+  if (deckB) master?.engage(false, deckB.ctx.currentTime + Math.max(SETTLE_S, r.settled - (context!.currentTime - r.start)))
+  trail(r)
   mixerTick()
 }
 
 /**
+ * Buffered, after A is gone and B plays at its own tempo again: B's sound goes back to its element. The muted element
+ * is found in B's slice and nudged (it can't be heard) until it plays what the buffer plays, to 2 ms; then a 10 ms
+ * crossfade hands over and the buffers are let go.
+ */
+async function handBack(r: Running) {
+  const ctx = context
+  const sides = r.sides
+  const source = decks.get(r.b)?.source
+  if (running !== r || !sides || !ctx || !source || r.pausedAt !== null) return
+  for (const stop of r.stops) stop()
+  r.stops = []
+  const b = r.b
+  b.playbackRate = 1
+  const stillOn = () => running === r && r.pausedAt === null
+  for (let attempt = 0; attempt < HANDBACK_ATTEMPTS; attempt++) {
+    await new Promise((resolve) => wakeAfter(ctx, 0.25, () => resolve(null)))
+    if (!stillOn()) return
+    const located = await locateElement(ctx, source, b, sides.b).catch(() => null)
+    if (!stillOn()) return
+    if (!located) continue
+    // What the buffer played at the recorded frame, and how far the element is ahead of it.
+    const t = located.frame / ctx.sampleRate - r.start
+    const bufferIndex = (positionAt(r.planB, t) - sides.b.slice.start) * ctx.sampleRate
+    const ahead = (located.index - bufferIndex) / ctx.sampleRate
+    if (Math.abs(ahead) < HANDBACK_TOLERANCE_S) break
+    if (Math.abs(ahead) > 0.2) b.currentTime -= ahead
+    else {
+      // Closed within a second by its rate (muted, so its pitch doesn't matter).
+      b.playbackRate = 1 - ahead
+      await new Promise((resolve) => wakeAfter(ctx, 1, () => resolve(null)))
+      b.playbackRate = 1
+      if (!stillOn()) return
+    }
+  }
+  const at = ctx.currentTime + 0.05
+  crossfade(sides.b.gain.gain, elementGain(b).gain, at)
+  sides.b.deck.stopAt(at + 0.02)
+  wakeAfter(ctx, 0.1, () => {
+    if (running !== r) return
+    running = null
+    closeSides(r)
+    master?.engage(false)
+    mixerTick()
+  })
+}
+
+function closeSides(r: Running) {
+  if (!r.sides) return
+  closeSide(r.sides.a)
+  closeSide(r.sides.b)
+  r.sides = null
+}
+
+/**
  * Calls off a transition under way. The element of the track shown (A before the handover, B after) keeps playing as
- * a plain deck at its own speed; the other one fades out quickly and stops.
+ * a plain deck at its own speed (with buffers: its sound back from its element, which followed it muted); the other
+ * one fades out quickly and stops.
  */
 function abortRunning() {
   const r = running
@@ -1849,9 +2021,25 @@ function abortRunning() {
   for (const stop of r.stops) stop()
   cancelEase()
   const keep = r.handedOver ? r.b : r.a
-  retire(r.handedOver ? r.a : r.b, ABORT_TAIL_S)
+  const gone = r.handedOver ? r.a : r.b
+  if (r.sides && context) {
+    const now = context.currentTime
+    const keepSide = keep === r.a ? r.sides.a : r.sides.b
+    // Its sound back from the element (which followed muted), unless the element still sounds anyway.
+    if (elementGain(keep).gain.value < 0.5) crossfade(keepSide.gain.gain, elementGain(keep).gain, now)
+    r.sides.a.deck.stopAt(now + 0.01)
+    r.sides.b.deck.stopAt(now + 0.01)
+    const sides = r.sides
+    r.sides = null
+    wakeAfter(context, 0.05, () => {
+      closeSide(sides.a)
+      closeSide(sides.b)
+    })
+  }
+  retire(gone, ABORT_TAIL_S)
   keep.preservesPitch = true
   keep.playbackRate = 1
+  elementGain(keep).gain.value = 1
   const deck = decks.get(keep)
   if (deck) safely(() => resetDeck(deck, deck.ctx.currentTime, SETTLE_S))
   if (deck) master?.engage(false, deck.ctx.currentTime + SETTLE_S)
@@ -1886,24 +2074,28 @@ function retire(element: HTMLAudioElement, tail: number) {
     // Stopped first, then back to neutral (once the echo has died away, on the audio clock): never audible again.
     unload(element)
     element.playbackRate = 1
+    elementGain(element).gain.value = 1
     safely(() => resetDeck(deck, Math.max(deck.ctx.currentTime, quiet)))
     if (quiet > deck.ctx.currentTime) ringing.set(element, quiet)
     mixerTick()
   })
 }
 
-/** B's rate back to 1 over the 8 bars after its transition (pitch kept), following B's own position. */
-function easeRate(element: HTMLAudioElement, transition: Transition) {
+/** Without buffers, after A is gone: B's rate follows its plan back to 1, by B's own position (pitch kept). */
+function trail(r: Running) {
   cancelEase()
-  const from = element.currentTime
-  const span = rateEaseSeconds(transition.tempo.b)
+  const element = r.b
+  const planB = r.planB
+  const start = planB.lane.start
   let stopped = false
   let cancel = () => {}
   const step = () => {
     if (stopped || element !== audio) return
-    const progress = Math.min(1, Math.max(0, (element.currentTime - from) / span))
-    element.playbackRate = rateAt(transition, transition.length + progress * span)
-    if (progress < 1) cancel = wakeAfter(context, 0.25, step)
+    // The transition time at which B is where it is now (B plays straight here).
+    const t = timeOfAdvance(planB, Math.max(0, element.currentTime - start))
+    element.playbackRate = rateOf(planB, t)
+    if (t < r.settled) cancel = wakeAfter(context, 0.25, step)
+    else element.playbackRate = 1
   }
   cancelEase = () => {
     stopped = true
@@ -1921,10 +2113,31 @@ function mixerPaused() {
   }
   const r = running
   if (r && r.pausedAt === null && context) {
-    r.pausedAt = context.currentTime - r.start
+    const now = context.currentTime
+    r.pausedAt = now - r.start
     for (const stop of r.stops) stop()
     r.stops = []
     ;(r.handedOver ? r.a : r.b).pause()
+    if (r.sides && r.pausedAt < r.handoverLead) {
+      // Paused before any of it came from the buffers: it goes on without them (the elements play it, straight).
+      const sides = r.sides
+      sides.a.deck.stopAt(now)
+      sides.b.deck.stopAt(now)
+      sides.a.gain.gain.cancelScheduledValues(0)
+      sides.a.gain.gain.value = 0
+      elementGain(r.a).gain.cancelScheduledValues(0)
+      elementGain(r.a).gain.value = 1
+      elementGain(r.b).gain.value = 1
+      r.sides = null
+      r.planA = { ...r.planA, lane: { start: r.planA.lane.start, path: [] } }
+      r.planB = { ...r.planB, lane: { start: r.planB.lane.start, path: [] } }
+      wakeAfter(context, 0.05, () => {
+        closeSide(sides.a)
+        closeSide(sides.b)
+      })
+    }
+    r.sides?.a.deck.stopAt(now)
+    r.sides?.b.deck.stopAt(now)
     for (const element of [r.a, r.b]) {
       const deck = decks.get(element)
       if (deck) safely(() => freezeDeck(deck))
@@ -1949,11 +2162,20 @@ function mixerPlayed() {
   if (!r || r.pausedAt === null || !context) return
   const at = r.pausedAt
   r.pausedAt = null
-  // Both elements start again now (the other one a moment after this one): the transition's clock goes on with them.
-  r.start = context.currentTime + currentPlayLead() - at
+  // The transition's clock goes on with the elements, from where it stopped; the buffers are scheduled ahead of it.
+  const lead = r.sides ? Math.max(r.sides.a.deck.latency, r.sides.b.deck.latency) + 0.05 : currentPlayLead()
+  r.start = context.currentTime + lead - at
   const deckA = decks.get(r.a)
   const deckB = decks.get(r.b)
-  if (!deckA || !deckB || !safely(() => scheduleTransition({ a: deckA, b: deckB }, r.transition, r.start, { from: Math.max(0, at) }))) return abortRunning()
+  if (!deckA || !deckB) return abortRunning()
+  if (!r.trailing && !safely(() => scheduleTransition({ a: deckA, b: deckB }, r.transition, r.start, { from: Math.max(0, at) }))) return abortRunning()
+  if (r.sides) {
+    if (!r.trailing) r.sides.a.deck.play(r.planA, Math.max(at, r.handoverLead), r.transition.length, r.start)
+    // B's buffer plays on from where it was (or starts at bAt as planned); it is silent until then anyway.
+    r.sides.b.gain.gain.cancelScheduledValues(0)
+    r.sides.b.gain.gain.value = 1
+    r.sides.b.deck.play(r.planB, Math.max(at, r.transition.bAt), r.settled + HANDBACK_AFTER_S + HANDBACK_SPAN_S, r.start)
+  }
   // B goes on with A if it had started; otherwise `follow` starts it on its cue.
   if (r.handedOver || r.bStarted) void (r.handedOver ? r.a : r.b).play().catch(() => running === r && abortRunning())
   follow(r)
@@ -1975,6 +2197,110 @@ function followsBackToBack(element: HTMLAudioElement) {
 /** An element other than the current one failed: B while coming in (the transition is called off). */
 function mixerElementFailed(element: HTMLAudioElement) {
   if (running && running.b === element && !running.handedOver) abortRunning()
+}
+
+// -- buffers (sample-exact transitions from decoded slices) --
+
+/**
+ * Loads both decks' slices for a planned transition (A's from a little before the cue through its path, B's through
+ * its path until it can hand back), and lines B's up with its element by playing that a moment, muted. Ready when the
+ * transition is armed: it then plays from the buffers; otherwise (too slow, not found, failed) without.
+ */
+async function loadBuffered(p: Plan) {
+  const transition = p.transition
+  const ctx = context
+  const b = p.element
+  const source = b ? decks.get(b)?.source : null
+  if (!transition || !ctx || !b || !source || p.backToBack || !connection) return
+  const abort = new AbortController()
+  p.loading = abort
+  try {
+    const planA = withBrake(transition, deckPlan(transition, 'a')).plan
+    const planB = deckPlan(transition, 'b')
+    const settled = bSettled(transition)
+    const spanA = trackSpan(planA, -BUFFER_ARM_S - 1, transition.length)
+    const spanB = trackSpan(planB, Math.max(0, transition.bAt), settled + HANDBACK_AFTER_S + HANDBACK_SPAN_S + 2)
+    const [sliceA, sliceB] = await Promise.all([
+      sliceOf(p.from, spanA.from - SLICE_MARGIN_S, spanA.to + SLICE_MARGIN_S, ctx, abort.signal),
+      sliceOf(p.to, spanB.from - SLICE_MARGIN_S, spanB.to + SLICE_MARGIN_S, ctx, abort.signal),
+    ])
+    if (plan !== p || p.status !== 'ready' || running) return
+    // B's slice lined up with B's element: it plays a moment from bIn, muted, and is parked again (the transition
+    // isn't armed meanwhile).
+    p.calibrating = true
+    const gain = elementGain(b)
+    const found: Located[] = []
+    try {
+      gain.gain.value = 0
+      b.playbackRate = 1
+      await b.play()
+      const side = { slice: sliceB, mono: mono(sliceB.channels) }
+      for (let i = 0; i < B_CALIBRATIONS && plan === p; i++) {
+        const located = await locateElement(ctx, source, b, side).catch(() => null)
+        if (located) found.push(located)
+      }
+    } finally {
+      // (It stays muted: parking may let a few samples through; the transition sets its level when it starts, a plain
+      // start resets it.)
+      b.pause()
+      b.currentTime = Math.max(0, transition.bIn)
+      await parked(b, Math.max(0, transition.bIn)).catch(() => undefined)
+      p.calibrating = false
+    }
+    if (!found.length || plan !== p) return mixerTick()
+    sliceB.start = medianStart(found, ctx.sampleRate)
+    const kindB = bufferDeckKind(planB, Math.max(0, transition.bAt), settled, tempoChangeKind)
+    const sideB = await openSide(ctx, elementInput(b), sliceB, kindB)
+    if (plan !== p) return closeSide(sideB)
+    p.buffered = { sliceA, sideB, kindA: bufferDeckKind(planA, -HANDOVER_LEAD_S, transition.length, tempoChangeKind) }
+    mixerTick()
+  } catch {
+    // Without buffers then.
+  } finally {
+    if (p.loading === abort) p.loading = null
+  }
+}
+
+/** Drops a plan's buffers (it plays without them, or not at all). */
+function dropBuffered(p: Plan) {
+  p.loading?.abort()
+  p.loading = null
+  if (p.buffered) closeSide(p.buffered.sideB)
+  p.buffered = null
+}
+
+/** A stretch [from, to] of a track: from its download or the cache when it is there, else cut by Jellyfin. */
+async function sliceOf(item: BaseItemDto, from: number, to: number, ctx: BaseAudioContext, signal: AbortSignal): Promise<Slice> {
+  const start = Math.max(0, from)
+  const downloaded = await downloadedAudioUrl(downloadId(item))
+  const key = downloaded ? null : cacheKey(item)
+  const cached = key ? await cachedAudioUrl(key) : null
+  const blob = downloaded ?? cached
+  if (blob) {
+    try {
+      return await blobSlice(blob, start, to, ctx)
+    } finally {
+      release(blob)
+    }
+  }
+  return streamSlice(wavSliceUrl(item.Id!, start, ctx.sampleRate), start, to - start, ctx.sampleRate, signal)
+}
+
+/** Jellyfin cutting a track from `start` (seconds) as 16-bit stereo WAV at the context's sample rate. */
+function wavSliceUrl(id: string, start: number, sampleRate: number) {
+  const { api, userId, accessToken } = connection!
+  const params = new URLSearchParams({
+    UserId: userId,
+    DeviceId: jellyfin.deviceInfo.id,
+    AudioCodec: 'pcm_s16le',
+    AudioSampleRate: String(sampleRate),
+    AudioChannels: '2',
+    StartTimeTicks: String(secondsToTicks(start)),
+    Static: 'false',
+    PlaySessionId: crypto.randomUUID(),
+    ApiKey: accessToken,
+  })
+  return `${api.basePath}/Audio/${id}/stream.wav?${params}`
 }
 
 

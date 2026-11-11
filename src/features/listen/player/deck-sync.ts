@@ -1,12 +1,13 @@
 import { driftCorrection } from '../mixer/engine'
 
 /**
- * Timing for the mixer's two <audio> decks: waking up at the right moment (also in a hidden tab), starting deck B so
- * its first sound lands on A's cue point, and keeping B on A's beat while both play.
+ * Timing for the mixer's two <audio> decks: waking up at the right moment (also in a hidden tab), starting an element
+ * so its first sound lands where it should, and keeping each element on its deck's plan (the transition's clock) while
+ * a transition runs.
  *
  * A media element can't be started at an exact time the way a Web Audio source can: `play()` takes a moment before
- * its position starts moving. So B is started that moment early (`playLead`, learned from the transitions before),
- * and what is left of the error is closed by nudging B's rate (pitch kept) for the first beats.
+ * its position starts moving. So it is started that moment early (`playLead`, learned from the transitions before),
+ * and what is left of the error is closed by nudging its rate (pitch kept).
  */
 
 /**
@@ -94,23 +95,20 @@ export function waitForCue(ctx: BaseAudioContext | null, a: HTMLAudioElement, cu
   }
 }
 
-/**
- * How far B is off A's beat (seconds; positive: B is ahead), given that A's `aOut` and B's `bIn` belong together and
- * B plays at `rate`.
- */
-export function alignmentError(a: HTMLAudioElement, b: HTMLAudioElement, aOut: number, bIn: number, rate: number) {
-  return (b.currentTime - bIn) / rate - (a.currentTime - aOut)
-}
-
 /** Errors below this are left alone (single readings of an element's position jitter by several milliseconds). */
 const DEADBAND_S = 0.006
-/** Above this, B jumps to the right place instead of catching up by rate. */
+/** Above this an audible element jumps to the right place (once) instead of catching up by rate. */
 const JUMP_OVER_S = 0.25
+/** A muted element (its sound comes from a buffer deck) jumps whenever it is this far off: nobody hears it. */
+const MUTED_JUMP_OVER_S = 0.03
 const MEASURE_EVERY_S = 0.1
 /** How many readings the correction looks at (their median). */
 const WINDOW = 5
-/** Readings start once B has really moved this far (right after `play()` its position still stands). */
+/** Readings start once the element has really moved this far (right after `play()` or a jump its position stands). */
 const SETTLE_S = 0.15
+/** The slowest and fastest an element plays. */
+const MIN_RATE = 0.0625
+const MAX_RATE = 16
 
 const median = (values: number[]) => {
   const sorted = [...values].sort((x, y) => x - y)
@@ -118,28 +116,29 @@ const median = (values: number[]) => {
   return sorted.length % 2 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2
 }
 
-export interface Alignment {
-  a: HTMLAudioElement
-  b: HTMLAudioElement
-  aOut: number
-  bIn: number
-  rate: number
-  /** The error once B has settled (the median of its first readings): how well it started. Called once. */
+export interface PlanFollow {
+  element: HTMLAudioElement
+  /** Transition time now. */
+  clock: () => number
+  /** Where the element should be, and at which rate, at transition time t. */
+  position: (t: number) => number
+  rate: (t: number) => number
+  /** Whether the pitch follows the rate at t (a brake); otherwise the element keeps it. */
+  pitchFollows?: (t: number) => boolean
+  /** The element is muted (a buffer deck sounds instead): it may jump whenever it is off. */
+  muted?: boolean
+  /** The error once the element has settled (the median of its first readings): how well it started. Called once. */
   onStart?: (error: number) => void
-  /** Each reading, for diagnostics. */
-  onMeasure?: (error: number) => void
-  /** Whether A's position still says where the beat is (not while A is braking). */
-  active?: () => boolean
 }
 
 /**
- * Keeps B on A's beat: reads the error every 100 ms and nudges B's rate around `rate` by the median of the last
- * readings (single readings of `currentTime` jitter, the median doesn't follow them); a big error is jumped over once.
- * Returns a stop, which leaves B at exactly `rate`.
+ * Keeps an element on its deck's plan: reads its error every 100 ms (against the transition's clock) and sets its
+ * rate to the plan's, nudged by the median of the last readings (single readings jitter; the median doesn't follow
+ * them). A big error is jumped over. Returns a stop.
  */
-export function keepAligned(ctx: BaseAudioContext | null, alignment: Alignment): () => void {
-  const { a, b, aOut, bIn, rate } = alignment
-  const from = b.currentTime
+export function followPlan(ctx: BaseAudioContext | null, follow: PlanFollow): () => void {
+  const { element } = follow
+  let from = element.currentTime
   let stopped = false
   let cancelWake = () => {}
   let readings: number[] = []
@@ -147,28 +146,32 @@ export function keepAligned(ctx: BaseAudioContext | null, alignment: Alignment):
   let jumped = false
   const step = () => {
     if (stopped) return
-    const steady = !a.paused && !b.paused && !a.seeking && !b.seeking && a.readyState >= 3 && b.readyState >= 3 && b.currentTime - from >= SETTLE_S
-    if (steady && (alignment.active?.() ?? true)) {
-      const error = alignmentError(a, b, aOut, bIn, rate)
-      alignment.onMeasure?.(error)
+    const t = follow.clock()
+    const rate = Math.min(MAX_RATE, Math.max(MIN_RATE, follow.rate(t)))
+    element.preservesPitch = !follow.pitchFollows?.(t)
+    const steady = !element.paused && !element.seeking && element.readyState >= 3 && Math.abs(element.currentTime - from) >= SETTLE_S
+    if (steady) {
+      const error = element.currentTime - follow.position(t)
       readings = [...readings, error].slice(-WINDOW)
       const typical = median(readings)
       if (!started && readings.length >= 3) {
         started = true
-        alignment.onStart?.(typical)
+        follow.onStart?.(typical)
       }
-      if (readings.length >= 3 && Math.abs(typical) > JUMP_OVER_S && !jumped) {
+      const jumpOver = follow.muted ? MUTED_JUMP_OVER_S : JUMP_OVER_S
+      if (readings.length >= 3 && Math.abs(typical) > jumpOver && (follow.muted || !jumped)) {
         jumped = true
         readings = []
-        b.currentTime = bIn + rate * (a.currentTime - aOut + playLead)
-      } else if (readings.length >= 3) b.playbackRate = Math.abs(typical) < DEADBAND_S ? rate : driftCorrection(typical, rate)
-    }
+        element.currentTime = follow.position(t + playLead)
+        from = element.currentTime
+      } else if (readings.length >= 3) element.playbackRate = Math.abs(typical) < DEADBAND_S ? rate : Math.min(MAX_RATE, Math.max(MIN_RATE, driftCorrection(typical, rate)))
+      else element.playbackRate = rate
+    } else if (!element.paused) element.playbackRate = rate
     cancelWake = wakeAfter(ctx, MEASURE_EVERY_S, step)
   }
   step()
   return () => {
     stopped = true
     cancelWake()
-    b.playbackRate = rate
   }
 }

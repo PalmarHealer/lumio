@@ -17,6 +17,13 @@ import { createStretch } from './stretch'
  */
 export type BufferDeckKind = 'exact' | 'stretch'
 
+/**
+ * How a deck whose tempo changes is played, in the player and in render.ts alike: with its pitch kept (`stretch`), or
+ * `exact` (the pitch follows the tempo). Decks at rate 1 always play exactly.
+ */
+export let tempoChangeKind: BufferDeckKind = 'stretch'
+export const setTempoChangeKind = (kind: BufferDeckKind) => (tempoChangeKind = kind)
+
 export interface BufferDeck {
   kind: BufferDeckKind
   /** How far ahead (seconds) playback must be scheduled to land exactly. */

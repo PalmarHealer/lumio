@@ -76,6 +76,12 @@ export interface TrackMix {
    * melodies and chords have similar profiles (cosine). Empty in analyses made before it.
    */
   phraseChroma: number[][]
+  /**
+   * Seconds the song's kick attacks lie behind its beat grid (the grid follows the broadband and snare/clap attacks;
+   * a kick's low rise peaks later by a song-specific amount): the median over the 2-bar stretches with one clear kick
+   * attack. 0 when unknown (fewer than 4 such stretches) and in analyses made before it.
+   */
+  kickOffset: number
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean
@@ -1449,6 +1455,11 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
     return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
   })
+  // How late the kick attacks lie behind the grid (the grid follows the broadband and accent attacks; a kick's low
+  // rise peaks later by a song-specific amount): per 2 bars, the kick band's averaged attack (see beatProfiles) where it
+  // has one clear peak; the median over those, 0 with fewer than 4 of them.
+  const kickProfiles = beatProfiles(beats, fineOnsets(samples, rate, 40, 150), 0.08).filter((profile, i) => i % 8 === 4 && profile.prominence >= 0.6 && profile.rival < 0.75)
+  const kickOffset = kickProfiles.length >= 4 ? round(median(kickProfiles.map((profile) => profile.shift)), 3) : 0
   const barClarity = downbeats.map((start, b) => {
     const end = downbeats[b + 1] ?? duration
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
@@ -1767,6 +1778,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     phraseClarity,
     barClarity,
     phraseChroma,
+    kickOffset,
     key: top.key,
     minor: top.minor,
     keyClarity: round(Math.max(0, top.r)),

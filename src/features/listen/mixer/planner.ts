@@ -108,6 +108,11 @@ const BEAT_HEARD = 0.3
 const KICK_HEARD = BEAT_HEARD
 /** Clarity at which a beatmatch counts as fully verifiable (below it, a soft cost). */
 const MIN_CLARITY = 0.6
+/**
+ * Mean offset (seconds) between the decks' beats allowed in any one bar where both are heard, after the fitted rate and
+ * phase: a drift the fit can't take out (the songs' tempos bending differently) is heard as the beats sliding apart.
+ */
+const MAX_BAR_OFFSET = 0.01
 /** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
 const MAX_WINDOW_DRIFT = 0.025
 /**
@@ -806,7 +811,7 @@ function beatOffsets(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple:
  */
 function phaseError(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: number) {
   const { times, offsets, heard } = beatOffsets(p, a, b, multiple, 0.45)
-  if (offsets.length === 0) return { median: 0, p90: 0, checked: heard === 0 ? 1 : 0, worstWindow: 0 }
+  if (offsets.length === 0) return { median: 0, p90: 0, checked: heard === 0 ? 1 : 0, worstWindow: 0, worstBar: 0 }
   const window = 8 * p.stats.beat
   const sums = new Map<number, { sum: number; count: number }>()
   times.forEach((t, i) => {
@@ -819,7 +824,18 @@ function phaseError(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
   const sorted = offsets.map(Math.abs).sort((x, y) => x - y)
   let worstWindow = 0
   for (const { sum, count } of sums.values()) if (count >= 3) worstWindow = Math.max(worstWindow, Math.abs(sum / count))
-  return { median: sorted[sorted.length >> 1], p90: sorted[Math.floor(sorted.length * 0.9)], checked: offsets.length / heard, worstWindow }
+  // Per bar of A (4 beats): the mean offset, which the fitted rate and phase must keep within MAX_BAR_OFFSET everywhere.
+  const bars = new Map<number, { sum: number; count: number }>()
+  times.forEach((t, i) => {
+    const w = Math.floor(t / (4 * p.stats.beat))
+    const entry = bars.get(w) ?? { sum: 0, count: 0 }
+    entry.sum += offsets[i]
+    entry.count++
+    bars.set(w, entry)
+  })
+  let worstBar = 0
+  for (const { sum, count } of bars.values()) if (count >= 2) worstBar = Math.max(worstBar, Math.abs(sum / count))
+  return { median: sorted[sorted.length >> 1], p90: sorted[Math.floor(sorted.length * 0.9)], checked: offsets.length / heard, worstWindow, worstBar }
 }
 
 /**
@@ -1609,8 +1625,9 @@ export function planTransition(
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
     // against A's beats. Judged two bars at a time too.
-    const drift = placement.beatmatched ? phaseError(placement, a, b, tempo.multiple) : { median: 0, p90: 0, checked: 1, worstWindow: 0 }
-    if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75 || drift.worstWindow > MAX_WINDOW_DRIFT) return null
+    const drift = placement.beatmatched ? phaseError(placement, a, b, tempo.multiple) : { median: 0, p90: 0, checked: 1, worstWindow: 0, worstBar: 0 }
+    if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75 || drift.worstWindow > MAX_WINDOW_DRIFT || drift.worstBar > MAX_BAR_OFFSET)
+      return null
     // A swung groove against a straight one flams wherever both beats are loud: a little of that is a handover, more
     // costs (up to a 16-beat stretch, then the full price).
     let swingTerm = 0

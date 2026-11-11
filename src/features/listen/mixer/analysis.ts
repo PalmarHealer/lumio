@@ -39,8 +39,8 @@ export interface PreparedTrack {
   /** `vocals` were measured (synced lyrics or the audio). */
   vocalsKnown: boolean
   /**
-   * Nothing was measured, so `vocals` are assumed: the body sections (not intro, outro or break) whose mid band is up
-   * like a voice's, padded by a bar each side. Treated like measured singing, at lower trust where cutting it.
+   * Nothing was measured, so `vocals` are assumed: the sections whose mid band is up like a voice's (intros and outros
+   * included), padded by a bar each side. Treated like measured singing, at lower trust where cutting it.
    */
   vocalsAssumed: boolean
   /** First and last moment the song is clearly audible (leading silence and a fade-out tail left out). */
@@ -82,8 +82,11 @@ export interface PreparedTrack {
 
 /** A section's mean mid band (against the song's loud mids) from which it may hold a voice, when nothing was measured. */
 const ASSUMED_VOICE_MID = 0.5
-/** The same where the song has lyrics that couldn't be placed (singing is certain, only where is unknown). */
-const UNPLACED_VOICE_MID = 0.35
+/**
+ * The same where the song has lyrics that couldn't be placed (singing is certain, only where is unknown): a quiet sung
+ * intro (Titanium's, 0.23 against its drops) must count too; only near-silent or thin parts stay free.
+ */
+const UNPLACED_VOICE_MID = 0.2
 
 const finite = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x))
@@ -260,8 +263,8 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
   const introEnd = finite(mix.introEnd) ? clamp(mix.introEnd, 0, duration) : 0
   const outroStart = finite(mix.outroStart) && mix.outroStart > introEnd ? clamp(mix.outroStart, 0, duration) : duration
 
-  // Vocals: as measured; when nothing was placed (no lyrics, or lyrics not placeable), assume singing in every body section
-  // with a voice-like mid band, a bar of margin each side, so no voice of the other song lands on it and a clean mix
+  // Vocals: as measured; when nothing was placed (no lyrics, or lyrics not placeable), assume singing in every section
+  // (intros and outros too: a song may open sung) with a voice-like mid band, a bar of margin each side, so no voice of the other song lands on it and a clean mix
   // doesn't cut into it. A song without such sections (thin mids: an instrumental) gets none.
   const vocalsKnown = (mix.vocalSource === 'lyrics' || mix.vocalSource === 'audio') && Array.isArray(mix.vocals)
   const sections = cleanSections(mix.sections, duration)
@@ -281,7 +284,7 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
       return count > 0 ? sum / count : 0
     }
     const assumed = sections
-      .filter((s) => s.kind !== 'intro' && s.kind !== 'outro' && s.kind !== 'break' && midOver(s.start, s.end) >= voiceMid)
+      .filter((s) => midOver(s.start, s.end) >= voiceMid)
       .map((s) => ({ start: Math.max(0, s.start - pad), end: Math.min(duration, s.end + pad) }))
     vocals = cleanSpans(assumed, duration)
   }

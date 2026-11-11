@@ -8,7 +8,7 @@
  */
 
 /** Raised when the analysis changes, so songs are analysed again. */
-export const MIX_VERSION = 2
+export const MIX_VERSION = 3
 
 export type SectionKind = 'intro' | 'verse' | 'chorus' | 'drop' | 'build' | 'break' | 'outro' | 'other'
 
@@ -30,12 +30,18 @@ export interface TrackMix {
   /** Global tempo (60–200 BPM) and how sure the analysis is of it and of the beat grid (0–1). */
   bpm: number
   bpmConfidence: number
-  /** Beat times (seconds, 3 decimals), following the music (not a rigid grid). */
+  /** Beat times (seconds, 3 decimals), following the music (not a rigid grid), on the audible attacks. */
   beats: number[]
   /** The beats that start a bar (a subset of `beats`). */
   downbeats: number[]
   /** Phrase starts: downbeats where an 8-bar (sometimes 4/16) phrase begins, usually where sections change. */
   phrases: number[]
+  /**
+   * Per phrase (same index as `phrases`, each up to the next phrase or the end): how clearly its beats are heard as
+   * attacks (0–1, the share of beats with a clear onset on the grid). Beatmatching over a phrase with unclear attacks
+   * can't be trusted to line up audibly.
+   */
+  phraseClarity: number[]
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean

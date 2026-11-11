@@ -80,7 +80,7 @@ const KEY_CLASH = 0.5
  * How much louder than the louder song's own loud parts the two decks may sound together, per band (dB, 95th
  * percentile over the overlap), and how far below them the overlap may sink on average before it's a hole.
  */
-const MAX_OVER_DB = 2
+const MAX_OVER_DB = 1.8
 const HOLE_DB = -6
 /** Room (seconds) a blend's B gets to be moved earlier by the phase fit. */
 const PHASE_SLACK = 0.05
@@ -225,7 +225,9 @@ interface Variant {
   volume?: 'overlap' | 'fade' | 'scurve'
   bassAt?: 'start' | 'middle' | 'none'
   filterIn?: 'hp' | 'lp' | null
-  filterOut?: 'hp' | 'lp' | null
+  filterOut?: 'hp' | 'lp' | 'eq' | null
+  /** Blend: bars of B played under A before B's event lands on A's boundary (the swap); the rest come after. */
+  pre?: number
   /**
    * 'swap': the chosen phrase starts of both songs meet at the swap, so the moment the bass changes deck lies on a
    * phrase of each (and B's drop or chorus lands on it); 'shape': at the shape's own anchors.
@@ -244,12 +246,17 @@ const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwa
  * at full volume ("overlap"), also 4 and 16, the long fade over 16 bars, the seamless S-curve over 2. Which EQ and
  * filter it gets is chosen per placement (`blendFinishes`).
  */
-const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve'; bars: number; prior: number; party: boolean; clean: boolean }> = [
-  { volume: 'overlap', bars: 8, prior: 0, party: true, clean: true },
-  { volume: 'overlap', bars: 16, prior: -0.04, party: true, clean: true },
-  { volume: 'overlap', bars: 4, prior: -0.04, party: true, clean: false },
-  { volume: 'fade', bars: 16, prior: -0.05, party: true, clean: true },
-  { volume: 'scurve', bars: 2, prior: -0.08, party: true, clean: true },
+const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
+  // B's event lands on A's boundary after `pre` bars of B under A; A plays on, thinned, for `post` bars to its next
+  // section, where it leaves. Pop: 4-bar phrases, 8-bar blends; dance music: 8 + 8 or more.
+  { volume: 'overlap', pre: 4, post: 4, prior: 0, party: true, clean: true },
+  { volume: 'overlap', pre: 0, post: 8, prior: 0, party: true, clean: true },
+  { volume: 'overlap', pre: 8, post: 8, prior: -0.03, party: true, clean: true },
+  { volume: 'overlap', pre: 0, post: 16, prior: -0.04, party: true, clean: true },
+  { volume: 'overlap', pre: 0, post: 4, prior: -0.04, party: true, clean: false },
+  { volume: 'overlap', pre: 16, post: 8, prior: -0.05, party: false, clean: true },
+  { volume: 'fade', pre: 8, post: 8, prior: -0.05, party: true, clean: true },
+  { volume: 'scurve', pre: 1, post: 1, prior: -0.08, party: true, clean: true },
 ]
 
 /**
@@ -257,20 +264,15 @@ const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve'; bars: number
  * out on A). Keys that clash take the tonal swap at the middle instead of an overlap of mids.
  */
 function blendFinishes(variant: Variant, clash: boolean): Variant[] {
-  // Short blends change the bass at their start, which lies on the phrase grid (their middle doesn't).
-  if (variant.volume === 'scurve') return [{ ...variant, bassAt: 'start', filterIn: null, filterOut: null, midSwap: clash }]
-  if (variant.bars < 8)
-    return [
-      { ...variant, bassAt: 'start', filterIn: null, filterOut: 'hp', midSwap: clash, prior: variant.prior + 0.03 },
-      { ...variant, bassAt: 'start', filterIn: null, filterOut: 'lp', midSwap: clash, prior: variant.prior + 0.02 },
-      { ...variant, bassAt: 'start', filterIn: null, filterOut: null, midSwap: clash, prior: variant.prior + 0.01 },
-    ]
+  // The bass changes deck on the swap (A's boundary): 'start' when B's event opens the blend.
+  const at: NonNullable<Variant['bassAt']> = (variant.pre ?? 0) === 0 ? 'start' : 'middle'
+  if (variant.volume === 'scurve') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: clash }]
   const finishes: Array<[NonNullable<Variant['bassAt']>, Variant['filterIn'], Variant['filterOut'], number]> = [
-    ['middle', 'hp', 'hp', 0.03],
-    ['middle', null, 'hp', 0.025],
-    ['middle', 'lp', 'lp', 0.02],
-    ['start', 'hp', 'hp', 0.02],
-    ['start', null, 'hp', 0.015],
+    [at, 'hp', 'hp', 0.03],
+    [at, null, 'hp', 0.025],
+    [at, 'lp', 'lp', 0.02],
+    [at, null, 'eq', 0.015],
+    [at, null, 'lp', 0.015],
     ['none', null, null, 0],
   ]
   return finishes.map(([bassAt, filterIn, filterOut, prior]) => ({ ...variant, bassAt, filterIn, filterOut, midSwap: clash, prior: variant.prior + prior }))
@@ -296,10 +298,12 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
   }
   const addBlends = (prior: number) => {
     for (const layout of BLEND_LAYOUTS) {
-      if (!(style === 'party' ? layout.party : layout.clean) || layout.bars > maxBars) continue
+      const bars = layout.pre + layout.post
+      if (!(style === 'party' ? layout.party : layout.clean) || bars > maxBars) continue
       list.push({
         preset: 'blend',
-        bars: layout.bars,
+        bars,
+        pre: layout.pre,
         swapFraction: 0.5,
         preRollBars: 0,
         filter: true,
@@ -337,7 +341,7 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
   // A technique this style doesn't use on its own (the editor's choice): plain defaults.
   const bars = FREE_LENGTH.has(forced) ? (synced ? [16, 8, 4] : [2]) : [0]
   if (forced === 'blend')
-    return [{ preset: 'blend', bars: 8, swapFraction: 0.5, preRollBars: 0, filter: true, midSwap: false, volume: 'overlap', bassAt: 'middle', filterIn: 'hp', filterOut: 'hp', meet: 'shape', prior: 0 }]
+    return [{ preset: 'blend', bars: 8, pre: 4, swapFraction: 0.5, preRollBars: 0, filter: true, midSwap: false, volume: 'overlap', bassAt: 'middle', filterIn: 'hp', filterOut: 'hp', meet: 'shape', prior: 0 }]
   return bars.map((n) => ({
     preset: forced,
     bars: n,
@@ -625,9 +629,16 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     total += sum / 3
     samples++
     busy += Math.min(1, (eA.mid + eA.high + eB.mid + eB.high) / 4)
-    const bassA = gA * valueAt(shape.a.low, t, 1) * fA.low * eA.low
-    const bassB = gB * valueAt(shape.b.low, t, 1) * fB.low * eB.low
-    if (bassA > 0.5 && bassB > 0.5) basses += dt * step
+  }
+  // Two basslines, at every sample (the moments around a swap matter).
+  for (let i = 0; i < stats.gainA.length; i++) {
+    const t = i * dt
+    if (t < p.bStart || t > length) continue
+    const atB = positionB(p, t)
+    if (atB === null) continue
+    const bassA = stats.gainA[i] * valueAt(shape.a.low, t, 1) * filterBands(valueAt(shape.a.filter, t, 0)).low * a.bandsAt(positionA(p, t)).low
+    const bassB = stats.gainB[i] * valueAt(shape.b.low, t, 1) * filterBands(valueAt(shape.b.filter, t, 0)).low * b.bandsAt(atB).low
+    if (bassA > 0.5 && bassB > 0.5) basses += dt
   }
   if (samples === 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0 }
   over.sort((x, y) => x - y)
@@ -840,16 +851,18 @@ function loopSplits(bars: number) {
  * A's material for a blend of `bars` bars from `start` on: straight on, or the bars up to a loopable stretch (the last
  * 4 or 8 of them) that then repeats, so A may leave a sung or unclear tail for a clear instrumental phrase of its own.
  */
-function lanesFrom(track: PreparedTrack, start: number, bars: number): LaneOption[] {
+function lanesFrom(track: PreparedTrack, start: number, bars: number, gridShift = 0): LaneOption[] {
   const i0 = floorIndex(track.downbeats, start + 0.05)
   const db = track.downbeats
   if (i0 < 0 || Math.abs(db[i0] - start) > 0.05) return []
+  // The phrase grid is the boundary's: `gridShift` bars after the start (whole 4-bar steps from it count as on grid).
+  const grid = i0 + gridShift
   const options: LaneOption[] = []
-  if (i0 + bars < db.length && db[i0 + bars] <= track.end && keepsGrid(track, i0, i0, i0 + bars))
+  if (i0 + bars < db.length && db[i0 + bars] <= track.end && keepsGrid(track, grid, i0, i0 + bars))
     options.push({ lane: { start, path: [] }, advance: db[i0 + bars] - start, extra: 0 })
   for (const { straight, loopBars, plays } of loopSplits(bars)) {
     const first = i0 + straight - loopBars
-    if (i0 + straight >= db.length || !loopable(track, first, loopBars) || !keepsGrid(track, i0, i0, i0 + straight)) continue
+    if (i0 + straight >= db.length || !loopable(track, first, loopBars) || !keepsGrid(track, grid, i0, i0 + straight)) continue
     const loopStart = db[first]
     const loopEnd = db[i0 + straight]
     const path: DeckSegment[] =
@@ -869,15 +882,17 @@ function lanesFrom(track: PreparedTrack, start: number, bars: number): LaneOptio
  * straight up to it, or from a loopable stretch (4 or 8 bars) that repeats first and then plays on to `end`, so B may
  * open on a clear instrumental phrase of its own even when its very first bars are sparse.
  */
-function lanesTo(track: PreparedTrack, end: number, bars: number): LaneOption[] {
+function lanesTo(track: PreparedTrack, end: number, bars: number, gridShift = 0): LaneOption[] {
   const iE = floorIndex(track.downbeats, end + 0.05)
   const db = track.downbeats
   if (iE < 0 || Math.abs(db[iE] - end) > 0.05) return []
+  // The phrase grid is the event's: `gridShift` bars before the end.
+  const grid = iE - gridShift
   const options: LaneOption[] = []
-  if (iE - bars >= 0 && keepsGrid(track, iE, iE - bars, iE)) options.push({ lane: { start: db[iE - bars], path: [] }, advance: end - db[iE - bars], extra: 0 })
+  if (iE - bars >= 0 && keepsGrid(track, grid, iE - bars, iE)) options.push({ lane: { start: db[iE - bars], path: [] }, advance: end - db[iE - bars], extra: 0 })
   for (const { straight, loopBars, plays } of loopSplits(bars)) {
     const first = iE - straight
-    if (!loopable(track, first, loopBars) || !keepsGrid(track, iE, first, iE)) continue
+    if (!loopable(track, first, loopBars) || !keepsGrid(track, grid, first, iE)) continue
     const start = db[first]
     const loopEnd = db[first + loopBars]
     options.push({
@@ -1092,9 +1107,9 @@ export function planTransition(
 
   const shapeFor = (variant: Variant, beat: number) => {
     // Half time: B's bar spans two of A's, so the swap goes on an even bar of A.
-    const rawSwap = variant.bars * variant.swapFraction
+    const rawSwap = variant.pre ?? variant.bars * variant.swapFraction
     const swapBar = tempo.synced && tempo.multiple === 2 ? 2 * Math.round(rawSwap / 2) : Math.round(rawSwap)
-    const key = `${variant.preset}:${variant.bars}:${swapBar}:${variant.preRollBars}:${variant.filter}:${variant.midSwap}:${variant.volume}:${variant.bassAt}:${variant.filterIn}:${variant.filterOut}:${variant.meet}:${beat.toFixed(5)}`
+    const key = `${variant.preset}:${variant.bars}:${variant.pre}:${swapBar}:${variant.preRollBars}:${variant.filter}:${variant.midSwap}:${variant.volume}:${variant.bassAt}:${variant.filterIn}:${variant.filterOut}:${variant.meet}:${beat.toFixed(5)}`
     let stats = shapes.get(key)
     if (!stats) {
       const shape = presetShape(variant.preset, {
@@ -1156,6 +1171,8 @@ export function planTransition(
     // tonal terms per finish (its finishes differ there), plus the best finish's prior.
     if (variant.preset === 'blend') {
       bound += BEST_FINISH
+      // Something must kick in on B as A leaves (its drop, chorus, groove): a thin part there is an anticlimax.
+      bound -= 0.3 * Math.max(0, 0.5 - b.energyBetween(bEnd, bEnd + 4 * b.period))
       // Parts whose melodies are alike blend cleanly (the user's favourite): the phrases meeting at the middle.
       const middle = stats.shape.swap
       const likeness = cosine(a.chromaAt(positionA(placed, middle)), b.chromaAt(positionB(placed, middle) ?? p.laneB.start))
@@ -1177,14 +1194,31 @@ export function planTransition(
       if (!tempo.synced) continue
       const barsB = variant.bars / tempo.multiple
       if (!Number.isInteger(barsB) || barsB % 4 !== 0) continue
-      // Both ends of a blend on the phrase grid, so its middle (the swap) is a phrase point of both songs too. Besides,
-      // A may play out completely in clean style: a blend ending on A's last bar (nothing of A skipped, B's intro under it).
+      // Event-based, as a DJ places it: B's event (its kick-in, drop, chorus, first vocal) lands on A's boundary (A's
+      // outro start, the end of a chorus, a section change), both on the phrase grid; the bass changes deck there. B
+      // plays `pre` bars under A before it, A `post` bars on after it to its next section. In clean style a blend may
+      // also end on A's last bar (A plays out completely, B's intro under it).
+      const pre = variant.pre ?? variant.bars / 2
+      const post = variant.bars - pre
+      const preB = pre / tempo.multiple
+      const postB = post / tempo.multiple
+      if (!Number.isInteger(preB) || !Number.isInteger(postB)) continue
       const onGrid = (track: PreparedTrack, t: number) => Math.abs(nearest(track.phraseGrid, t) - t) < 0.05
-      const lanesB = ins.map((pb) => ({ pb, options: (party && pb.t > b.duration * 0.6) || !onGrid(b, pb.t) ? [] : lanesTo(b, pb.t, barsB) }))
+      const shiftBars = (track: PreparedTrack, t: number, bars: number) => {
+        const i = floorIndex(track.downbeats, t + 0.05)
+        const k = i + bars
+        return i >= 0 && Math.abs(track.downbeats[i] - t) <= 0.05 && k >= 0 && k < track.downbeats.length ? track.downbeats[k] : NaN
+      }
+      const lanesB = ins.map((pb) => {
+        const end = shiftBars(b, pb.t, postB)
+        return { pb, options: (party && pb.t > b.duration * 0.6) || !onGrid(b, pb.t) || !Number.isFinite(end) ? [] : lanesTo(b, end, barsB, postB) }
+      })
       const lastBar = floorIndex(a.downbeats, a.end + 0.05)
-      const playOut: Anchor[] = !party && lastBar - variant.bars >= 0 ? [{ t: a.downbeats[lastBar - variant.bars], bonus: 0, drop: false, chorus: false }] : []
-      for (const pa of [...outs.filter((anchor) => onGrid(a, anchor.t)), ...playOut])
-        for (const fromA of lanesFrom(a, pa.t, variant.bars)) {
+      const playOut: Anchor[] = !party && lastBar - post >= 0 ? [{ t: a.downbeats[lastBar - post], bonus: 0, drop: false, chorus: false }] : []
+      for (const pa of [...outs.filter((anchor) => onGrid(a, anchor.t)), ...playOut]) {
+        const start = shiftBars(a, pa.t, -pre)
+        if (!Number.isFinite(start)) continue
+        for (const fromA of lanesFrom(a, start, variant.bars, pre)) {
           // The shape's beat: A's real bars over the material (loops included), so the swap lands on A's bar.
           const stats = shapeFor(variant, fromA.advance / (4 * variant.bars))
           if (stats.basses > 0.001) continue
@@ -1196,12 +1230,14 @@ export function planTransition(
               // agree with the songs' beats there (a bar the analysis miscounted would put B off by a beat).
               const rate = toB.advance / length
               if (!rateOk(rate)) continue
-              const byBeats = periodOver(b, toB.lane.start, pb.t) / (tempo.multiple * periodOver(a, fromA.lane.start, laneReach(fromA.lane, length)))
+              const byBeats =
+                periodOver(b, toB.lane.start, laneReach(toB.lane, length * rate)) / (tempo.multiple * periodOver(a, fromA.lane.start, laneReach(fromA.lane, length)))
               if (Math.abs(rate / byBeats - 1) > 0.01) continue
               const base = { stats, variant, laneA: fromA.lane, laneB: toB.lane, bStart: PHASE_SLACK, rate, beatmatched: true, clarity: NaN, loops: fromA.extra + toB.extra, slack: PHASE_SLACK, pa, pb }
               placements.push({ ...base, ...scoreBound(base) })
             }
         }
+      }
       continue
     }
     for (const pa of outs) {

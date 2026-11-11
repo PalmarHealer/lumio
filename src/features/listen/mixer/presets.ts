@@ -70,9 +70,12 @@ export interface PresetContext {
   volume?: 'overlap' | 'fade' | 'scurve'
   /** Blend: where the bass changes deck (start, middle) or 'none' (one of the two parts has no bass of its own). */
   bassAt?: 'start' | 'middle' | 'none'
-  /** Blend: a filter on B opening over the first half, and on A closing over the second half (high- or low-pass). */
+  /**
+   * Blend: a filter on B opening up to the swap, and on A closing after it (high- or low-pass); or A's EQ worked down
+   * before the swap, highs first, then mids (its voice), bass last on the swap ('eq': making a gap for B).
+   */
   filterIn?: 'hp' | 'lp' | null
-  filterOut?: 'hp' | 'lp' | null
+  filterOut?: 'hp' | 'lp' | 'eq' | null
   /** Echo out: delay in beats and feedback (defaults 1 beat, 0.5). */
   echoBeats?: number
   echoFeedback?: number
@@ -516,7 +519,8 @@ export function matchLevels(shape: PresetShape, beat: number, difference: number
 function blend(ctx: PresetContext): PresetShape {
   const bars = Math.max(1, ctx.bars)
   const length = bars * 4 * ctx.beat
-  const middle = bars >= 2 ? swapTime(ctx, length, bars / 2) : length / 2
+  // The swap: on the bar the planner lines up with A's section boundary (0 = the start).
+  const middle = ctx.swapBar !== undefined ? Math.min(length, Math.max(0, Math.round(ctx.swapBar))) * 4 * ctx.beat : bars >= 2 ? swapTime(ctx, length, bars / 2) : length / 2
   const volume = ctx.volume ?? 'fade'
   const bassAt = ctx.bassAt ?? 'middle'
   // The old 16-bar layout: high-pass in on B, high-pass out on A, unless the filters are given.
@@ -558,7 +562,7 @@ function blend(ctx: PresetContext): PresetShape {
             [0, 0],
             [RAMP, 1],
           ]
-  const swapAt = bassAt === 'start' ? RAMP : middle
+  const swapAt = bassAt === 'start' || middle === 0 ? RAMP : middle
   // A DJ's bass swap is gradual: A's low goes down to half over the two bars before the phrase downbeat and is gone on
   // it, where B's low comes in (never both full: B's stays killed until then).
   const preCut = bassAt === 'middle' ? Math.min(8 * ctx.beat, middle / 2) : 0
@@ -570,9 +574,14 @@ function blend(ctx: PresetContext): PresetShape {
         [middle - beat, 1],
         [middle, 0.1],
       ]
-    : volume === 'fade'
-      ? aBand
-      : []
+    : filterOut === 'eq' && middle > 0
+      ? [
+          [Math.max(0, middle - 4 * ctx.beat), 1],
+          [middle, 0.3],
+        ]
+      : volume === 'fade'
+        ? aBand
+        : []
   const bMid: Point[] = ctx.midSwap
     ? [
         [middle, 0.1],
@@ -581,14 +590,21 @@ function blend(ctx: PresetContext): PresetShape {
     : volume === 'fade'
       ? bBand
       : []
+  // A's EQ worked down (gap for B): highs over the bars before the swap, mids in its last bar, the bass on it.
+  const gap = filterOut === 'eq' && middle > 0
   const aHigh: Point[] = ctx.midSwap
     ? [
         [middle - beat, 1],
         [middle, 0.4],
       ]
-    : volume === 'fade'
-      ? aBand
-      : []
+    : gap
+      ? [
+          [Math.max(0, middle - 16 * ctx.beat), 1],
+          [Math.max(0, middle - 4 * ctx.beat), 0.3],
+        ]
+      : volume === 'fade'
+        ? aBand
+        : []
   const bHigh: Point[] = ctx.midSwap
     ? [
         [middle, 0.4],
@@ -597,7 +613,7 @@ function blend(ctx: PresetContext): PresetShape {
     : volume === 'fade'
       ? bBand
       : []
-  const knob = (kind: 'hp' | 'lp') => (kind === 'hp' ? 0.6 : -0.6)
+  const knob = (kind: 'hp' | 'lp' | 'eq') => (kind === 'hp' ? 0.6 : -0.6)
   return {
     preset: 'blend',
     length,
@@ -606,24 +622,26 @@ function blend(ctx: PresetContext): PresetShape {
       low: aLow,
       mid: aMid,
       high: aHigh,
-      filter: filterOut
-        ? [
-            [middle, 0],
-            [length, knob(filterOut)],
-          ]
-        : [],
+      filter:
+        filterOut && filterOut !== 'eq'
+          ? [
+              [middle, 0],
+              [length, knob(filterOut)],
+            ]
+          : [],
     }),
     b: automation(length, {
       gain: bGainPoints,
       low: bLow,
       mid: bMid,
       high: bHigh,
-      filter: filterIn
-        ? [
-            [0, knob(filterIn)],
-            [middle, 0],
-          ]
-        : [],
+      filter:
+        filterIn && middle > 0
+          ? [
+              [0, knob(filterIn)],
+              [middle, 0],
+            ]
+          : [],
     }),
     effects: [],
     anchorA: 0,

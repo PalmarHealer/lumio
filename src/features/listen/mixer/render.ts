@@ -1,4 +1,4 @@
-import { brakeRateAt, createDeck, rateAt, rateEaseSeconds, resetDeck, releaseEcho, scheduleTransition } from './engine'
+import { asPlayed, brakeRateAt, createDeck, rateAt, rateEaseSeconds, resetDeck, releaseEcho, scheduleTransition } from './engine'
 import type { Transition } from './types'
 
 /**
@@ -10,7 +10,8 @@ import type { Transition } from './types'
  * stretch). For the small beatmatching rates (±6 %) that is about one semitone at most.
  *
  * The rendered timeline: 0 is `preRoll` seconds before A's `aOut`; the transition starts at `preRoll` (B's `bIn`
- * starts there), A stops `length` seconds later, and the render ends `postRoll` seconds after that.
+ * starts there; with a negative `bIn` B's top starts `-bIn / rate` seconds later), A stops `length` seconds later, and the
+ * render ends `postRoll` seconds after that.
  */
 export interface RenderTransitionOptions {
   a: AudioBuffer
@@ -32,8 +33,8 @@ const RATE_CURVE_RATE = 100
 
 export async function renderTransition(options: RenderTransitionOptions): Promise<AudioBuffer> {
   const { a, b } = options
-  // 'none' plays back to back: A to its real end, whatever its analysed length said (as the player does).
-  const transition = options.transition.preset === 'none' ? { ...options.transition, aOut: a.duration, length: 0 } : options.transition
+  // As the player plays it ('none': back to back from A's real end, nothing else).
+  const transition = asPlayed(options.transition, a.duration)
   const preRoll = Math.max(0, options.preRoll ?? 8)
   const postRoll = Math.max(0, options.postRoll ?? 8)
   const sampleRate = options.sampleRate ?? a.sampleRate
@@ -63,7 +64,8 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   // B: from `bIn` at the transition's start, at `rate` during the overlap, then easing back to 1.
   const sourceB = new AudioBufferSourceNode(ctx, { buffer: b, playbackRate: transition.rate })
   sourceB.connect(deckB.input)
-  sourceB.start(start, Math.max(0, transition.bIn))
+  // B's position is bIn + t · rate: a negative bIn starts it from its top at t = -bIn / rate (its automation at 0).
+  sourceB.start(start + Math.max(0, -transition.bIn) / transition.rate, Math.max(0, transition.bIn))
   if (transition.rate !== 1) {
     const ease = Math.min(rateEaseSeconds(transition.tempo.b), Math.max(0, total - end))
     if (ease > 0) {

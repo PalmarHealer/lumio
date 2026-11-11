@@ -21,6 +21,10 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  *   high-pass at 0 Hz have the transfer function 1.
  * - The echo is a tempo-synced delay with feedback, fed by a send that opens at the effect's moment; its tail rings on
  *   after the deck's volume is gone ("echo out").
+ * - Automation uses only `setValueAtTime` and `linearRampToValueAtTime` (non-linear curves are sampled into short
+ *   ramps), and the engine keeps its own copy of what it scheduled per param. Holding a param where it is (a pause, a
+ *   seek) then needs only `cancelScheduledValues`, which every browser has, and never reads `param.value` (which
+ *   says nothing about the future, and nothing at all before an offline render runs).
  *
  * Nothing here touches the DOM, so node and OfflineAudioContext can use it as well.
  */
@@ -37,8 +41,10 @@ const HIGHPASS_MAX_HZ = 9000
 const FILTER_RESONANCE_DB = 3
 /** Butterworth Q (1/√2): in dB for low-/high-pass biquads, linear for the all-pass. */
 const BUTTERWORTH_Q_DB = 20 * Math.log10(Math.SQRT1_2)
-/** How finely the filter's (non-linear) frequency curve is sampled. */
+/** How finely the filter's (non-linear) frequency curve is sampled into ramps. */
 const FILTER_CURVE_RATE = 200
+/** Steps of a filter's glide back to open (on the log scale). */
+const GLIDE_STEPS = 12
 /** Longest echo delay a deck allows (seconds). */
 const MAX_DELAY_S = 4
 /** A tempo that isn't a usable number counts as this (the contract already sends 120 for unknown ones). */
@@ -65,7 +71,9 @@ export interface Deck {
   echo: { send: GainNode; delay: DelayNode; feedback: GainNode; wet: GainNode }
   /** The player's volume, normalization and fades; 1 when rendering. */
   level: GainNode
-  /** Disconnects the deck from its destination and its nodes from each other. */
+  /** The source feeding `input` (set by whoever connects one), disconnected with the deck. */
+  source: AudioNode | null
+  /** Disconnects the deck (and its source) from everything. */
   dispose(): void
 }
 
@@ -125,7 +133,11 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
   level.connect(destination)
 
   const nodes: AudioNode[] = [input, brake, gain, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, highpass, lowpass, send, delay, feedback, wet, level]
-  return {
+  // What each automated param starts at (its constructor value), for the engine's own copy of its timeline.
+  for (const param of [brake.gain, gain.gain, low.gain, mid.gain, high.gain, lowpass.frequency, highpass.frequency, send.gain, feedback.gain, delay.delayTime, wet.gain]) {
+    timelines.set(param, [{ t: 0, v: param.value, ramp: false }])
+  }
+  const deck: Deck = {
     ctx,
     input,
     brake,
@@ -137,10 +149,14 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
     lowpass,
     echo: { send, delay, feedback, wet },
     level,
+    source: null,
     dispose() {
+      deck.source?.disconnect()
+      deck.source = null
       for (const node of nodes) node.disconnect()
     },
   }
+  return deck
 }
 
 // ---- pure helpers (also used by the player and the editor) ----
@@ -236,16 +252,71 @@ export function driftCorrection(error: number, rate: number, limit = 0.04) {
 
 // ---- scheduling ----
 
-/** Stops a param's automation at `time`, keeping the value it has then (no jump back to an older value). */
-export function holdAt(param: AudioParam, time: number) {
-  if (typeof param.cancelAndHoldAtTime === 'function') {
-    param.cancelAndHoldAtTime(time)
-    return
+/**
+ * The engine's copy of what is scheduled on a param: points in time order, each reached by a jump (`ramp: false`) or
+ * a linear ramp from the point before.
+ */
+interface Point {
+  t: number
+  v: number
+  ramp: boolean
+}
+const timelines = new WeakMap<AudioParam, Point[]>()
+
+const timelineOf = (param: AudioParam) => {
+  let points = timelines.get(param)
+  if (!points) timelines.set(param, (points = [{ t: 0, v: param.defaultValue, ramp: false }]))
+  return points
+}
+
+/** A param's scheduled value at context time `time` (from the engine's copy, not `param.value`). */
+export function valueOn(param: AudioParam, time: number) {
+  const points = timelineOf(param)
+  let before: Point | undefined
+  for (const point of points) {
+    if (point.t > time) {
+      if (!before) return point.v
+      return point.ramp && point.t > before.t ? before.v + ((point.v - before.v) * (time - before.t)) / (point.t - before.t) : before.v
+    }
+    before = point
   }
-  // Browsers without cancelAndHoldAtTime (older Firefox): the value as it is now, held.
-  const value = param.value
-  param.cancelScheduledValues(time)
+  return before ? before.v : param.defaultValue
+}
+
+function insert(param: AudioParam, point: Point) {
+  const points = timelineOf(param)
+  let at = points.length
+  while (at > 0 && points[at - 1]!.t > point.t) at--
+  points.splice(at, 0, point)
+}
+
+/** `setValueAtTime`, remembered. */
+export function setAt(param: AudioParam, time: number, value: number) {
   param.setValueAtTime(value, time)
+  insert(param, { t: time, v: value, ramp: false })
+}
+
+/** `linearRampToValueAtTime`, remembered. */
+export function rampAt(param: AudioParam, time: number, value: number) {
+  param.linearRampToValueAtTime(value, time)
+  insert(param, { t: time, v: value, ramp: true })
+}
+
+/**
+ * Stops a param's automation at `time`, keeping the value it has then: everything from `time` on is cancelled and the
+ * value at `time` is set again (a ramp under way is cut there, ending on the same line).
+ */
+export function holdAt(param: AudioParam, time: number) {
+  const points = timelineOf(param)
+  const value = valueOn(param, time)
+  const next = points.find((point) => point.t >= time)
+  const crossing = !!next && next.ramp && points.some((point) => point.t < time)
+  param.cancelScheduledValues(time)
+  // Only the last point before `time` is still needed (a cut ramp starts there).
+  const earlier = points.filter((point) => point.t < time)
+  timelines.set(param, earlier.slice(-1))
+  if (crossing) rampAt(param, time, value)
+  else setAt(param, time, value)
 }
 
 interface ScheduleOptions {
@@ -261,18 +332,15 @@ function scheduleLinear(param: AudioParam, keyframes: Keyframe[], neutral: numbe
   const value = valueAt(keyframes, from, neutral)
   // The start value holds from now on (a deck that starts a little early is already where the curve begins).
   holdAt(param, now)
-  param.setValueAtTime(value, now)
-  if (begin > now) param.setValueAtTime(value, begin)
+  setAt(param, now, value)
+  if (begin > now) setAt(param, begin, value)
   for (const keyframe of keyframes) {
     if (keyframe.t <= from) continue
-    param.linearRampToValueAtTime(keyframe.v, start + keyframe.t * scale)
+    rampAt(param, start + keyframe.t * scale, keyframe.v)
   }
 }
 
-/**
- * The filter knob's curve: its frequency mapping isn't linear, so the curve is sampled finely (5 ms) and handed over
- * as one value curve per filter.
- */
+/** The filter knob's curve: its frequency mapping isn't linear, so it is sampled finely (5 ms) into short ramps. */
 function scheduleFilter(deck: Deck, keyframes: Keyframe[], start: number, scale: number, from: number, now: number) {
   const begin = Math.max(now, start + from * scale)
   const rate = deck.ctx.sampleRate
@@ -281,22 +349,21 @@ function scheduleFilter(deck: Deck, keyframes: Keyframe[], start: number, scale:
   const span = last - from
   const moving = keyframes.length > 1 && span > 0 && keyframes.some((keyframe) => keyframe.v !== keyframes[0]!.v)
   const initial = filterFrequencies(valueAt(keyframes, from, 0), rate)
-  if (!moving || begin > now) {
-    deck.lowpass.frequency.setValueAtTime(initial.lowpass, now)
-    deck.highpass.frequency.setValueAtTime(initial.highpass, now)
-  }
+  setAt(deck.lowpass.frequency, now, initial.lowpass)
+  setAt(deck.highpass.frequency, now, initial.highpass)
   if (!moving) return
-  const count = Math.max(2, Math.ceil(span * FILTER_CURVE_RATE) + 1)
-  const lowCurve = new Float32Array(count)
-  const highCurve = new Float32Array(count)
-  for (let i = 0; i < count; i++) {
-    const { lowpass, highpass } = filterFrequencies(valueAt(keyframes, from + (span * i) / (count - 1), 0), rate)
-    lowCurve[i] = lowpass
-    highCurve[i] = highpass
+  if (begin > now) {
+    setAt(deck.lowpass.frequency, begin, initial.lowpass)
+    setAt(deck.highpass.frequency, begin, initial.highpass)
   }
+  const count = Math.max(2, Math.ceil(span * FILTER_CURVE_RATE) + 1)
   const duration = Math.max(1e-3, start + last * scale - begin)
-  deck.lowpass.frequency.setValueCurveAtTime(lowCurve, begin, duration)
-  deck.highpass.frequency.setValueCurveAtTime(highCurve, begin, duration)
+  for (let i = 1; i < count; i++) {
+    const { lowpass, highpass } = filterFrequencies(valueAt(keyframes, from + (span * i) / (count - 1), 0), rate)
+    const time = begin + (duration * i) / (count - 1)
+    rampAt(deck.lowpass.frequency, time, lowpass)
+    rampAt(deck.highpass.frequency, time, highpass)
+  }
 }
 
 /**
@@ -322,12 +389,12 @@ function scheduleEcho(deck: Deck, effect: Extract<TransitionEffect, { kind: 'ech
   const { send, delay, feedback } = deck.echo
   const delayTime = Math.min(MAX_DELAY_S, Math.max(0.01, effect.beats * beatSeconds(bpm)))
   for (const param of [send.gain, delay.delayTime, feedback.gain]) holdAt(param, begin)
-  delay.delayTime.setValueAtTime(delayTime, begin)
-  feedback.gain.setValueAtTime(Math.max(0, Math.min(0.95, effect.feedback)), begin)
+  setAt(delay.delayTime, begin, delayTime)
+  setAt(feedback.gain, begin, Math.max(0, Math.min(0.95, effect.feedback)))
   holdAt(deck.echo.wet.gain, begin)
-  deck.echo.wet.gain.setValueAtTime(1, begin)
-  send.gain.setValueAtTime(0, at)
-  send.gain.linearRampToValueAtTime(1, at + DECLICK_S)
+  setAt(deck.echo.wet.gain, begin, 1)
+  setAt(send.gain, at, 0)
+  rampAt(send.gain, at + DECLICK_S, 1)
 }
 
 /** The brake's fade on deck A (its speed is the source's business: a buffer's playbackRate or the element's). */
@@ -337,10 +404,10 @@ function scheduleBrakeFade(deck: Deck, effect: Extract<TransitionEffect, { kind:
   const param = deck.brake.gain
   holdAt(param, begin)
   const local = from - effect.at
-  param.setValueAtTime(brakeGainAt(local, effect.length), begin)
+  setAt(param, begin, brakeGainAt(local, effect.length))
   const fadeFrom = effect.at + effect.length * 0.75
-  if (from < fadeFrom) param.setValueAtTime(1, start + fadeFrom * scale)
-  if (from < effect.at + effect.length) param.linearRampToValueAtTime(0, start + (effect.at + effect.length) * scale)
+  if (from < fadeFrom) setAt(param, start + fadeFrom * scale, 1)
+  if (from < effect.at + effect.length) rampAt(param, start + (effect.at + effect.length) * scale, 0)
 }
 
 /**
@@ -359,7 +426,7 @@ export function scheduleTransition(decks: { a: Deck; b: Deck }, transition: Tran
   for (const deck of [decks.a, decks.b]) {
     holdAt(deck.echo.send.gain, begin)
     holdAt(deck.brake.gain, now)
-    deck.brake.gain.setValueAtTime(1, now)
+    setAt(deck.brake.gain, now, 1)
   }
   let braking = false
   for (const effect of transition.effects) {
@@ -372,14 +439,14 @@ export function scheduleTransition(decks: { a: Deck; b: Deck }, transition: Tran
   // Declicking, on the decks' brake gain (unused otherwise): B comes in over a few ms (it starts mid-song), and A is
   // silent by the end of the overlap, whatever its curve says (a hard cut, length 0, cuts here too).
   if (from === 0 && startTime >= now) {
-    decks.b.brake.gain.setValueAtTime(0, startTime)
-    decks.b.brake.gain.linearRampToValueAtTime(1, startTime + DECLICK_S)
+    setAt(decks.b.brake.gain, startTime, 0)
+    rampAt(decks.b.brake.gain, startTime + DECLICK_S, 1)
   }
   if (!braking) {
     // (A cut right at the start, or resumed in the last few ms, fades from the earliest moment it still can.)
     const fadeFrom = Math.max(begin, end - DECLICK_S)
-    decks.a.brake.gain.setValueAtTime(1, fadeFrom)
-    decks.a.brake.gain.linearRampToValueAtTime(0, fadeFrom + DECLICK_S)
+    setAt(decks.a.brake.gain, fadeFrom, 1)
+    rampAt(decks.a.brake.gain, fadeFrom + DECLICK_S, 0)
   }
 }
 
@@ -413,9 +480,9 @@ function automatedParams(deck: Deck) {
 export function releaseEcho(deck: Deck, time = deck.ctx.currentTime, tail = 6) {
   const { send, wet } = deck.echo
   holdAt(send.gain, time)
-  send.gain.linearRampToValueAtTime(0, time + DECLICK_S)
+  rampAt(send.gain, time + DECLICK_S, 0)
   holdAt(wet.gain, time)
-  wet.gain.linearRampToValueAtTime(0, time + tail)
+  rampAt(wet.gain, time + tail, 0)
   return time + tail
 }
 
@@ -429,22 +496,36 @@ export function resetDeck(deck: Deck, time = deck.ctx.currentTime, ramp = 0) {
   const unity = [deck.brake.gain, deck.gain.gain, deck.low.gain, deck.mid.gain, deck.high.gain]
   const end = time + ramp
   for (const param of unity) {
-    if (ramp > 0) param.linearRampToValueAtTime(1, end)
-    else param.setValueAtTime(1, time)
+    if (ramp > 0) rampAt(param, end, 1)
+    else setAt(param, time, 1)
   }
-  // The filters glide on the log scale (an exponential ramp); the transparent end points are then set exactly.
+  // The filters glide open on the log scale (short ramps); the transparent end points are then set exactly.
   if (ramp > 0) {
-    deck.lowpass.frequency.exponentialRampToValueAtTime(top, end)
-    deck.highpass.frequency.setValueAtTime(Math.max(HIGHPASS_MIN_HZ, deck.highpass.frequency.value), time)
-    deck.highpass.frequency.exponentialRampToValueAtTime(HIGHPASS_MIN_HZ, end)
+    const lowFrom = Math.max(LOWPASS_MIN_HZ, valueOn(deck.lowpass.frequency, time))
+    const highFrom = Math.max(HIGHPASS_MIN_HZ, valueOn(deck.highpass.frequency, time))
+    for (let i = 1; i <= GLIDE_STEPS; i++) {
+      const p = i / GLIDE_STEPS
+      rampAt(deck.lowpass.frequency, time + ramp * p, lowFrom * (top / lowFrom) ** p)
+      rampAt(deck.highpass.frequency, time + ramp * p, highFrom * (HIGHPASS_MIN_HZ / highFrom) ** p)
+    }
   }
-  deck.lowpass.frequency.setValueAtTime(top, end)
-  deck.highpass.frequency.setValueAtTime(0, end)
+  setAt(deck.lowpass.frequency, end, top)
+  setAt(deck.highpass.frequency, end, 0)
   // The echo: nothing goes in any more, and its return stays shut until the delay line has emptied itself.
   const { send, feedback, wet } = deck.echo
   holdAt(wet.gain, time)
-  send.gain.setValueAtTime(0, time)
-  feedback.gain.setValueAtTime(0, time)
-  wet.gain.setValueAtTime(0, time)
-  wet.gain.setValueAtTime(1, time + MAX_DELAY_S + 0.05)
+  setAt(send.gain, time, 0)
+  setAt(feedback.gain, time, 0)
+  setAt(wet.gain, time, 0)
+  setAt(wet.gain, time + MAX_DELAY_S + 0.05, 1)
+}
+
+/**
+ * A transition as it is played: 'none' is back to back, so it has no overlap, automation, effects or tempo change,
+ * and A plays to its real end (`aEnd`, when known; the player waits for A's own end otherwise).
+ */
+export function asPlayed(transition: Transition, aEnd?: number): Transition {
+  if (transition.preset !== 'none') return transition
+  const still = () => ({ gain: [], low: [], mid: [], high: [], filter: [] })
+  return { ...transition, aOut: aEnd && aEnd > 0 ? aEnd : Number.NaN, length: 0, rate: 1, a: still(), b: still(), effects: [] }
 }

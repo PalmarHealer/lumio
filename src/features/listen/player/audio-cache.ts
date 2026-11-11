@@ -33,11 +33,6 @@ let index: Index = (() => {
 let stats = summarize()
 const listeners = new Set<() => void>()
 const inFlight = new Map<string, Promise<void>>()
-/**
- * The object URLs handed to the player last: the two newest stay valid (the track playing and, in a mixer transition,
- * the one coming in on the second element); older ones are released.
- */
-let recentUrls: string[] = []
 
 function summarize() {
   const entries = Object.values(index)
@@ -79,10 +74,8 @@ export async function cachedAudioUrl(key: string): Promise<string | null> {
       saveIndex()
       return null
     }
-    const url = URL.createObjectURL(await response.blob())
-    recentUrls = [...recentUrls, url]
-    while (recentUrls.length > 2) URL.revokeObjectURL(recentUrls.shift()!)
-    return url
+    // A new object URL each time; the player releases it once no element plays it any more.
+    return URL.createObjectURL(await response.blob())
   } catch {
     return null
   }

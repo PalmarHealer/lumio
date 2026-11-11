@@ -82,6 +82,16 @@ export interface TrackMix {
    * attack. 0 when unknown (fewer than 4 such stretches) and in analyses made before it.
    */
   kickOffset: number
+  /**
+   * Seconds the song's snare/clap/hat attacks (1.5–5 kHz) lie behind its beat grid: the median over the 2-bar stretches
+   * with one clear accent attack. 0 when unknown (fewer than 4 such stretches) and in analyses made before it.
+   */
+  accentOffset: number
+  /**
+   * Where the off-beat 16ths fall, as a share of the beat between two 8ths (0.5 = straight, about 0.6–0.67 = swung): a
+   * swung and a straight groove can't both be loud without flamming. 0.5 when unknown and in analyses made before it.
+   */
+  swing: number
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean
@@ -1008,6 +1018,42 @@ function sungCorrelation(stretches: Array<{ start: number; end: number }>, activ
 }
 
 /**
+ * Where the off-beat 16ths fall, as a share of the 8th note (0.5 straight, about 0.6–0.67 swung): per 2 bars, the
+ * accent band's onset rise (hats, 1.5–5 kHz) folded over every 8th of the stretch (100 steps per 8th) and averaged; the
+ * off-beat 16th is that average's peak between 35 % and 80 % of the 8th, counted where it stands out (half its height
+ * above the average's median) and reaches 30 % of the 8th's own attack. The median over those stretches; 0.5 with fewer
+ * than 4. Returns the swing and how many stretches showed a clear off-beat 16th.
+ */
+function swingOf(beats: number[], accents: { rise: Float32Array; step: number }) {
+  const { rise, step } = accents
+  const at = (time: number) => {
+    const x = time / step
+    const i = Math.floor(x)
+    return i >= 0 && i + 1 < rise.length ? rise[i]! + (rise[i + 1]! - rise[i]!) * (x - i) : 0
+  }
+  const found: number[] = []
+  for (let start = 0; start + 9 <= beats.length; start += 8) {
+    const profile = new Float64Array(100)
+    let count = 0
+    for (let k = start; k < start + 8; k++) {
+      const half = (beats[k + 1]! - beats[k]!) / 2
+      for (const from of [beats[k]!, beats[k]! + half]) {
+        for (let j = 0; j < 100; j++) profile[j] += at(from + (half * j) / 100)
+        count++
+      }
+    }
+    for (let j = 0; j < 100; j++) profile[j] = profile[j]! / count
+    let head = 0
+    for (let j = 0; j < 15; j++) head = Math.max(head, profile[j]!)
+    let peak = 35
+    for (let j = 36; j < 80; j++) if (profile[j]! > profile[peak]!) peak = j
+    const value = profile[peak]!
+    if (value > 0 && value >= 0.3 * head && value - median(Array.from(profile)) >= 0.5 * value) found.push(peak / 100)
+  }
+  return { swing: found.length >= 4 ? round(median(found), 2) : 0.5, stretches: found.length }
+}
+
+/**
  * Which bass note sounds at each of these times (the strongest note from E1 to B2 over the next 0.74 s), counted per
  * pitch class: what the bass lands on where phrases begin.
  */
@@ -1448,7 +1494,12 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   // DJ can lock onto. A wash, a pad, a riff without a beat, or a grid off the attacks scores low. (The kick band alone
   // isn't used: a bass line moving in the same band makes it ambiguous in most pop.)
   const unambiguous = (profile: { prominence: number; shift: number; rival: number }) => profile.prominence >= 0.6 && Math.abs(profile.shift) <= 0.012 && profile.rival < 0.75
-  const accentClear = beatProfiles(beats, accents, 0.08).map(unambiguous)
+  const accentBeats = beatProfiles(beats, accents, 0.08)
+  const accentClear = accentBeats.map(unambiguous)
+  // Where the song's snares, claps and hats usually sit against the grid (as kickOffset below).
+  const accentStretches = accentBeats.filter((profile, i) => i % 8 === 4 && profile.prominence >= 0.6 && profile.rival < 0.75)
+  const accentOffset = accentStretches.length >= 4 ? round(median(accentStretches.map((profile) => profile.shift)), 3) : 0
+  const { swing } = swingOf(beats, accents)
   // How late the kick attacks lie behind the grid (the grid follows the broadband and accent attacks; a kick's low
   // rise peaks later by a song-specific amount): per 2 bars, the kick band's averaged attack where it has one clear
   // peak; the median over those, 0 with fewer than 4 of them.
@@ -1787,6 +1838,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     barClarity,
     phraseChroma,
     kickOffset,
+    accentOffset,
+    swing,
     key: top.key,
     minor: top.minor,
     keyClarity: round(Math.max(0, top.r)),

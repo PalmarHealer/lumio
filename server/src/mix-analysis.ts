@@ -31,7 +31,7 @@ import { MAJOR, MINOR, fft, pearson } from './sound-analysis.ts'
 // ---- the contract (an identical copy of src/features/listen/mixer/types.ts: the server can't import from src/) ----
 
 /** Raised when the analysis changes, so songs are analysed again. */
-export const MIX_VERSION = 3
+export const MIX_VERSION = 4
 
 export type SectionKind = 'intro' | 'verse' | 'chorus' | 'drop' | 'build' | 'break' | 'outro' | 'other'
 
@@ -1001,6 +1001,38 @@ function sungCorrelation(stretches: Array<{ start: number; end: number }>, activ
   }
 }
 
+/**
+ * Which bass note sounds at each of these times (the strongest note from E1 to B2 over the next 0.74 s), counted per
+ * pitch class: what the bass lands on where phrases begin.
+ */
+function phraseBass(samples: Float32Array, rate: number, times: number[]) {
+  const size = 2 ** Math.round(Math.log2(rate * 0.74))
+  const window = Float64Array.from({ length: size }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / size))
+  const re = new Float64Array(size)
+  const im = new Float64Array(size)
+  const counts = new Array(12).fill(0) as number[]
+  for (const time of times) {
+    const start = Math.round(time * rate)
+    if (start < 0 || start + size > samples.length) continue
+    for (let i = 0; i < size; i++) {
+      re[i] = samples[start + i]! * window[i]!
+      im[i] = 0
+    }
+    fft(re, im)
+    let best = { note: -1, level: 0 }
+    for (let note = 28; note < 48; note++) {
+      const from = Math.ceil((440 * 2 ** ((note - 69.5) / 12) * size) / rate)
+      const to = (440 * 2 ** ((note - 68.5) / 12) * size) / rate
+      for (let k = from; k < to; k++) {
+        const level = Math.hypot(re[k]!, im[k]!)
+        if (level > best.level) best = { note, level }
+      }
+    }
+    if (best.note >= 0) counts[best.note % 12]++
+  }
+  return counts
+}
+
 /** Where lyrics might belong on the audio: an offset (seconds) and how well the sung stretches fit there (0–1). */
 interface Placement {
   offset: number
@@ -1703,13 +1735,26 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   }
 
   // ---- key and loudness ----
+  // The key from the melody's range (C3–C6: chords and tunes; the whole range lets the bass of one chord, the VI of a
+  // minor key, pass for the tonic), matched to the Krumhansl–Kessler profiles. A key and its relative share their notes,
+  // so the bass at the phrase starts settles between them (it lands on the tonic there; the other one needs two more
+  // phrase starts to win), and major or minor goes by the third above the tonic (minor or major third, in the melody's
+  // range). Measured on 25 songs against published keys: 21 exact, 2 relative, 1 a fifth off, 1 wrong (whole-range
+  // profiles alone: 14, 6, 1, 4).
+  const melody = new Array(12).fill(0) as number[]
+  for (let f = 0; f < chroma.count; f++) for (let c = 0; c < 12; c++) melody[c] += chroma.melody[f * 12 + c]!
   const keys: Array<{ key: number; minor: boolean; r: number }> = []
   for (let key = 0; key < 12; key++) {
-    const rotated = chroma.total.map((_, i) => chroma.total[(i + key) % 12]!)
+    const rotated = melody.map((_, i) => melody[(i + key) % 12]!)
     keys.push({ key, minor: false, r: pearson(rotated, MAJOR) }, { key, minor: true, r: pearson(rotated, MINOR) })
   }
   keys.sort((a, b) => b.r - a.r)
-  const top = keys[0]!
+  const profileKey = keys[0]!
+  const relativeKey = profileKey.minor ? (profileKey.key + 3) % 12 : (profileKey.key + 9) % 12
+  const bassNotes = phraseBass(samples, rate, phrases)
+  const tonic = bassNotes[relativeKey]! >= bassNotes[profileKey.key]! + 2 ? relativeKey : profileKey.key
+  const keyMinor = melody[(tonic + 3) % 12]! > melody[(tonic + 4) % 12]!
+  const top = keys.find((entry) => entry.key === tonic && entry.minor === keyMinor)!
 
   return {
     v: MIX_VERSION,

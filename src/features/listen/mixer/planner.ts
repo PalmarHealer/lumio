@@ -84,7 +84,12 @@ const MAX_OVER_DB = 1.8
 const HOLE_DB = -6
 /** Room (seconds) a blend's B gets to be moved earlier by the phase fit. */
 const PHASE_SLACK = 0.05
-/** Least attack clarity (share of beats with an audible onset) a beatmatch needs in each song's phrases it covers. */
+/**
+ * Below this attack clarity in the bars where both beats are loud, the alignment can't be verified at all; measured
+ * with lag3 on the 25 songs, such beatmatches are where the flams are (9 at no floor, 1 at 0.4, for 13 fewer blends).
+ */
+const MIN_VERIFIABLE = 0.4
+/** Clarity at which a beatmatch counts as fully verifiable (below it, a soft cost). */
 const MIN_CLARITY = 0.6
 /** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
 const MAX_WINDOW_DRIFT = 0.025
@@ -256,7 +261,7 @@ const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve'; pre: number;
   { volume: 'overlap', pre: 0, post: 4, prior: -0.04, party: true, clean: false },
   { volume: 'overlap', pre: 16, post: 8, prior: -0.05, party: false, clean: true },
   { volume: 'fade', pre: 8, post: 8, prior: -0.05, party: true, clean: true },
-  { volume: 'scurve', pre: 1, post: 1, prior: -0.08, party: true, clean: true },
+  { volume: 'scurve', pre: 1, post: 1, prior: -0.25, party: true, clean: true },
 ]
 
 /**
@@ -268,18 +273,19 @@ function blendFinishes(variant: Variant, clash: boolean): Variant[] {
   const at: NonNullable<Variant['bassAt']> = (variant.pre ?? 0) === 0 ? 'start' : 'middle'
   if (variant.volume === 'scurve') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: clash }]
   const finishes: Array<[NonNullable<Variant['bassAt']>, Variant['filterIn'], Variant['filterOut'], number]> = [
-    [at, 'hp', 'hp', 0.03],
-    [at, null, 'hp', 0.025],
-    [at, 'lp', 'lp', 0.02],
-    [at, null, 'eq', 0.015],
-    [at, null, 'lp', 0.015],
+    // The user's Spotify favourites mostly take a filter out on A (high-pass), in on B as well, or a low-pass pair.
+    [at, null, 'hp', 0.05],
+    [at, 'hp', 'hp', 0.045],
+    [at, 'lp', 'lp', 0.04],
+    [at, null, 'lp', 0.035],
+    [at, null, 'eq', 0.03],
     ['none', null, null, 0],
   ]
   return finishes.map(([bassAt, filterIn, filterOut, prior]) => ({ ...variant, bassAt, filterIn, filterOut, midSwap: clash, prior: variant.prior + prior }))
 }
 
 /** The best prior any finish of a blend layout can add (so the bound stays an upper bound). */
-const BEST_FINISH = 0.03
+const BEST_FINISH = 0.05
 
 /**
  * Added to every blend's score: wherever a blend passes every rule it is chosen; echo outs and fades are the fallback
@@ -378,6 +384,8 @@ interface ShapeStats {
    * basslines up (must be 0).
    */
   together: number
+  /** Share of the moments with both decks' beats loud where both kicks (low bands) are up too. */
+  kicksTogether: number
   /** The stretch where both decks are clearly audible: first and last such moment. */
   togetherFrom: number
   togetherTo: number
@@ -445,6 +453,8 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
   let tonal = 0
   let tonalBoth = 0
   let basses = 0
+  let loudBoth = 0
+  let kicksBoth = 0
   for (let i = 0; i <= steps; i++) {
     const t = i * dt
     const ga = valueAt(a.gain, t, 1)
@@ -469,6 +479,10 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
       if (ga * valueAt(a.mid, t, 1) * filterDamp(fa) > VOICE_HEARD && gb * valueAt(b.mid, t, 1) * filterDamp(fb) > VOICE_HEARD) tonal += dt
       if (ga * valueAt(a.low, t, 1) * bassThrough(fa) > 0.5 && gb * valueAt(b.low, t, 1) * bassThrough(fb) > 0.5) basses += dt
       if (tonalLevel(a, t, ga, fa) > 0.3 && tonalLevel(b, t, gb, fb) > 0.3) tonalBoth += dt
+      if (loudA[i] && loudB[i]) {
+        loudBoth++
+        if (ga * valueAt(a.low, t, 1) * bassThrough(fa) >= 0.5 && gb * valueAt(b.low, t, 1) * bassThrough(fb) >= 0.5) kicksBoth++
+      }
     }
   }
   return {
@@ -488,6 +502,7 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
     tonal,
     basses,
     tonalBoth,
+    kicksTogether: loudBoth > 0 ? kicksBoth / loudBoth : 0,
   }
 }
 
@@ -566,8 +581,10 @@ function vocalCost(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     for (let i = 0; i < stats.voiceA.length - 1; i++) {
       const t = i * dt
       const tb = positionB(p, t)
-      const aSings = !!spanAt(a.vocals, positionA(p, t))
-      const bSings = tb !== null && !!spanAt(b.vocals, tb)
+      // Only measured singing counts here (a song whose vocals weren't measured has its body assumed sung, which is no
+      // reason to keep a voice of the other song off it: only voice over voice is a violation).
+      const aSings = a.vocalsKnown && !!spanAt(a.vocals, positionA(p, t))
+      const bSings = b.vocalsKnown && tb !== null && !!spanAt(b.vocals, tb)
       const aHeard = stats.voiceA[i] > VOICE_HEARD
       const bHeard = stats.voiceB[i] > VOICE_HEARD
       if (bSings && bHeard && ((aSings && aHeard) || (echoed !== null && echoed[i] >= ECHO_HEARD))) clash += dt
@@ -763,7 +780,14 @@ function alignPhase(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
   }
   // No beats of both loud at once (a shape that hands the beat over in one go): nothing to fit, B starts on its phrase.
   if (!fitted) return { rate: p.rate, bStart: p.bStart - p.slack, laneB: p.laneB }
-  return { rate: current.rate, bStart: current.bStart, laneB: current.laneB }
+  // Each song's kick sits a little after its grid (its accents): where both kicks sound together, meet halfway between
+  // grid and kick alignment, weighting the kicks 2:1 (B moves earlier by that share of the difference).
+  const kick = (mix: TrackMix) => {
+    const value = (mix as TrackMix & { kickOffset?: number }).kickOffset
+    return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 0.05 ? value : 0
+  }
+  const shift = (2 / 3) * p.stats.kicksTogether * (kick(b.mix) - kick(a.mix))
+  return { rate: current.rate, bStart: Math.max(0, current.bStart - shift), laneB: current.laneB }
 }
 
 /**
@@ -783,6 +807,8 @@ function audibleClarity(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     if (t > length || t < p.bStart || !stats.loudA[i] || !stats.loudB[i]) continue
     const atA = positionA(p, t)
     const atB = positionB(p, t) ?? 0
+    // Outside a song's beat grid (before its first beat, after its last) there's nothing to match: -1 rejects.
+    if (atB < (b.beats[0] ?? 0) - 0.05 || atA > (a.beats[a.beats.length - 1] ?? Infinity) + 0.05) return -1
     const value = Math.min(a.clarityBetween(atA, atA + 0.01), b.clarityBetween(atB, atB + 0.01))
     if (Number.isNaN(value)) return NaN
     least = Math.min(least, value)
@@ -1193,7 +1219,7 @@ export function planTransition(
       // the blend spans the same time in both, so B covers bars / multiple of its own bars.
       if (!tempo.synced) continue
       const barsB = variant.bars / tempo.multiple
-      if (!Number.isInteger(barsB) || barsB % 4 !== 0) continue
+      if (!Number.isInteger(barsB) || barsB < 1) continue
       // Event-based, as a DJ places it: B's event (its kick-in, drop, chorus, first vocal) lands on A's boundary (A's
       // outro start, the end of a chorus, a section change), both on the phrase grid; the bass changes deck there. B
       // plays `pre` bars under A before it, A `post` bars on after it to its next section. In clean style a blend may
@@ -1209,31 +1235,54 @@ export function planTransition(
         const k = i + bars
         return i >= 0 && Math.abs(track.downbeats[i] - t) <= 0.05 && k >= 0 && k < track.downbeats.length ? track.downbeats[k] : NaN
       }
-      const lanesB = ins.map((pb) => {
-        const end = shiftBars(b, pb.t, postB)
-        return { pb, options: (party && pb.t > b.duration * 0.6) || !onGrid(b, pb.t) || !Number.isFinite(end) ? [] : lanesTo(b, end, barsB, postB) }
-      })
-      const lastBar = floorIndex(a.downbeats, a.end + 0.05)
-      const playOut: Anchor[] = !party && lastBar - post >= 0 ? [{ t: a.downbeats[lastBar - post], bonus: 0, drop: false, chorus: false }] : []
-      for (const pa of [...outs.filter((anchor) => onGrid(a, anchor.t)), ...playOut]) {
+      // B's material per number of bars after the swap (the play-outs below have their own).
+      const lanesBFor = new Map<number, Array<{ pb: Anchor; options: LaneOption[] }>>()
+      const lanesB = (afterBars: number) => {
+        let list = lanesBFor.get(afterBars)
+        if (!list) {
+          list = ins.map((pb) => {
+            const end = shiftBars(b, pb.t, afterBars / tempo.multiple)
+            const bars = (pre + afterBars) / tempo.multiple
+            const usable = !(party && pb.t > b.duration * 0.6) && onGrid(b, pb.t) && Number.isFinite(end) && Number.isInteger(bars)
+            return { pb, options: usable ? lanesTo(b, end, bars, afterBars / tempo.multiple) : [] }
+          })
+          lanesBFor.set(afterBars, list)
+        }
+        return list
+      }
+      // Where A goes out: its boundaries on the phrase grid, A playing `post` bars on after them. In clean style also the
+      // play-out: from A's last boundary on the grid A plays on to its very last bar (nothing of A skipped, B's intro
+      // under it), as many bars as that takes.
+      const jobs: Array<{ pa: Anchor; after: number }> = outs.filter((anchor) => onGrid(a, anchor.t)).map((pa) => ({ pa, after: post }))
+      if (!party && (variant.volume === 'overlap' && (pre === 0 || pre === 4))) {
+        const lastBar = floorIndex(a.downbeats, a.end + 0.05)
+        for (const t of a.phraseGrid) {
+          const i = floorIndex(a.downbeats, t + 0.05)
+          const after = lastBar - i
+          if (i < 0 || after < 2 || after > 16 || after === post) continue
+          jobs.push({ pa: { t, bonus: 0, drop: false, chorus: false }, after })
+        }
+      }
+      for (const { pa, after } of jobs) {
         const start = shiftBars(a, pa.t, -pre)
         if (!Number.isFinite(start)) continue
-        for (const fromA of lanesFrom(a, start, variant.bars, pre)) {
+        const job = after === post ? variant : { ...variant, bars: pre + after }
+        for (const fromA of lanesFrom(a, start, job.bars, pre)) {
           // The shape's beat: A's real bars over the material (loops included), so the swap lands on A's bar.
-          const stats = shapeFor(variant, fromA.advance / (4 * variant.bars))
+          const stats = shapeFor(job, fromA.advance / (4 * job.bars))
           if (stats.basses > 0.001) continue
           const length = stats.shape.length
           if (laneReach(fromA.lane, length) > a.duration) continue
-          for (const { pb, options } of lanesB)
+          for (const { pb, options } of lanesB(after))
             for (const toB of options) {
-              // B's rate: its material over the blend's length, so B arrives at `pb` as A stops. Counted in bars, it must
-              // agree with the songs' beats there (a bar the analysis miscounted would put B off by a beat).
+              // B's rate: its material over the blend's length, so B arrives where it should as A stops. Counted in bars, it
+              // must agree with the songs' beats there (a bar the analysis miscounted would put B off by a beat).
               const rate = toB.advance / length
               if (!rateOk(rate)) continue
               const byBeats =
                 periodOver(b, toB.lane.start, laneReach(toB.lane, length * rate)) / (tempo.multiple * periodOver(a, fromA.lane.start, laneReach(fromA.lane, length)))
               if (Math.abs(rate / byBeats - 1) > 0.01) continue
-              const base = { stats, variant, laneA: fromA.lane, laneB: toB.lane, bStart: PHASE_SLACK, rate, beatmatched: true, clarity: NaN, loops: fromA.extra + toB.extra, slack: PHASE_SLACK, pa, pb }
+              const base = { stats, variant: job, laneA: fromA.lane, laneB: toB.lane, bStart: PHASE_SLACK, rate, beatmatched: true, clarity: NaN, loops: fromA.extra + toB.extra, slack: PHASE_SLACK, pa, pb }
               placements.push({ ...base, ...scoreBound(base) })
             }
         }
@@ -1308,10 +1357,11 @@ export function planTransition(
       const length = placement.stats.shape.length
       const shifted = { ...placement, ...aligned }
       if (laneReach(shifted.laneB, (length - shifted.bStart) * shifted.rate) > b.duration - 2) return null
-      // A beatmatch needs clear attacks where both decks' beats are loud. Without the measure (older analyses) only a
-      // short overlap is risked.
+      // Attack clarity says how well the alignment can be verified, not whether it flams (the grids are steady): a
+      // soft preference for clear placements. Only where a song has no grid at all (before its first beat) it rejects.
+      // (clarityBetween reads 0 before the first phrase, so the grid itself is what's checked there.)
       const clarity = audibleClarity(shifted, a, b)
-      if (Number.isNaN(clarity) ? placement.stats.together > 16 * placement.stats.beat : clarity < MIN_CLARITY) return null
+      if (clarity < 0 || (!Number.isNaN(clarity) && clarity < MIN_VERIFIABLE)) return null
       placement = { ...shifted, clarity }
     }
     const { stats } = placement
@@ -1341,20 +1391,22 @@ export function planTransition(
         // Busy parts (mids and highs up) take a filter, thin ones blend open; long blends suit thin parts, the short
         // seamless one dense parts.
         const filtered = placement.variant.filterIn || placement.variant.filterOut ? 1 : 0
-        energyTerm -= 0.04 * (filtered ? energy.busy : 1 - energy.busy)
+        energyTerm -= 0.02 * (filtered ? energy.busy : 1 - energy.busy)
         if (placement.variant.bars >= 16) energyTerm += 0.04 * energy.busy
         if (placement.variant.bars <= 4) energyTerm += 0.04 * (1 - energy.busy)
       }
     }
     const { clash: voices, lostA, lostB } = vocalCost(placement, a, b)
-    if (voices > 0.1) return null
+    // The short S-curve may let one voice end as the other starts (a beat at most); otherwise never voice over voice.
+    if (voices > (placement.variant.volume === 'scurve' ? stats.beat : 0.1)) return null
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
     // against A's beats. Judged two bars at a time too.
     const drift = placement.beatmatched ? phaseError(placement, a, b, tempo.multiple) : { median: 0, p90: 0, checked: 1, worstWindow: 0 }
     if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75 || drift.worstWindow > MAX_WINDOW_DRIFT) return null
     const finish = placement.variant.preset === 'blend' ? placement.variant.prior - start.variant.prior - BEST_FINISH : 0
-    const score = placement.bound + finish - tonalTerm - energyTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    const clarityTerm = Number.isNaN(placement.clarity) ? 0.1 : 0.3 * Math.max(0, 1 - placement.clarity / MIN_CLARITY)
+    const score = placement.bound + finish - tonalTerm - energyTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
   let best: { placement: Placement; score: number } | null = null
@@ -1494,8 +1546,8 @@ export function transitionIssues(transition: Transition, aMix: TrackMix | null, 
     for (let i = 0; i < sampled.voiceA.length - 1; i++) {
       const t = i * dt
       const tb = deckPosition(transition, 'b', t)
-      if (sampled.voiceB[i] <= VOICE_HEARD || tb === null || !spanAt(b.vocals, tb)) continue
-      const direct = sampled.voiceA[i] > VOICE_HEARD && spanAt(a.vocals, at(t))
+      if (sampled.voiceB[i] <= VOICE_HEARD || tb === null || !b.vocalsKnown || !spanAt(b.vocals, tb)) continue
+      const direct = sampled.voiceA[i] > VOICE_HEARD && a.vocalsKnown && spanAt(a.vocals, at(t))
       if (direct || (echoed !== null && echoed[i] >= ECHO_HEARD)) voices += dt
     }
   }

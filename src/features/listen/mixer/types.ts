@@ -37,9 +37,12 @@ export interface TrackMix {
   /** Phrase starts: downbeats where an 8-bar (sometimes 4/16) phrase begins, usually where sections change. */
   phrases: number[]
   /**
-   * Per phrase (same index as `phrases`, each up to the next phrase or the end): how clearly its beats are heard as
-   * attacks (0–1, the share of beats with one clear broadband or snare/clap/hat attack on the grid). Beatmatching over
-   * a phrase with unclear attacks can't be trusted to line up audibly. The kick is measured apart (`barKickClarity`).
+   * Per phrase (same index as `phrases`, each up to the next phrase or the end): how safely its beats can be laid over
+   * another song's (0–1, the share of beats that aren't flam material). A beat is flam material where a clear attack
+   * lies near the grid (within 50 ms) but not on it (more than 12 ms off: a grid beside its attacks, a doubled or
+   * wandering attack) in the broadband or the snare/clap/hat attacks (averaged over the 2 bars around it); attacks on
+   * the grid, no clear attacks (pads, silence) and stabs well off the beat are clear. The kick is measured apart
+   * (`barKickClarity`).
    */
   phraseClarity: number[]
   /**
@@ -48,9 +51,9 @@ export interface TrackMix {
    */
   barClarity: number[]
   /**
-   * Per bar (same index as `downbeats`): the share of its beats whose kick doesn't contradict the grid (no standing-out
-   * kick attack, or one within 25 ms of `kickOffset`). Low where the kick plays off the beat (syncopated or doubled):
-   * two decks' kicks flam there unless one deck's lows are down. Empty in analyses made before it.
+   * Per bar (same index as `downbeats`): the same measure for the kick alone (40–150 Hz, against `kickOffset`): low
+   * where a kick attack lies within 50 ms of where the song's kicks sit but more than 12 ms from it (doubled or
+   * scattered). Two decks' kicks flam there unless one deck's lows are down. Empty in analyses made before it.
    */
   barKickClarity: number[]
   /**

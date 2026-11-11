@@ -437,6 +437,21 @@ interface BandSamples {
   high: Float32Array
 }
 
+/**
+ * How much of a voice a filter knob lets through, with the player's knob-to-cutoff mapping (engine.ts
+ * filterFrequencies: high-pass 20 Hz × 450^knob, low-pass Nyquist × (70 Hz / Nyquist)^-knob, at 44.1 kHz). A rising
+ * high-pass takes the bass first and leaves a voice clear until its cutoff passes about 1 kHz (its intelligibility,
+ * 1–4 kHz, goes from there); a closing low-pass leaves a muffled voice audible (its body, from about 300 Hz) until
+ * the cutoff falls that far.
+ */
+function voicePass(f: number) {
+  const knob = Math.max(-1, Math.min(1, f))
+  const cutoff = knob > 0 ? 20 * 450 ** knob : knob < 0 ? 22050 * (70 / 22050) ** -knob : NaN
+  if (Number.isNaN(cutoff)) return 1
+  const passed = knob > 0 ? Math.log(4000 / cutoff) / Math.log(4000 / 1000) : Math.log(cutoff / 300) / Math.log(4000 / 300)
+  return Math.min(1, Math.max(0, passed))
+}
+
 const filterDamp = (f: number) => (Math.abs(f) <= 0.4 ? 1 : 1 - ((Math.abs(f) - 0.4) / 0.6) * 0.7)
 const bassThrough = (f: number) => (f > 0.5 ? 0.3 : 1)
 
@@ -515,11 +530,11 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
     const pa = filterBands(fa)
     const pb = filterBands(fb)
     // A voice comes through as gain × the louder of the mid band (its body) and the high band (its air and consonants,
-    // which carry a voice on their own), damped by a closed filter. A deck's beats are heard where its kick (gain × low,
+    // which carry a voice on their own), through the filter as far as it passes the voice's 1–4 kHz. A deck's beats are heard where its kick (gain × low,
     // no high-pass) or its accents (gain × the louder of mids and highs, no low-pass) are up to BEAT_HEARD: each can
     // flam on its own, hats at -8 dB too.
-    voiceA[i] = ga * Math.max(ma, ha) * da
-    voiceB[i] = gb * Math.max(mb, hb) * db
+    voiceA[i] = ga * Math.max(ma, ha) * voicePass(fa)
+    voiceB[i] = gb * Math.max(mb, hb) * voicePass(fb)
     gainA[i] = ga
     gainB[i] = gb
     loudA[i] = (ga * la >= BEAT_HEARD && fa <= 0.4) || (ga * Math.max(ma, ha) >= BEAT_HEARD && fa >= -0.4) ? 1 : 0

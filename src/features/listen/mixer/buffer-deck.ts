@@ -39,6 +39,8 @@ export interface BufferDeck {
   play(plan: DeckPlan, from: number, to: number, zero: number, semitones?: (t: number) => number): void
   /** Fades out over a few ms from context time `when` and stops. */
   stopAt(when: number): void
+  /** Resolves once everything scheduled so far has reached the audio thread (an offline render waits for it). */
+  settled(): Promise<void>
   dispose(): void
 }
 
@@ -63,6 +65,7 @@ export async function createBufferDeck(ctx: BaseAudioContext, destination: Audio
       load: (channels, origin) => stretch.load(channels, origin),
       play: (plan, from, to, zero, semitones) => stretch.follow(deckSchedule(plan, from, to), zero, semitones),
       stopAt: (when) => stretch.stopAt(when),
+      settled: () => stretch.settled(),
       dispose: () => stretch.dispose(),
     }
   }
@@ -122,6 +125,8 @@ export async function createBufferDeck(ctx: BaseAudioContext, destination: Audio
         source.stop(when + JOIN_FADE_S)
       }
     },
+    // Audio params and sources are set on the main thread.
+    settled: () => Promise.resolve(),
     dispose() {
       for (const { source, gain } of playing) {
         source.onended = null
@@ -296,6 +301,7 @@ async function createHybridDeck(ctx: BaseAudioContext, destination: AudioNode, o
         rampAt(param, Math.max(ctx.currentTime, when) + 0.005, 0)
       }
     },
+    settled: () => stretch.settled(),
     dispose() {
       exact.dispose()
       stretch.dispose()

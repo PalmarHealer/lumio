@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Glide check</title>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      import { checkLive, checkRender } from './glide-check.ts'
+      const out = document.getElementById('out')
+      const results = []
+      const show = (result) => {
+        results.push(result)
+        out.textContent = results.map((r) => JSON.stringify({ ...r, errors: undefined })).join('\n')
+      }
+      window.glideResults = results
+      for (const rate of [44100, 48000]) for (const kind of ['hybrid', 'stretch']) for (const deck of ['b', 'a']) show(await checkRender(deck, kind, rate))
+      if (new URLSearchParams(location.search).has('live')) for (const rate of [44100, 48000]) show(await checkLive('hybrid', rate))
+      out.textContent += results.every((r) => r.pass) ? '\nPASS' : '\nFAIL'
+      window.glideDone = true
+    </script>
+  </body>
+</html>

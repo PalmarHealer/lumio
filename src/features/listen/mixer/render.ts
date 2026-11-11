@@ -89,6 +89,9 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   master.engage(true, Math.max(0, zero - LIMITER_LEAD_S))
   master.engage(false, zero + Math.max(length, bSettled(transition)) + 0.05)
 
+  // The stretchers' changes travel by message: all must have arrived before rendering runs past them.
+  await Promise.all([playerA.settled(), playerB.settled()])
+
   // Without the lead and the limiter's delay at the front.
   const rendered = await ctx.startRendering()
   playerA.dispose()

@@ -60,9 +60,12 @@ export interface TrackMix {
   /** Phrase starts: downbeats where an 8-bar (sometimes 4/16) phrase begins, usually where sections change. */
   phrases: number[]
   /**
-   * Per phrase (same index as `phrases`, each up to the next phrase or the end): how clearly its beats are heard as
-   * attacks (0–1, the share of beats with one clear broadband or snare/clap/hat attack on the grid). Beatmatching over
-   * a phrase with unclear attacks can't be trusted to line up audibly. The kick is measured apart (`barKickClarity`).
+   * Per phrase (same index as `phrases`, each up to the next phrase or the end): how safely its beats can be laid over
+   * another song's (0–1, the share of beats that aren't flam material). A beat is flam material where a clear attack
+   * lies near the grid (within 50 ms) but not on it (more than 12 ms off: a grid beside its attacks, a doubled or
+   * wandering attack) in the broadband or the snare/clap/hat attacks (averaged over the 2 bars around it); attacks on
+   * the grid, no clear attacks (pads, silence) and stabs well off the beat are clear. The kick is measured apart
+   * (`barKickClarity`).
    */
   phraseClarity: number[]
   /**
@@ -71,9 +74,9 @@ export interface TrackMix {
    */
   barClarity: number[]
   /**
-   * Per bar (same index as `downbeats`): the share of its beats whose kick doesn't contradict the grid (no standing-out
-   * kick attack, or one within 25 ms of `kickOffset`). Low where the kick plays off the beat (syncopated or doubled):
-   * two decks' kicks flam there unless one deck's lows are down. Empty in analyses made before it.
+   * Per bar (same index as `downbeats`): the same measure for the kick alone (40–150 Hz, against `kickOffset`): low
+   * where a kick attack lies within 50 ms of where the song's kicks sit but more than 12 ms from it (doubled or
+   * scattered). Two decks' kicks flam there unless one deck's lows are down. Empty in analyses made before it.
    */
   barKickClarity: number[]
   /**
@@ -583,7 +586,7 @@ function beatProfiles(beats: number[], onsets: { rise: Float32Array; step: numbe
       for (let j = 0; j < width; j++) profile[j] += rise[centre - reach + j]!
       count++
     }
-    if (!count) return { shift: 0, prominence: 0, rival: 1 }
+    if (!count) return { shift: 0, prominence: 0, rival: 1, profile, step }
     let at = 0
     for (let j = 1; j < width; j++) if (profile[j]! > profile[at]!) at = j
     const peak = profile[at]!
@@ -592,8 +595,51 @@ function beatProfiles(beats: number[], onsets: { rise: Float32Array; step: numbe
     for (let j = 1; j < width - 1; j++) {
       if (Math.abs(j - at) > apart && profile[j]! >= profile[j - 1]! && profile[j]! >= profile[j + 1]!) rival = Math.max(rival, profile[j]!)
     }
-    return { shift: (at - reach) * step, prominence: peak > 0 ? (peak - median(Array.from(profile))) / peak : 0, rival: peak > 0 ? rival / peak : 1 }
+    return { shift: (at - reach) * step, prominence: peak > 0 ? (peak - median(Array.from(profile))) / peak : 0, rival: peak > 0 ? rival / peak : 1, profile, step }
   })
+}
+
+/**
+ * Whether a beat's averaged attacks (see beatProfiles) are flam material: an attack lies near the grid (within 50 ms
+ * of `centre`, seconds from the beat) but not on it (more than 12 ms off). Taken on the profile smoothed over 5 ms,
+ * where it stands out at all (its peak at least 0.6 of itself above its median): an attack is a peak reaching 75 % of
+ * the strongest that rises at least 30 % of the profile's range (peak over median) above the dips around it, so a
+ * busy, jagged texture has none.
+ * Attacks on the grid line up; no clear attack (a pad, a wash, silence in that band) and stabs well off the beat
+ * (syncopation, an off-beat hat) can't flam against another song's beat; a grid beside its attacks, a doubled attack
+ * and attacks that wander between two places can.
+ */
+function flamRisk(beat: { profile: Float64Array; step: number }, centre = 0) {
+  const raw = beat.profile
+  const width = Math.max(1, Math.round(0.005 / beat.step))
+  const profile = raw.map((_, j) => {
+    let sum = 0
+    let count = 0
+    for (let k = Math.max(0, j - (width >> 1)); k < Math.min(raw.length, j - (width >> 1) + width); k++) {
+      sum += raw[k]!
+      count++
+    }
+    return sum / count
+  })
+  let peak = 0
+  for (const value of profile) peak = Math.max(peak, value)
+  const middle = median(Array.from(profile))
+  if (peak <= 0 || (peak - middle) / peak < 0.6) return false
+  const rise = 0.3 * (peak - middle)
+  const reach = (profile.length - 1) / 2
+  for (let j = 1; j < profile.length - 1; j++) {
+    const value = profile[j]!
+    if (value < 0.75 * peak || value < profile[j - 1]! || value < profile[j + 1]!) continue
+    const off = Math.abs((j - reach) * beat.step - centre)
+    if (off <= 0.012 || off > 0.05) continue
+    // How far the peak rises above the deeper of the dips that part it from higher ground (or the profile's ends).
+    let left = value
+    for (let k = j - 1; k >= 0 && profile[k]! <= value; k--) left = Math.min(left, profile[k]!)
+    let right = value
+    for (let k = j + 1; k < profile.length && profile[k]! <= value; k++) right = Math.min(right, profile[k]!)
+    if (value - Math.max(left, right) >= rise) return true
+  }
+  return false
 }
 
 /**
@@ -1494,14 +1540,11 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const phraseBars = barCount ? findPhrases(boundary, barCount) : []
   const phrases = phraseBars.map((b) => barStarts[b]!)
   const phraseEnd = (p: number) => (p + 1 < phraseBars.length ? barStarts[phraseBars[p + 1]!]! : duration)
-  // How clearly each phrase's beats are heard as attacks: a beat counts when the attacks averaged over the two bars
-  // around it (see beatProfiles, ±80 ms) form one peak that stands out (at least 0.6) within 12 ms of the grid, with no
-  // other peak reaching 75 % of it, in the broadband attacks or in the snares, claps and hats (1.5–5 kHz), a rhythm a
-  // DJ can lock onto. A wash, a pad, a riff without a beat, or a grid off the attacks scores low. (The kick band alone
-  // isn't used: a bass line moving in the same band makes it ambiguous in most pop.)
-  const unambiguous = (profile: { prominence: number; shift: number; rival: number }) => profile.prominence >= 0.6 && Math.abs(profile.shift) <= 0.012 && profile.rival < 0.75
+  // How safely each phrase's beats can be laid over another song's: a beat is clear unless its broadband attacks or
+  // its snares, claps and hats (1.5–5 kHz) are flam material (see flamRisk: an attack near the grid but not on it).
+  // Off-beat stabs, pads and silence can't flam; a grid beside its attacks, a doubled attack and attacks that wander
+  // can. The kick is measured apart (barKickClarity), against where the song's kicks usually sit.
   const accentBeats = beatProfiles(beats, accents, 0.08)
-  const accentClear = accentBeats.map(unambiguous)
   // Where the song's snares, claps and hats usually sit against the grid (as kickOffset below).
   const accentStretches = accentBeats.filter((profile, i) => i % 8 === 4 && profile.prominence >= 0.6 && profile.rival < 0.75)
   const accentOffset = accentStretches.length >= 4 ? round(median(accentStretches.map((profile) => profile.shift)), 3) : 0
@@ -1512,22 +1555,20 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const kickBeats = beatProfiles(beats, fineOnsets(samples, rate, 40, 150), 0.08)
   const kickProfiles = kickBeats.filter((profile, i) => i % 8 === 4 && profile.prominence >= 0.6 && profile.rival < 0.75)
   const kickOffset = kickProfiles.length >= 4 ? round(median(kickProfiles.map((profile) => profile.shift)), 3) : 0
-  // A beat whose kick plays off the grid (a syncopated or doubled kick: its averaged attack stands out but not within
-  // 25 ms of where the song's kicks usually sit) is measured apart (barKickClarity): two songs' kicks would flam there
+  // A beat whose kick is flam material (a kick attack within 50 ms of where the song's kicks usually sit but more than
+  // 12 ms from it: a doubled or scattered kick) is measured apart (barKickClarity): two songs' kicks would flam there
   // although their claps and hats line up, unless one deck's lows are down.
-  const kickAgrees = kickBeats.map((profile) => profile.prominence < 0.6 || Math.abs(profile.shift - kickOffset) <= 0.025)
-  const beatClear = beatProfiles(beats, onsets, 0.08).map((profile, i) => unambiguous(profile) || accentClear[i]!)
+  const kickClear = kickBeats.map((profile) => !flamRisk(profile, kickOffset))
+  const broadBeats = beatProfiles(beats, onsets, 0.08)
+  const beatClear = broadBeats.map((profile, i) => !flamRisk(profile) && !flamRisk(accentBeats[i]!))
   const phraseClarity = phrases.map((start, p) => {
     const end = phraseEnd(p)
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
     return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
   })
-  // How late the kick attacks lie behind the grid (the grid follows the broadband and accent attacks; a kick's low
-  // rise peaks later by a song-specific amount): per 2 bars, the kick band's averaged attack (see beatProfiles) where it
-  // has one clear peak; the median over those, 0 with fewer than 4 of them.
   const barKickClarity = downbeats.map((start, b) => {
     const end = downbeats[b + 1] ?? duration
-    const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [kickAgrees[i]!] : []))
+    const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [kickClear[i]!] : []))
     return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
   })
   const barClarity = downbeats.map((start, b) => {

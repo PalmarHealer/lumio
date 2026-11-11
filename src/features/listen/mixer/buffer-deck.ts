@@ -138,10 +138,19 @@ export async function createBufferDeck(ctx: BaseAudioContext, destination: Audio
   }
 }
 
-/** Which way a deck plays: exactly while its rate stays 1 over the window, else as `tempoChange` says. */
+/**
+ * How far a deck's rate may stray from 1 and still be played exactly (resampled: its pitch moves with it). 0.3 % is
+ * 5 cents, below what the ear tells apart even with both decks sounding; the stretcher, on the other hand, costs
+ * transient precision and raises peaks the deck limiter must then take back (it worked on up to 29 % of frames, down
+ * to -6 dB, for a mere 0.04 % of beatmatching). Above it the pitch is kept (stretched where the rate isn't 1).
+ */
+export const EXACT_RATE_TOLERANCE = 0.003
+
+/** Which way a deck plays: exactly while its rate stays within the tolerance of 1 over the window, else `tempoChange`. */
 export function bufferDeckKind(plan: DeckPlan, from: number, to: number, tempoChange: BufferDeckKind): BufferDeckKind {
-  const changes = plan.rate.some((keyframe) => Math.abs(keyframe.v - 1) > 1e-6 && keyframe.t <= to) || Math.abs(rateOf(plan, from) - 1) > 1e-6
-  return changes ? tempoChange : 'exact'
+  // The curve is linear between keyframes: its furthest point from 1 is at a keyframe (or where the window starts).
+  const deviation = Math.max(Math.abs(rateOf(plan, from) - 1), ...plan.rate.filter((keyframe) => keyframe.t <= to).map((keyframe) => Math.abs(keyframe.v - 1)))
+  return deviation > EXACT_RATE_TOLERANCE ? tempoChange : 'exact'
 }
 
 /** Equal-power crossfades between the exact and the stretched sound, and how far each plays into the other's turn. */

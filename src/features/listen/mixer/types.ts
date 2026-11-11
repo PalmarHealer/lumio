@@ -57,6 +57,13 @@ export interface TrackMix {
    */
   barKickClarity: number[]
   /**
+   * Per bar (same index as `downbeats`): how much it repeats the bar before it or the one before that (0–1, the larger
+   * cosine similarity of the two bars' chroma and kick/mid/accent attacks in 16 steps each). Near 1 in a looped 1- or
+   * 2-bar figure (a chant, a sampled hook, a DJ-intro groove); lower where the music develops (a build with a riser,
+   * sung verses). Empty in analyses made before it.
+   */
+  barRepeat: number[]
+  /**
    * Per phrase (same index as `phrases`): what it plays harmonically, as 12 values (pitch classes from C, 0–1, the
    * strongest 1). Taken from the melody's range (C3–C6) with short transients (drums) held out, so phrases with similar
    * melodies and chords have similar profiles (cosine). Empty in analyses made before it.

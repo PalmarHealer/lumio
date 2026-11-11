@@ -876,9 +876,14 @@ function phaseError(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
   const sorted = offsets.map(Math.abs).sort((x, y) => x - y)
   let worstWindow = 0
   for (const { sum, count } of sums.values()) if (count >= 3) worstWindow = Math.max(worstWindow, Math.abs(sum / count))
-  // Per bar of A (4 beats): the mean offset, which the fitted rate and phase must keep within MAX_BAR_OFFSET everywhere.
+  // Per bar of A (4 beats) where both decks' accents (snares, claps, hats: the sharpest attacks) are heard: the mean
+  // offset, which the fitted rate and phase must keep within MAX_BAR_OFFSET everywhere.
   const bars = new Map<number, { sum: number; count: number }>()
+  const { stats } = p
   times.forEach((t, i) => {
+    const k = Math.round(t / stats.dt)
+    if (k < 0 || k >= stats.loudA.length) return
+    if (Math.max(stats.passA.mid[k], stats.passA.high[k]) < BEAT_HEARD || Math.max(stats.passB.mid[k], stats.passB.high[k]) < BEAT_HEARD) return
     const w = Math.floor(t / (4 * p.stats.beat))
     const entry = bars.get(w) ?? { sum: 0, count: 0 }
     entry.sum += offsets[i]
@@ -955,6 +960,25 @@ function spreadOf(mix: TrackMix) {
  * user's approved Right Round → Beauty And A Beat (0.016) and Legendary Lovers → Heartbeat (0.018).
  */
 const GROOVE_SPREAD = 0.02
+
+/** A bar repeats the one or two before it (barRepeat) from here: a looped figure. */
+const REPEATED_BAR = 0.75
+
+/** The share of a track's bars in [from, to] that repeat the bar or two before them; 0 without the measure or bars. */
+function repeatedShare(track: PreparedTrack, from: number, to: number) {
+  const repeat: unknown = track.mix.barRepeat
+  if (!Array.isArray(repeat) || repeat.length !== track.downbeats.length) return 0
+  const first = Math.max(0, floorIndex(track.downbeats, from + 0.05))
+  let count = 0
+  let same = 0
+  for (let k = first; k < repeat.length && track.downbeats[k] < to - 0.05; k++) {
+    const value = repeat[k]
+    if (typeof value !== 'number' || !Number.isFinite(value)) continue
+    count++
+    if (value > REPEATED_BAR) same++
+  }
+  return count >= 4 ? same / count : 0
+}
 
 /** A song's swing (0.5 straight); 0.5 when unknown. */
 function swingOf(mix: TrackMix) {
@@ -1762,10 +1786,14 @@ export function planTransition(
       for (let i = 0; i < stats.loudA.length; i++) if (i * stats.dt >= placement.bStart && stats.loudA[i] && stats.loudB[i]) loudBoth += stats.dt
       grooveTerm = 0.4 * Math.min(1, (spread - GROOVE_SPREAD) / GROOVE_SPREAD) * Math.min(1, loudBoth / (16 * stats.beat))
     }
+    // A parked on a looped 1–2-bar figure (a chant, a sampled hook) for most of a long overlap sounds sampled ("you're
+    // basically sampling it"): the longer, the more it costs; a short A tail with B carrying the time doesn't.
+    const parked = repeatedShare(a, positionA(placement, placement.bStart), positionA(placement, stats.aGone))
+    const repeatTerm = parked >= 0.75 ? 0.3 * Math.min(1, Math.max(0, stats.aGone - placement.bStart - 8 * stats.beat) / (24 * stats.beat)) : 0
     const finish = placement.variant.preset === 'blend' ? placement.variant.prior - start.variant.prior - BEST_FINISH : 0
     const clarityTerm = Number.isNaN(placement.clarity) ? 0.1 : 0.3 * Math.max(0, 1 - placement.clarity / MIN_CLARITY)
     const duckTerm = (0.02 * (placement.ducked ?? 0)) / (4 * stats.beat)
-    const score = placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    const score = placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
   let best: { placement: Placement; score: number } | null = null

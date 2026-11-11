@@ -8,7 +8,7 @@
  */
 
 /** Raised when the analysis changes, so songs are analysed again. */
-export const MIX_VERSION = 3
+export const MIX_VERSION = 4
 
 export type SectionKind = 'intro' | 'verse' | 'chorus' | 'drop' | 'build' | 'break' | 'outro' | 'other'
 

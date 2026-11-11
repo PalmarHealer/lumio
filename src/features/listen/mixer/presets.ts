@@ -559,7 +559,10 @@ function blend(ctx: PresetContext): PresetShape {
             [RAMP, 1],
           ]
   const swapAt = bassAt === 'start' ? RAMP : middle
-  const aLow: Point[] = bassAt === 'none' ? [] : [[0, 1], ...stepAt(swapAt, 1, 0)]
+  // A DJ's bass swap is gradual: A's low goes down to half over the two bars before the phrase downbeat and is gone on
+  // it, where B's low comes in (never both full: B's stays killed until then).
+  const preCut = bassAt === 'middle' ? Math.min(8 * ctx.beat, middle / 2) : 0
+  const aLow: Point[] = bassAt === 'none' ? [] : preCut > 0 ? [[middle - preCut, 1], [swapAt - RAMP, 0.5], [swapAt, 0]] : [[0, 1], ...stepAt(swapAt, 1, 0)]
   const bLow: Point[] = bassAt === 'none' ? [] : [[0, 0], ...stepFrom(swapAt, 0, 1)]
   // Tonal content: crossing equal-power in the fade, swapped in the beat around the middle for clashing keys.
   const aMid: Point[] = ctx.midSwap

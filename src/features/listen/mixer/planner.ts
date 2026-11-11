@@ -279,6 +279,12 @@ function blendFinishes(variant: Variant, clash: boolean): Variant[] {
 /** The best prior any finish of a blend layout can add (so the bound stays an upper bound). */
 const BEST_FINISH = 0.03
 
+/**
+ * Added to every blend's score: wherever a blend passes every rule it is chosen; echo outs and fades are the fallback
+ * when none does.
+ */
+const BLEND_FIRST = 3
+
 function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?: ConcretePreset): Variant[] {
   const list: Variant[] = []
   const add = (preset: ConcretePreset, prior: number, bars: number[] = [0], extra: { preRolls?: number[] } = {}) => {
@@ -303,7 +309,7 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
         filterIn: 'hp',
         filterOut: 'hp',
         meet: 'shape',
-        prior: prior + layout.prior,
+        prior: prior + layout.prior + BLEND_FIRST,
       })
     }
   }
@@ -320,7 +326,6 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
     add('fadeIn', 0, [2])
   } else if (synced) {
     addBlends(0.75)
-    add('dropSwap', 0.1, [0], { preRolls: [8] })
     add('echoOut', 0.05)
   } else {
     add('echoOut', 0.12)
@@ -328,7 +333,7 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
   }
   if (!forced) return list
   const chosen = list.filter((v) => v.preset === forced)
-  if (chosen.length > 0) return chosen.map((v) => ({ ...v, prior: v.preset === 'blend' ? v.prior - (style === 'clean' ? 0.9 : 0.75) : 0 }))
+  if (chosen.length > 0) return chosen.map((v) => ({ ...v, prior: v.preset === 'blend' ? v.prior - (style === 'clean' ? 0.9 : 0.75) - BLEND_FIRST : 0 }))
   // A technique this style doesn't use on its own (the editor's choice): plain defaults.
   const bars = FREE_LENGTH.has(forced) ? (synced ? [16, 8, 4] : [2]) : [0]
   if (forced === 'blend')
@@ -592,7 +597,8 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   let total = 0
   let samples = 0
   let basses = 0
-  if (length <= 0 || dt <= 0) return { over: -Infinity, mean: 0, basses: 0 }
+  let busy = 0
+  if (length <= 0 || dt <= 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0 }
   const step = Math.max(1, Math.round(0.1 / dt))
   for (let i = 0; i < stats.gainA.length; i += step) {
     const t = i * dt
@@ -618,13 +624,14 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     over.push(worst)
     total += sum / 3
     samples++
+    busy += Math.min(1, (eA.mid + eA.high + eB.mid + eB.high) / 4)
     const bassA = gA * valueAt(shape.a.low, t, 1) * fA.low * eA.low
     const bassB = gB * valueAt(shape.b.low, t, 1) * fB.low * eB.low
     if (bassA > 0.5 && bassB > 0.5) basses += dt * step
   }
-  if (samples === 0) return { over: -Infinity, mean: 0, basses: 0 }
+  if (samples === 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0 }
   over.sort((x, y) => x - y)
-  return { over: over[Math.floor(over.length * 0.95)], mean: 10 * Math.log10(Math.max(total / samples, 1e-9)), basses }
+  return { over: over[Math.floor(over.length * 0.95)], mean: 10 * Math.log10(Math.max(total / samples, 1e-9)), basses, busy: busy / samples }
 }
 
 /** Cosine of two harmonic profiles (0 when either is missing). */
@@ -1129,7 +1136,8 @@ export function planTransition(
         if (p.pb.drop) bound += 0.35
         else if (p.pb.chorus) bound += 0.05
         else bound -= 0.2
-        if (p.pa.drop) bound += 0.1
+        // The DJ's drop mix: A is cut inside its own pre-drop gap, exactly where its drop would land.
+        if (p.pa.drop) bound += forced === 'dropSwap' ? 0.5 : 0.1
       }
       if (variant.preset === 'blend' && (p.pb.drop || p.pb.chorus)) bound += 0.1
     } else {
@@ -1169,10 +1177,13 @@ export function planTransition(
       if (!tempo.synced) continue
       const barsB = variant.bars / tempo.multiple
       if (!Number.isInteger(barsB) || barsB % 4 !== 0) continue
-      // Both ends of a blend on the phrase grid, so its middle (the swap) is a phrase point of both songs too.
+      // Both ends of a blend on the phrase grid, so its middle (the swap) is a phrase point of both songs too. Besides,
+      // A may play out completely in clean style: a blend ending on A's last bar (nothing of A skipped, B's intro under it).
       const onGrid = (track: PreparedTrack, t: number) => Math.abs(nearest(track.phraseGrid, t) - t) < 0.05
       const lanesB = ins.map((pb) => ({ pb, options: (party && pb.t > b.duration * 0.6) || !onGrid(b, pb.t) ? [] : lanesTo(b, pb.t, barsB) }))
-      for (const pa of outs.filter((anchor) => onGrid(a, anchor.t)))
+      const lastBar = floorIndex(a.downbeats, a.end + 0.05)
+      const playOut: Anchor[] = !party && lastBar - variant.bars >= 0 ? [{ t: a.downbeats[lastBar - variant.bars], bonus: 0, drop: false, chorus: false }] : []
+      for (const pa of [...outs.filter((anchor) => onGrid(a, anchor.t)), ...playOut])
         for (const fromA of lanesFrom(a, pa.t, variant.bars)) {
           // The shape's beat: A's real bars over the material (loops included), so the swap lands on A's bar.
           const stats = shapeFor(variant, fromA.advance / (4 * variant.bars))
@@ -1289,7 +1300,15 @@ export function planTransition(
     if (stats.shape.length > 0) {
       const energy = overlapEnergy(placement, a, b)
       if (energy.over > MAX_OVER_DB || energy.basses > 0) return null
-      if (placement.variant.preset === 'blend') energyTerm = 0.05 * Math.max(0, HOLE_DB - energy.mean)
+      if (placement.variant.preset === 'blend') {
+        energyTerm = 0.05 * Math.max(0, HOLE_DB - energy.mean)
+        // Busy parts (mids and highs up) take a filter, thin ones blend open; long blends suit thin parts, the short
+        // seamless one dense parts.
+        const filtered = placement.variant.filterIn || placement.variant.filterOut ? 1 : 0
+        energyTerm -= 0.04 * (filtered ? energy.busy : 1 - energy.busy)
+        if (placement.variant.bars >= 16) energyTerm += 0.04 * energy.busy
+        if (placement.variant.bars <= 4) energyTerm += 0.04 * (1 - energy.busy)
+      }
     }
     const { clash: voices, lostA, lostB } = vocalCost(placement, a, b)
     if (voices > 0.1) return null

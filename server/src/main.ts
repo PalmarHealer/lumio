@@ -65,6 +65,8 @@ const WEB_DIR = resolve(process.env.WEB_DIR ?? join(import.meta.dirname, '../../
 const TOKEN_TTL_MS = 5 * 60_000
 /** Largest request body accepted (bytes). */
 const BODY_LIMIT = 16 * 1024
+/** Largest lyrics body (a long medley has hundreds of timed lines). */
+const LYRICS_BODY_LIMIT = 256 * 1024
 /**
  * Hosts whose pictures the image relay fetches (podcast covers from Apple, artist photos from Deezer, posters and logos
  * in another language from TMDb, fanart.tv and TheTVDB); nothing else, so it is no open proxy.
@@ -1711,7 +1713,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       return send(response, 204)
     }
     if (request.method === 'PUT') {
-      const body = await readJson<{ lines?: unknown; synced?: unknown; source?: unknown; sourceName?: unknown }>(request).catch(() => null)
+      const body = await readJson<{ lines?: unknown; synced?: unknown; source?: unknown; sourceName?: unknown }>(request, LYRICS_BODY_LIMIT).catch(() => null)
       const source = typeof body?.source === 'string' && /^[a-z0-9][a-z0-9_.-]{0,59}$/i.test(body.source) ? body.source : null
       if (!source || !Array.isArray(body?.lines) || !body.lines.length || body.lines.length > 2000) return send(response, 400, { error: 'Bad lyrics' })
       const lines = (body.lines as Array<{ time?: unknown; text?: unknown }>).map((line) => ({

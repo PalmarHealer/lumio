@@ -52,7 +52,14 @@ export interface TrackMix {
   sections: MixSection[]
   /** Drop moments (a phrase start where bass and energy jump after a build-up). */
   drops: number[]
-  /** Stretches with singing. */
+  /**
+   * Stretches with singing, padded for safety ("never two vocals at once" may rely on them): synced lyrics give only
+   * line starts, and their timing may be off. Lyrics kept where they were timed (offset 0) are padded by one beat (at
+   * least 0.5 s) each side; lyrics the analysis had to move (another version) by 2 s each side, the measured placement
+   * error. A line's end isn't known: it ends 0.15 s before the next line, at most as long as its words take (about 3 a
+   * second, at least 1.5 s) and at most 1.25 times the song's median line distance (2–8 s); stretches that touch after
+   * padding are merged.
+   */
   vocals: Array<{ start: number; end: number }>
   /** Where `vocals` came from: synced lyrics aligned to the audio, an estimate from the audio, or nothing found. */
   vocalSource: 'lyrics' | 'audio' | 'none'
@@ -120,6 +127,10 @@ export interface Transition {
   style: MixStyle
   preset: PresetId
   aOut: number
+  /**
+   * Where B starts. Negative (down to -2 s) when B's first downbeat lies too close to the file start for a pre-roll:
+   * B then starts from 0 that many seconds after the transition began, so its downbeat still meets A's.
+   */
   bIn: number
   length: number
   /** B's playback rate while the decks overlap (beatmatching, pitch kept); eases back to 1 over the 8 bars after. */

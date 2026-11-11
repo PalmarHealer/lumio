@@ -64,7 +64,9 @@ const VOICE_HEARD = 0.3
  */
 const ECHO_HEARD = 0.12
 /** Median distance (seconds) between both decks' beats above which a beatmatch is rejected. */
-const MAX_DRIFT = 0.03
+const MAX_DRIFT = 0.025
+/** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
+const MAX_WINDOW_DRIFT = 0.025
 
 /** How B's tempo relates to A's: the closest of straight, half and double time. */
 export function matchTempo(a: PreparedTrack, b: PreparedTrack): TempoMatch {
@@ -415,27 +417,41 @@ function beatsBack(track: PreparedTrack, anchor: number, count: number): number 
  * How far B's beats sit from A's while both are heard, with B at `rate` from `bIn`: the median and the 90th percentile
  * (seconds). In double time (B's beat half of A's) B's off-beats fall between A's beats, which counts as on the beat.
  * Where A has no beat within half a beat (a beatless break, or beats the analysis lost) the match can't be checked;
- * `checked` is the share of B's beats that could be.
+ * `checked` is the share of B's beats that could be. `worstWindow`: the largest mean offset over any two bars.
  */
 function phaseError(stats: ShapeStats, a: PreparedTrack, b: PreparedTrack, aOut: number, bIn: number, rate: number, multiple: number) {
   const { dt } = stats
   const length = stats.shape.length
   const offsets: number[] = []
+  // Signed offsets summed per window of two bars of A: a song whose tempo drifts can line up on average and still
+  // run a bar or two late somewhere, which is what the ear hears.
+  const window = 8 * stats.beat
+  const sums = new Map<number, { sum: number; count: number }>()
   let heard = 0
-  if (dt <= 0) return { median: 0, p90: 0, checked: 1 }
+  if (dt <= 0) return { median: 0, p90: 0, checked: 1, worstWindow: 0 }
   for (let k = Math.max(0, floorIndex(b.beats, Math.max(0, bIn)) + 1); k < b.beats.length && b.beats[k] <= bIn + length * rate; k++) {
     const t = (b.beats[k] - bIn) / rate
     const i = Math.round(t / dt)
     if (i < 0 || i >= stats.gainA.length || stats.gainA[i] < 0.2 || stats.gainB[i] < 0.2) continue
     const ta = aOut + t
     heard++
-    let offset = Math.abs(nearest(a.beats, ta) - ta)
-    if (multiple === 0.5) offset = Math.min(offset, Math.abs(offset - stats.beat / 2))
-    if (offset < stats.beat * 0.45) offsets.push(offset)
+    // Positive: B's beat comes after A's.
+    let signed = ta - nearest(a.beats, ta)
+    if (multiple === 0.5 && Math.abs(signed) > stats.beat / 4) signed -= Math.sign(signed) * (stats.beat / 2)
+    const offset = Math.abs(signed)
+    if (offset >= stats.beat * 0.45) continue
+    offsets.push(offset)
+    const w = Math.floor(t / window)
+    const entry = sums.get(w) ?? { sum: 0, count: 0 }
+    entry.sum += signed
+    entry.count++
+    sums.set(w, entry)
   }
-  if (offsets.length === 0) return { median: 0, p90: 0, checked: heard === 0 ? 1 : 0 }
+  if (offsets.length === 0) return { median: 0, p90: 0, checked: heard === 0 ? 1 : 0, worstWindow: 0 }
   offsets.sort((p, q) => p - q)
-  return { median: offsets[offsets.length >> 1], p90: offsets[Math.floor(offsets.length * 0.9)], checked: offsets.length / heard }
+  let worstWindow = 0
+  for (const { sum, count } of sums.values()) if (count >= 3) worstWindow = Math.max(worstWindow, Math.abs(sum / count))
+  return { median: offsets[offsets.length >> 1], p90: offsets[Math.floor(offsets.length * 0.9)], checked: offsets.length / heard, worstWindow }
 }
 
 interface Placement {
@@ -761,13 +777,15 @@ export function planTransition(
     if (!party && placement.sung > 0.5) continue
     const { clash, lostA, lostB } = vocalCost(placement.stats, a, b, placement.aOut, placement.bIn, placement.rate)
     if (clash > 0.1) continue
-    // Beats that drift apart flam audibly from about 30 ms on (and a stretch of the overlap may drift worse than the
+    // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
     // against A's beats (unsure: the safe techniques remain).
     const drift = placement.beatmatched
       ? phaseError(placement.stats, a, b, placement.aOut, placement.bIn, placement.rate, tempo.multiple)
-      : { median: 0, p90: 0, checked: 1 }
-    if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75) continue
+      : { median: 0, p90: 0, checked: 1, worstWindow: 0 }
+    // Judged two bars at a time too: a stretch where B runs late flams even when the whole lines up on average. A
+    // longer overlap that drifts loses here; a shorter variant of it, or a technique without beatmatch, takes over.
+    if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75 || drift.worstWindow > MAX_WINDOW_DRIFT) continue
     const score = placement.bound - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     if (!best || score > best.score) best = { placement, score }
   }

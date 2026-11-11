@@ -13,6 +13,8 @@ import { creditsOfRecording, lookupCredits, sameName, searchRecordings, type Fai
 import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, type Privacy } from './store.ts'
 import { tasteSignals, type TasteSignals } from './taste.ts'
 import { SOUND_VERSION } from './sound-analysis.ts'
+import { MIX_VERSION } from './mix-analysis.ts'
+import { analyzeTrack, parsePlaylistMixer, type MixTrack } from './mix.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
@@ -81,6 +83,8 @@ const UPLOAD_DIR = join(DATA_DIR, 'localized-images')
 const TEXT_BODY_LIMIT = 64 * 1024
 /** Largest part of an imported listening history (the app sends it in parts of a few thousand plays). */
 const IMPORT_BODY_LIMIT = 4 * 1024 * 1024
+/** Largest playlist mixer body (its transitions: about a kilobyte or two each). */
+const MIXER_BODY_LIMIT = 2 * 1024 * 1024
 /** Most plays in one part of an import. */
 const IMPORT_BATCH = 5000
 /** Services whose listening history can be imported. */
@@ -736,7 +740,7 @@ async function creditsFor(id: string, meta: TrackMeta): Promise<TrackCredits | n
   return lookup
 }
 
-type JobName = 'credits' | 'artists' | 'languages' | 'sound' | 'lyrics'
+type JobName = 'credits' | 'artists' | 'languages' | 'sound' | 'lyrics' | 'mix'
 
 /** The administrators' tasks on the library, each running on its own (one run at a time). */
 const jobs: Record<JobName, JobState & { stop?: boolean }> = {
@@ -745,6 +749,7 @@ const jobs: Record<JobName, JobState & { stop?: boolean }> = {
   languages: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
   sound: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
   lyrics: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
+  mix: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
 }
 
 /**
@@ -1007,6 +1012,105 @@ function queueSound(id: string, token: string) {
       soundRunning = false
     }
   })()
+}
+
+// ---- whole songs analysed for the mixer mode (see mix.ts, mix-analysis.ts) ----
+
+/** A song that couldn't be analysed is tried again after a week (Jellyfin may have been away, the file replaced). */
+const MIX_RETRY = 7 * 24 * HOUR
+/** Songs being analysed right now (by the library run or the queue), so none is done twice at once. */
+const mixing = new Set<string>()
+
+/** Analyses a song and keeps the result (null: it can't be). Returns whether it could be analysed. */
+async function mixOf(token: string, track: MixTrack) {
+  if (mixing.has(track.Id)) return false
+  mixing.add(track.Id)
+  try {
+    const mix = await analyzeTrack(JELLYFIN_URL, token, track, store.lyrics(track.Id.toLowerCase())?.data as Parameters<typeof analyzeTrack>[3])
+    store.setTrackMix(track.Id, mix)
+    return !!mix
+  } finally {
+    mixing.delete(track.Id)
+  }
+}
+
+/** Analyses every song not analysed yet (with this version of the analysis); a few seconds each. */
+function scanMix(token: string, userId: string, scope: Scope = NO_SCOPE) {
+  return runJob<MixTrack & { Genres?: string[] }>(
+    jobs.mix,
+    async () => {
+      const done = store.currentTrackMixes(MIX_VERSION, MIX_RETRY)
+      const tracks = await libraryItems<MixTrack & { Genres?: string[] }>(token, userId, '/Users/{user}/Items', { Recursive: 'true', IncludeItemTypes: 'Audio', Fields: 'Genres' }, scope.libraries)
+      return tracks.filter((track) => !done.has(track.Id) && !leftOut(scope, [...(track.Artists ?? []), track.AlbumArtist], track.Genres))
+    },
+    (track) => (store.hasTrackMix(track.Id, MIX_VERSION, MIX_RETRY) ? Promise.resolve(true) : mixOf(token, track)),
+    (track) => ({ id: track.Id, title: track.Name ?? '', artist: track.Artists?.[0] ?? track.AlbumArtist ?? '' }),
+  )
+}
+
+/**
+ * Songs the apps asked for (GET /music/mix) that aren't analysed yet, done one after another in the background with
+ * the asker's token (a mixer-mode playlist fills in as it is played, without an administrator's run). Bounded, so a
+ * flood of requests can't grow it without end; what didn't fit is asked for again by the apps later.
+ */
+const mixQueue = new Map<string, string>()
+const MIX_QUEUE_MAX = 2000
+let mixRunning = false
+
+function queueMix(id: string, token: string) {
+  if (mixQueue.has(id) || mixing.has(id) || mixQueue.size >= MIX_QUEUE_MAX) return
+  mixQueue.set(id, token)
+  if (mixRunning) return
+  mixRunning = true
+  void (async () => {
+    try {
+      while (mixQueue.size) {
+        const [next, nextToken] = mixQueue.entries().next().value as [string, string]
+        mixQueue.delete(next)
+        try {
+          const person = tokens.get(nextToken)?.person
+          if (!person || store.hasTrackMix(next, MIX_VERSION, MIX_RETRY)) continue
+          const item = await fetch(`${JELLYFIN_URL}/Users/${person.id}/Items/${next}`, { headers: { Authorization: `MediaBrowser Token="${nextToken}"` }, signal: AbortSignal.timeout(15_000) })
+          if (!item.ok) continue
+          const track = (await item.json()) as MixTrack & { Type?: string }
+          if (track.Type !== 'Audio') continue
+          await mixOf(nextToken, track)
+        } catch (error) {
+          console.warn(`Mix of ${next}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+    } finally {
+      mixRunning = false
+    }
+  })()
+}
+
+/**
+ * What someone may do with a playlist, as Jellyfin decides it with their token: see it (it is a playlist they can
+ * open), and edit it (they own it, or it is shared with them for editing). Asked again after a minute.
+ */
+const playlistAccess = new Map<string, { see: boolean; edit: boolean; until: number }>()
+
+async function accessToPlaylist(token: string, userId: string, playlistId: string) {
+  const key = `${token}|${playlistId}`
+  const cached = playlistAccess.get(key)
+  if (cached && cached.until > Date.now()) return cached
+  const headers = { Authorization: `MediaBrowser Token="${token}"` }
+  const access = { see: false, edit: false, until: Date.now() + 60_000 }
+  const item = await fetch(`${JELLYFIN_URL}/Users/${userId}/Items/${playlistId}?${new URLSearchParams({ Fields: 'CanDelete' })}`, { headers, signal: AbortSignal.timeout(15_000) })
+  if (item.ok) {
+    const playlist = (await item.json()) as { Type?: string; CanDelete?: boolean }
+    access.see = playlist.Type === 'Playlist'
+    // Who may delete a playlist owns it (or administers the server); others edit it when it is shared with them so.
+    if (access.see && playlist.CanDelete) access.edit = true
+    else if (access.see) {
+      const share = await fetch(`${JELLYFIN_URL}/Playlists/${playlistId}/Users/${userId}`, { headers, signal: AbortSignal.timeout(15_000) })
+      access.edit = share.ok && !!((await share.json()) as { CanEdit?: boolean }).CanEdit
+    }
+  } else if (item.status >= 500) throw new Error(`Jellyfin ${item.status}`)
+  if (playlistAccess.size > 5000) playlistAccess.clear()
+  playlistAccess.set(key, access)
+  return access
 }
 
 // ---- finding songs by their lyrics (see lyrics-search.ts) ----
@@ -1403,11 +1507,11 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     }
   }
 
-  // /admin/jobs/<credits|artists|languages|sound|lyrics>: an admin's task on the whole library (POST starts, DELETE
-  // stops, GET tells how far it is): looking up every track's credits, fetching every artist's information into the
-  // caches, filling in films and series in both languages, measuring every song's sound and fetching its tags, or
-  // putting every song's lyrics into the search index.
-  const jobName = path.match(/^\/admin\/jobs\/(credits|artists|languages|sound|lyrics)$/)?.[1] as JobName | undefined
+  // /admin/jobs/<credits|artists|languages|sound|lyrics|mix>: an admin's task on the whole library (POST starts,
+  // DELETE stops, GET tells how far it is): looking up every track's credits, fetching every artist's information into
+  // the caches, filling in films and series in both languages, measuring every song's sound and fetching its tags,
+  // putting every song's lyrics into the search index, or analysing every whole song for the mixer mode.
+  const jobName = path.match(/^\/admin\/jobs\/(credits|artists|languages|sound|lyrics|mix)$/)?.[1] as JobName | undefined
   if (jobName) {
     if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
     const job = jobs[jobName]
@@ -1425,6 +1529,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       }
       if (jobName === 'credits') void scanCredits(token, me.id, scope)
       else if (jobName === 'lyrics') void scanLyrics(token, me.id, scope)
+      else if (jobName === 'mix') void scanMix(token, me.id, scope)
       else if (jobName === 'languages') void scanLanguages(token, me.id, isTmdbKey(body.tmdbKey) ? body.tmdbKey : undefined, scope.libraries)
       else {
         const lastfmKey = typeof body.lastfmKey === 'string' && /^[0-9a-f]{32}$/i.test(body.lastfmKey) ? body.lastfmKey : undefined
@@ -1669,6 +1774,54 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     }
     const artists = Object.fromEntries(Object.entries(store.artistTags()).map(([id, entry]) => [id, entry.tags]))
     return send(response, 200, { tracks, artists })
+  }
+
+  // GET /music/mix?ids=a,b,c: the whole-track analyses of up to 200 songs ({id: TrackMix | null}, see mix-analysis.ts).
+  // null: not analysed yet (it is now queued, with the asker's token) or it can't be (too long, silent). With
+  // summary=1 only {bpm, bpmConfidence, key, minor, keyClarity, duration} per song (for lists; the whole analysis is
+  // some 50 KB a song), queued alike.
+  if (path === '/music/mix' && request.method === 'GET') {
+    const ids = (url.searchParams.get('ids') ?? '').split(',').filter(Boolean)
+    if (!ids.length || ids.length > 200 || !ids.every((id) => /^[0-9a-f]{32}$/i.test(id))) return send(response, 400, { error: 'Bad ids' })
+    const known = store.trackMixes(ids, url.searchParams.get('summary') === '1')
+    const token = tokenOf(request, url)!
+    const entries = ids.map((id) => {
+      const entry = known[id]
+      const current = entry?.json && entry.version === MIX_VERSION
+      if (!current && !(entry && !entry.json && Date.now() - entry.at < MIX_RETRY)) queueMix(id, token)
+      // The kept JSON as it is (it is large: no parsing and writing again).
+      return `${JSON.stringify(id)}:${current ? entry.json : 'null'}`
+    })
+    response.writeHead(200, { 'Content-Type': 'application/json' })
+    return response.end(`{${entries.join(',')}}`)
+  }
+
+  // GET /music/mixer/<playlistId>: a playlist's mixer settings and transitions (PlaylistMixer; off and empty when never
+  // saved), for anyone who can see the playlist. PUT: saves them, for its owner and those it is shared with for editing.
+  // A PUT naming an older `updated` than the one kept is turned down (409, with the kept settings): someone else saved
+  // in between.
+  const mixer = path.match(/^\/music\/mixer\/([0-9a-f]{32})$/i)
+  if (mixer && (request.method === 'GET' || request.method === 'PUT')) {
+    const playlistId = mixer[1]!.toLowerCase()
+    const token = tokenOf(request, url)!
+    let access: { see: boolean; edit: boolean }
+    try {
+      access = await accessToPlaylist(token, me.id, playlistId)
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+    }
+    if (!access.see) return send(response, 404, { error: 'No such playlist' })
+    const stored = store.playlistMixer(playlistId)
+    const current = stored ? { ...(stored.data as object), updated: stored.updated } : { on: false, style: 'clean', transitions: {}, updated: 0 }
+    if (request.method === 'GET') return send(response, 200, current)
+    if (!access.edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+    const body = await readJson<Record<string, unknown>>(request, MIXER_BODY_LIMIT).catch(() => null)
+    const settings = parsePlaylistMixer(body)
+    if (!settings) return send(response, 400, { error: 'Bad mixer settings' })
+    if (stored && typeof body?.updated === 'number' && body.updated < stored.updated) return send(response, 409, current)
+    const updated = Math.max(Date.now(), (stored?.updated ?? 0) + 1)
+    store.setPlaylistMixer(playlistId, settings, me.id, updated)
+    return send(response, 200, { ...settings, updated })
   }
 
   // GET /music/lyrics-search?q=…: songs whose lyrics have these words ({items, snippets: {id: lines around the match}}),

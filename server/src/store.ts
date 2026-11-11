@@ -8,7 +8,8 @@ import type { Label, Localized, LocalizedMeta } from './languages.ts'
  * them, so others can see who they are), who follows whom, each person's privacy choices, what they last played, and
  * their Lumio settings that follow the account (the app decides which; the server keeps them as one JSON object),
  * the credits looked up for the library's tracks (see credits.ts), lyrics found outside Jellyfin, and films' and series' texts and pictures in both
- * languages (see languages.ts), shared by everyone.
+ * languages (see languages.ts), shared by everyone; and for the mixer mode, each song's whole-track analysis (see
+ * mix-analysis.ts) and each playlist's mixer settings and transitions.
  */
 export interface Privacy {
   /** Others see the person's public playlists on their profile. */
@@ -162,6 +163,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS artist_tags (artist_id TEXT PRIMARY KEY, name TEXT NOT NULL, tags TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS lyrics (item_id TEXT PRIMARY KEY, data TEXT NOT NULL, source TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS playlist_adds (playlist_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (playlist_id, item_id));
+      CREATE TABLE IF NOT EXISTS track_mix (item_id TEXT PRIMARY KEY, data TEXT, at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS playlist_mixer (playlist_id TEXT PRIMARY KEY, data TEXT NOT NULL, user_id TEXT NOT NULL, updated INTEGER NOT NULL);
     `)
     // How a play went (music too): why it started and ended, where it came from, shuffle, from the device, buffering.
     const playColumns = (this.db.prepare('PRAGMA table_info(plays)').all() as Array<{ name: string }>).map((column) => column.name)
@@ -494,6 +497,59 @@ export class Store {
     this.db
       .prepare('INSERT INTO lyrics (item_id, data, source, at) VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET data = excluded.data, source = excluded.source, at = excluded.at')
       .run(id, JSON.stringify(data), source, Date.now())
+  }
+
+  /**
+   * The whole-track analyses of these songs (see mix-analysis.ts) as kept, with when: `json` null means it was tried
+   * and the song couldn't be analysed. Songs never analysed are left out. The JSON is handed on as it is stored; with
+   * `summary`, only its tempo, key and length (bpm, bpmConfidence, key, minor, keyClarity, duration), cut out by SQLite.
+   */
+  trackMixes(ids: string[], summary = false): Record<string, { json: string | null; version: number; at: number }> {
+    const result: Record<string, { json: string | null; version: number; at: number }> = {}
+    const fields = ['bpm', 'bpmConfidence', 'key', 'minor', 'keyClarity', 'duration'].map((field) => `'${field}', data -> '$.${field}'`).join(', ')
+    const column = summary ? `CASE WHEN data IS NULL THEN NULL ELSE json_object(${fields}) END` : 'data'
+    const query = this.db.prepare(`SELECT ${column} AS data, json_extract(data, '$.v') AS v, at FROM track_mix WHERE item_id = ?`)
+    for (const id of ids) {
+      const row = query.get(id) as { data: string | null; v: number | null; at: number } | undefined
+      if (row) result[id] = { json: row.data, version: row.v ?? 0, at: row.at }
+    }
+    return result
+  }
+
+  setTrackMix(id: string, data: unknown) {
+    this.db
+      .prepare('INSERT INTO track_mix (item_id, data, at) VALUES (?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET data = excluded.data, at = excluded.at')
+      .run(id, data === null ? null : JSON.stringify(data), Date.now())
+  }
+
+  /**
+   * Whether a song's analysis is there and current: analysed with this version, or tried and failed less than `retry`
+   * ms ago (a failure is tried again later: Jellyfin may have been away, the file replaced).
+   */
+  hasTrackMix(id: string, version: number, retry: number) {
+    const row = this.db.prepare("SELECT data IS NULL AS failed, json_extract(data, '$.v') AS v, at FROM track_mix WHERE item_id = ?").get(id) as
+      | { failed: number; v: number | null; at: number }
+      | undefined
+    return !!row && (row.failed ? Date.now() - row.at < retry : row.v === version)
+  }
+
+  /** Every song whose analysis is current (see hasTrackMix), for the library run to skip. */
+  currentTrackMixes(version: number, retry: number): Set<string> {
+    const rows = this.db.prepare("SELECT item_id, data IS NULL AS failed, json_extract(data, '$.v') AS v, at FROM track_mix").all() as Array<{ item_id: string; failed: number; v: number | null; at: number }>
+    const now = Date.now()
+    return new Set(rows.filter((row) => (row.failed ? now - row.at < retry : row.v === version)).map((row) => row.item_id))
+  }
+
+  /** A playlist's mixer settings and transitions (the app's PlaylistMixer), null when never saved. */
+  playlistMixer(playlistId: string): { data: unknown; userId: string; updated: number } | null {
+    const row = this.db.prepare('SELECT data, user_id, updated FROM playlist_mixer WHERE playlist_id = ?').get(playlistId) as { data: string; user_id: string; updated: number } | undefined
+    return row ? { data: JSON.parse(row.data) as unknown, userId: row.user_id, updated: row.updated } : null
+  }
+
+  setPlaylistMixer(playlistId: string, data: unknown, userId: string, updated: number) {
+    this.db
+      .prepare('INSERT INTO playlist_mixer (playlist_id, data, user_id, updated) VALUES (?, ?, ?, ?) ON CONFLICT(playlist_id) DO UPDATE SET data = excluded.data, user_id = excluded.user_id, updated = excluded.updated')
+      .run(playlistId, JSON.stringify(data), userId, updated)
   }
 
   /** The credits looked up for these tracks (null: looked up, none found); tracks never looked up are left out. */

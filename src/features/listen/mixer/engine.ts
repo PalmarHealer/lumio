@@ -62,8 +62,6 @@ const GLIDE_STEPS = 12
 const MAX_DELAY_S = 4
 /** A tempo that isn't a usable number counts as this (the contract already sends 120 for unknown ones). */
 export const DEFAULT_BPM = 120
-/** B's rate eases back to 1 over this many beats after the overlap (8 bars of 4/4). */
-const RATE_EASE_BEATS = 32
 /** The dry ↔ coloured switch when the deck isn't silent at a moment it could switch at (see the top). */
 const CROSSFADE_S = 0.005
 /** A deck this quiet (gain) may switch paths at once. */
@@ -231,21 +229,6 @@ export function brakeGainAt(t: number, length: number) {
   return 1 - (t - fadeFrom) / (length - fadeFrom)
 }
 
-/**
- * B's playback rate at `t` seconds from the transition's start: `rate` during the overlap, then easing back to 1 over
- * the 8 bars after it (smoothly, so the tempo change isn't heard as a step).
- */
-export function rateAt(transition: Pick<Transition, 'rate' | 'length' | 'tempo'>, t: number) {
-  const { rate, length } = transition
-  if (t <= length || rate === 1) return rate
-  const ease = rateEaseSeconds(transition.tempo.b)
-  const p = Math.min(1, (t - length) / ease)
-  return rate + (1 - rate) * p * p * (3 - 2 * p)
-}
-
-/** How long B's rate takes to get back to 1 after the overlap. */
-export const rateEaseSeconds = (bpmB?: number | null) => RATE_EASE_BEATS * beatSeconds(bpmB)
-
 /** How loud deck A is at `t` (its volume curve and a brake's fade), for deciding when B takes over. */
 function levelOfA(transition: Transition, t: number) {
   const brake = transition.effects.find((effect) => effect.kind === 'brake')
@@ -254,17 +237,19 @@ function levelOfA(transition: Transition, t: number) {
 }
 
 /**
- * When B takes over as "the track playing" (what the UI shows, what is reported): the first moment B is louder than
- * A, or the middle of the overlap when their volumes never cross (both full, say). A hard cut hands over at once.
+ * When B takes over as "the track playing" (what the UI shows, what is reported): the first moment B (once it has
+ * started) is louder than A, or the middle of their overlap when their volumes never cross (both full, say).
  */
 export function handoverPoint(transition: Transition) {
   const { length } = transition
-  if (length <= 0) return 0
-  const step = Math.min(0.05, length / 100)
-  for (let t = 0; t <= length + 1e-9; t += step) {
+  const bAt = Math.max(0, transition.bAt ?? 0)
+  if (length <= bAt) return Math.max(0, Math.min(bAt, length))
+  // B can't take over before it sounds.
+  const step = Math.min(0.05, (length - bAt) / 100)
+  for (let t = bAt; t <= length + 1e-9; t += step) {
     if (valueAt(transition.b.gain, t, 1) > levelOfA(transition, t) + 1e-6) return Math.min(t, length)
   }
-  return length / 2
+  return (bAt + length) / 2
 }
 
 /**
@@ -535,11 +520,12 @@ export function scheduleTransition(decks: { a: Deck; b: Deck }, transition: Tran
       scheduleBrakeFade(decks.a, effect, startTime, scale, from)
     }
   }
-  // Declicking, on the decks' brake gain (unused otherwise): B comes in over a few ms (it starts mid-song), and A is
-  // silent by the end of the overlap, whatever its curve says (a hard cut, length 0, cuts here too).
-  if (from === 0 && startTime >= now) {
-    setAt(decks.b.brake.gain, startTime, 0)
-    rampAt(decks.b.brake.gain, startTime + DECLICK_S, 1)
+  // Declicking, on the decks' brake gain (unused otherwise): B comes in over a few ms when it starts (mid-song), and A
+  // is silent by the end of the overlap, whatever its curve says (length 0 cuts here too).
+  const bStart = startTime + Math.max(0, transition.bAt ?? 0) * scale
+  if (bStart >= begin) {
+    setAt(decks.b.brake.gain, bStart, 0)
+    rampAt(decks.b.brake.gain, bStart + DECLICK_S, 1)
   }
   if (!braking) {
     // (A cut right at the start, or resumed in the last few ms, fades from the earliest moment it still can.)
@@ -630,7 +616,7 @@ export function resetDeck(deck: Deck, time = deck.ctx.currentTime, ramp = 0) {
 export function asPlayed(transition: Transition, aEnd?: number): Transition {
   if (transition.preset !== 'none') return transition
   const still = () => ({ gain: [], low: [], mid: [], high: [], filter: [] })
-  return { ...transition, aOut: aEnd && aEnd > 0 ? aEnd : Number.NaN, length: 0, rate: 1, a: still(), b: still(), effects: [] }
+  return { ...transition, aOut: aEnd && aEnd > 0 ? aEnd : Number.NaN, bAt: 0, length: 0, pathA: [], pathB: [], rateA: [], rateB: [], a: still(), b: still(), effects: [] }
 }
 
 // ---- the master: a lookahead limiter after all decks ----

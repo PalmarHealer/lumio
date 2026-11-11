@@ -1,0 +1,46 @@
+diff --git a/SignalsmithStretch.js b/SignalsmithStretch.js
+index 7b39b2ae500c8563500c20a4f951878e309d845f..91386b68a8a940eda94f7b0f432875226a6c1f50 100644
+--- a/SignalsmithStretch.js
++++ b/SignalsmithStretch.js
+@@ -113,13 +113,16 @@ function registerWorkletProcessor(Module, audioNodeKey) {
+ 						previous.rate = (obj.input - previous.input)/(obj.output - previous.output);
+ 					}
+ 	
++					// Lumio patch: drop only the changes already in the past (by "now", not by the new change's time), so
++					// several changes can be scheduled ahead; the time estimate below is for now too.
++					let nowOutput = currentTime + this.outputLatencySeconds;
+ 					let currentMapSegment = this.timeMap[0];
+-					while (this.timeMap.length > 1 && this.timeMap[1].output <= outputTime) {
++					while (this.timeMap.length > 1 && this.timeMap[1].output <= nowOutput) {
+ 						this.timeMap.shift();
+ 						currentMapSegment = this.timeMap[0];
+ 					}
+ 					let rate = (currentMapSegment.active ? currentMapSegment.rate : 0);
+-					let inputTime = currentMapSegment.input + (outputTime - currentMapSegment.output)*rate;
++					let inputTime = currentMapSegment.input + (nowOutput - currentMapSegment.output)*rate;
+ 					this.timeIntervalCounter = this.timeIntervalSamples;
+ 					this.port.postMessage(['time', inputTime]);
+ 					
+diff --git a/SignalsmithStretch.mjs b/SignalsmithStretch.mjs
+index 7d5cae72e77a84143ed91ba12fc91b806dc4d9d1..0bc1723f56351d1e8e859d8569843016dd07026c 100644
+--- a/SignalsmithStretch.mjs
++++ b/SignalsmithStretch.mjs
+@@ -114,13 +114,16 @@ function registerWorkletProcessor(Module, audioNodeKey) {
+ 						previous.rate = (obj.input - previous.input)/(obj.output - previous.output);
+ 					}
+ 	
++					// Lumio patch: drop only the changes already in the past (by "now", not by the new change's time), so
++					// several changes can be scheduled ahead; the time estimate below is for now too.
++					let nowOutput = currentTime + this.outputLatencySeconds;
+ 					let currentMapSegment = this.timeMap[0];
+-					while (this.timeMap.length > 1 && this.timeMap[1].output <= outputTime) {
++					while (this.timeMap.length > 1 && this.timeMap[1].output <= nowOutput) {
+ 						this.timeMap.shift();
+ 						currentMapSegment = this.timeMap[0];
+ 					}
+ 					let rate = (currentMapSegment.active ? currentMapSegment.rate : 0);
+-					let inputTime = currentMapSegment.input + (outputTime - currentMapSegment.output)*rate;
++					let inputTime = currentMapSegment.input + (nowOutput - currentMapSegment.output)*rate;
+ 					this.timeIntervalCounter = this.timeIntervalSamples;
+ 					this.port.postMessage(['time', inputTime]);
+ 					

@@ -1,20 +1,19 @@
-import { asPlayed, brakeRateAt, createDeck, createMaster, limiterLatency, rateAt, rateEaseSeconds, resetDeck, releaseEcho, scheduleTransition, type LimiterStats } from './engine'
+import { bufferDeckKind, createBufferDeck, type BufferDeckKind } from './buffer-deck'
+import { bSettled, deckPlan, withBrake } from './deck-schedule'
+import { asPlayed, createDeck, createMaster, limiterLatency, resetDeck, releaseEcho, scheduleTransition, type LimiterStats } from './engine'
 import type { Transition } from './types'
 
 /**
- * Renders a transition to audio, offline: the editor's preview, and demo mixes. It runs the very graph the player uses
- * (`createDeck` / `scheduleTransition`), fed by decoded buffers instead of <audio> elements.
+ * Renders a transition to audio, offline: the editor's preview, and demo mixes. It runs what the player runs during a
+ * transition: each deck plays from decoded audio through a time-stretcher (paths, loops and rate curves, pitch kept;
+ * stretch.ts / deck-schedule.ts), into the same decks (`createDeck` / `scheduleTransition`) and master limiter.
  *
- * One difference to live playback: a buffer source changes pitch with its speed, so B's `rate` (and the brake) are
- * heard with the pitch shifted here, while the player keeps B's pitch (the media element's pitch-preserving
- * stretch). For the small beatmatching rates (±6 %) that is about one semitone at most.
- *
- * The rendered timeline: 0 is `preRoll` seconds before A's `aOut`; the transition starts at `preRoll` (B's `bIn`
- * starts there; with a negative `bIn` B's top starts `-bIn / rate` seconds later), A stops `length` seconds later, and the
- * render ends `postRoll` seconds after that. Both decks go through the player's master limiter (0 dBFS); its lookahead
- * delay is taken out again, so the timeline stays exact to the sample. As in the player the limiter only acts from just
- * before the transition until it is over (and its release has run out): the rolls before and after are the sources
- * as they are.
+ * The rendered timeline: 0 is `preRoll` seconds before t = 0 (A at `aOut`); B starts at `bAt` (at `bIn`), A is gone at
+ * `length`, and the render ends `postRoll` seconds after that. The stretcher needs its changes scheduled a little
+ * ahead and the limiter delays by its lookahead; the render starts early enough for both and drops that lead again, so
+ * the timeline stays exact to the sample. As in the player the limiter only acts from just before the transition until
+ * B plays at its own tempo again: the rolls before and after are the sources as they are (the stretcher passes rate 1
+ * through exactly).
  */
 export interface RenderTransitionOptions {
   a: AudioBuffer
@@ -22,7 +21,7 @@ export interface RenderTransitionOptions {
   transition: Transition
   /** Seconds of A before the transition (default 8; less if A doesn't have them: then the render starts silent). */
   preRoll?: number
-  /** Seconds of B after the overlap (default 8). */
+  /** Seconds of B after A is gone (default 8). */
   postRoll?: number
   /** Default: A's sample rate. */
   sampleRate?: number
@@ -35,9 +34,18 @@ const frames = (seconds: number, sampleRate: number) => Math.max(1, Math.round(s
 
 /** The limiter is engaged this long before the transition, while B is still silent. */
 const LIMITER_LEAD_S = 0.05
+/** Rendered before the timeline's 0 and dropped: the stretchers' changes must be scheduled this far ahead (≥ 140 ms). */
+const STRETCH_LEAD_S = 0.5
 
-/** How finely the sources' speed curves (brake, B's easing) are sampled. */
-const RATE_CURVE_RATE = 100
+/**
+ * How a deck whose tempo changes is played (see buffer-deck.ts): with pitch kept (`stretch`), or `exact` (the pitch
+ * follows the tempo). Decks at rate 1 always play exactly.
+ */
+export let tempoChangeKind: BufferDeckKind = 'stretch'
+export const setTempoChangeKind = (kind: BufferDeckKind) => (tempoChangeKind = kind)
+
+/** A buffer's channels as two (a mono file plays on both sides). */
+const stereo = (buffer: AudioBuffer) => [buffer.getChannelData(0), buffer.getChannelData(Math.min(1, buffer.numberOfChannels - 1))] as Float32Array<ArrayBuffer>[]
 
 export async function renderTransition(options: RenderTransitionOptions): Promise<AudioBuffer> {
   const { a, b } = options
@@ -49,55 +57,46 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   const length = Math.max(0, transition.length)
   const total = preRoll + length + postRoll
   const latency = limiterLatency(sampleRate)
+  const lead = frames(STRETCH_LEAD_S, sampleRate)
   const wanted = frames(total, sampleRate)
-  const ctx = new OfflineAudioContext({ numberOfChannels: 2, length: wanted + latency, sampleRate })
+  const ctx = new OfflineAudioContext({ numberOfChannels: 2, length: lead + wanted + latency, sampleRate })
   const master = await createMaster(ctx, ctx.destination, { onStats: options.onLimiter })
   const deckA = createDeck(ctx, master.input)
   const deckB = createDeck(ctx, master.input)
-  const start = preRoll
-  const end = start + length
+  // Context time of transition time 0.
+  const zero = lead / sampleRate + preRoll
+  // A: straight into the transition, then its path at its rate (and a brake, if any), gone at `length`. (It starts
+  // within the dropped lead, so its first sample has settled when the render begins.) B: from `bAt` on its path, at its
+  // rate (back at 1 by its last keyframe), playing on to the render's end.
+  const braked = withBrake(transition, deckPlan(transition, 'a'))
+  const planB = deckPlan(transition, 'b')
+  const aFrom = -preRoll - STRETCH_LEAD_S / 2
+  const bAt = Math.max(0, transition.bAt)
+  const bTo = Math.max(bAt, length) + postRoll
+  const [playerA, playerB] = await Promise.all([
+    createBufferDeck(ctx, deckA.input, braked.semitones ? 'stretch' : bufferDeckKind(braked.plan, aFrom, length, tempoChangeKind)),
+    createBufferDeck(ctx, deckB.input, bufferDeckKind(planB, bAt, bTo, tempoChangeKind)),
+  ])
+  await Promise.all([playerA.load(stereo(a), 0, a.sampleRate), playerB.load(stereo(b), 0, b.sampleRate)])
+  playerA.play(braked.plan, aFrom, length, zero, braked.semitones)
+  playerA.stopAt(zero + length + 0.02)
+  playerB.play(planB, bAt, bTo, zero)
 
-  // A: from `aOut - preRoll` (or silent until its start), gone when the overlap ends.
-  const sourceA = new AudioBufferSourceNode(ctx, { buffer: a })
-  sourceA.connect(deckA.input)
-  const aFrom = transition.aOut - preRoll
-  if (aFrom >= 0) sourceA.start(0, aFrom)
-  else sourceA.start(-aFrom, 0)
-  sourceA.stop(end)
-  const brake = transition.effects.find((effect) => effect.kind === 'brake')
-  if (brake && brake.length > 0) {
-    const count = Math.max(2, Math.ceil(brake.length * RATE_CURVE_RATE) + 1)
-    const curve = new Float32Array(count)
-    for (let i = 0; i < count; i++) curve[i] = brakeRateAt((brake.length * i) / (count - 1), brake.length)
-    sourceA.playbackRate.setValueCurveAtTime(curve, start + brake.at, brake.length)
-  }
-
-  // B: from `bIn` at the transition's start, at `rate` during the overlap, then easing back to 1.
-  const sourceB = new AudioBufferSourceNode(ctx, { buffer: b, playbackRate: transition.rate })
-  sourceB.connect(deckB.input)
-  // B's position is bIn + t · rate: a negative bIn starts it from its top at t = -bIn / rate (its automation at 0).
-  sourceB.start(start + Math.max(0, -transition.bIn) / transition.rate, Math.max(0, transition.bIn))
-  if (transition.rate !== 1) {
-    const ease = Math.min(rateEaseSeconds(transition.tempo.b), Math.max(0, total - end))
-    if (ease > 0) {
-      const count = Math.max(2, Math.ceil(ease * RATE_CURVE_RATE) + 1)
-      const curve = new Float32Array(count)
-      for (let i = 0; i < count; i++) curve[i] = rateAt(transition, length + (ease * i) / (count - 1))
-      sourceB.playbackRate.setValueCurveAtTime(curve, end, ease)
-    }
-  }
-
-  scheduleTransition({ a: deckA, b: deckB }, transition, start)
+  scheduleTransition({ a: deckA, b: deckB }, transition, zero)
   // As in the player: A's echo rings out after A is gone; B glides back to neutral and plays on.
-  releaseEcho(deckA, end)
-  resetDeck(deckB, end, 0.05)
-  master.engage(true, Math.max(0, start - LIMITER_LEAD_S))
-  master.engage(false, end + 0.05)
+  releaseEcho(deckA, zero + length)
+  resetDeck(deckB, zero + length, 0.05)
+  // The limiter acts while the decks overlap and while B is still stretched (stretched audio can peak higher than the
+  // track itself); at rate 1 the stretcher passes B through exactly again.
+  master.engage(true, Math.max(0, zero - LIMITER_LEAD_S))
+  master.engage(false, zero + Math.max(length, bSettled(transition)) + 0.05)
 
-  // Without the limiter's delay at the front.
+  // Without the lead and the limiter's delay at the front.
   const rendered = await ctx.startRendering()
+  playerA.dispose()
+  playerB.dispose()
   const out = new AudioBuffer({ numberOfChannels: rendered.numberOfChannels, length: wanted, sampleRate })
-  for (let channel = 0; channel < rendered.numberOfChannels; channel++) out.copyToChannel(rendered.getChannelData(channel).subarray(latency, latency + wanted), channel)
+  for (let channel = 0; channel < rendered.numberOfChannels; channel++) out.copyToChannel(rendered.getChannelData(channel).subarray(lead + latency, lead + latency + wanted), channel)
   return out
 }
 

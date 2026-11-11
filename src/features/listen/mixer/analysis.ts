@@ -36,7 +36,13 @@ export interface PreparedTrack {
   loudness: number
   /** Where singing is (measured), or where it may be (assumed from the structure when nothing was found). */
   vocals: Span[]
+  /** `vocals` were measured (synced lyrics or the audio). */
   vocalsKnown: boolean
+  /**
+   * Nothing was measured, so `vocals` are assumed: the body sections (not intro, outro or break) whose mid band is up
+   * like a voice's, padded by a bar each side. Treated like measured singing, at lower trust where cutting it.
+   */
+  vocalsAssumed: boolean
   /** First and last moment the song is clearly audible (leading silence and a fade-out tail left out). */
   start: number
   end: number
@@ -73,6 +79,9 @@ export interface PreparedTrack {
    */
   kickClarityBetween(from: number, to: number): number
 }
+
+/** A section's mean mid band (against the song's loud mids) from which it may hold a voice, when nothing was measured. */
+const ASSUMED_VOICE_MID = 0.5
 
 const finite = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x))
@@ -249,14 +258,30 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
   const introEnd = finite(mix.introEnd) ? clamp(mix.introEnd, 0, duration) : 0
   const outroStart = finite(mix.outroStart) && mix.outroStart > introEnd ? clamp(mix.outroStart, 0, duration) : duration
 
-  // Vocals: as measured; when nothing was found, assume singing through the body of the song (between intro and
-  // outro, or the middle 80 %), so the planner keeps overlaps to the edges.
+  // Vocals: as measured; when nothing was found (lyrics missing or not placeable), assume singing in every body section
+  // with a voice-like mid band, a bar of margin each side, so no voice of the other song lands on it and a clean mix
+  // doesn't cut into it. A song without such sections (thin mids: an instrumental) gets none.
   const vocalsKnown = (mix.vocalSource === 'lyrics' || mix.vocalSource === 'audio') && Array.isArray(mix.vocals)
+  const sections = cleanSections(mix.sections, duration)
+  const bandsAt = bandCurves(mix, frameRate)
   let vocals = vocalsKnown ? cleanSpans(mix.vocals, duration) : []
   if (!vocalsKnown) {
-    const body = outroStart - introEnd > duration * 0.3 ? { start: introEnd, end: outroStart } : { start: duration * 0.1, end: duration * 0.9 }
-    vocals = [body]
+    const pad = 4 * period
+    const midOver = (from: number, to: number) => {
+      let sum = 0
+      let count = 0
+      for (let t = from; t < to; t += 0.25) {
+        sum += bandsAt(t).mid
+        count++
+      }
+      return count > 0 ? sum / count : 0
+    }
+    const assumed = sections
+      .filter((s) => s.kind !== 'intro' && s.kind !== 'outro' && s.kind !== 'break' && midOver(s.start, s.end) >= ASSUMED_VOICE_MID)
+      .map((s) => ({ start: Math.max(0, s.start - pad), end: Math.min(duration, s.end + pad) }))
+    vocals = cleanSpans(assumed, duration)
   }
+  const vocalsAssumed = !vocalsKnown && vocals.length > 0
 
   return {
     mix,
@@ -275,23 +300,24 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
     loudness: finite(mix.loudness) ? clamp(mix.loudness, -60, 0) : -14,
     vocals,
     vocalsKnown,
+    vocalsAssumed,
     start,
     end,
     introEnd,
     outroStart,
-    sections: cleanSections(mix.sections, duration),
+    sections,
     drops: cleanTimes(mix.drops, duration),
     cuesIn: Array.isArray(mix.cuesIn) ? mix.cuesIn.filter((t): t is number => finite(t) && t >= 0 && t < duration) : [],
     cuesOut: Array.isArray(mix.cuesOut) ? mix.cuesOut.filter((t): t is number => finite(t) && t > 0 && t <= duration) : [],
     energyBetween,
     loudSeconds,
-    bandsAt: bandCurves(mix, frameRate),
+    bandsAt,
     level: 10 ** ((finite(mix.loudness) ? clamp(mix.loudness, -60, 0) : -14) / 20),
     chromaAt: phraseChromaAt(mix, duration),
     clarityBetween: clarity(mix, duration, beats.length > 0 ? beats[0] : 0),
     kickClarityBetween: kickClarity(mix, duration, beats.length > 0 ? beats[0] : 0),
     sungSeconds: (from: number, to: number) =>
-      vocalsKnown ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
+      vocalsKnown || vocalsAssumed ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
   }
 }
 

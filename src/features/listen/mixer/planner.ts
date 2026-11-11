@@ -181,7 +181,7 @@ function outAnchors(a: PreparedTrack, style: MixStyle): Anchor[] {
   if (a.outroStart >= from && a.outroStart < a.end) addAnchor(list, snapToPhrase(a, a.outroStart), party ? 0.15 : 0.05)
   const cues = a.cuesOut.filter((t) => t >= from && t < a.end)
   cues.forEach((t, i) => addAnchor(list, snapToPhrase(a, t), (party ? 0.3 : 0.05) * (1 - i / (cues.length + 1))))
-  if (!party && a.vocalsKnown && a.vocals.length > 0) {
+  if (!party && a.vocals.length > 0 && (a.vocalsKnown || a.vocalsAssumed)) {
     // The first 4-bar point (counted from the analysed phrase before it) after A's last sung line: where a clean mix
     // can leave without cutting a word and still on the phrase grid.
     const lastLine = a.vocals[a.vocals.length - 1].end
@@ -223,7 +223,7 @@ function inAnchors(b: PreparedTrack, style: MixStyle): Anchor[] {
   if (b.introEnd > 0 && b.introEnd <= until) addAnchor(list, snapToPhrase(b, b.introEnd), party ? (b.introEnd >= b.start + 16 * b.period ? 0.1 : 0) : 0.05)
   const cues = b.cuesIn.filter((t) => t <= until)
   cues.forEach((t, i) => addAnchor(list, snapToPhrase(b, t), party ? (t >= intoSong ? 0.2 * (1 - i / (cues.length + 1)) : 0.03) : 0.03))
-  if (!party && b.vocalsKnown && b.vocals.length > 0) {
+  if (!party && b.vocals.length > 0 && (b.vocalsKnown || b.vocalsAssumed)) {
     // Where B's singing starts: a clean blend brings B fully in there, with its whole intro under A.
     addAnchor(list, snapToPhrase(b, b.vocals[0].start), 0.05)
   }
@@ -644,10 +644,9 @@ function vocalCost(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     for (let i = 0; i < stats.voiceA.length - 1; i++) {
       const t = i * dt
       const tb = positionB(p, t)
-      // Only measured singing counts here (a song whose vocals weren't measured has its body assumed sung, which is no
-      // reason to keep a voice of the other song off it: only voice over voice is a violation).
-      const aSings = a.vocalsKnown && !!spanAt(a.vocals, positionA(p, t))
-      const bSings = b.vocalsKnown && tb !== null && !!spanAt(b.vocals, tb)
+      // Measured singing, or singing assumed where nothing was measured (voice-like body sections): both count.
+      const aSings = !!spanAt(a.vocals, positionA(p, t))
+      const bSings = tb !== null && !!spanAt(b.vocals, tb)
       const aHeard = stats.voiceA[i] > VOICE_HEARD
       const bHeard = stats.voiceB[i] > VOICE_HEARD
       if (bSings && bHeard && ((aSings && aHeard) || (echoed !== null && echoed[i] >= ECHO_HEARD))) clash += dt
@@ -1212,8 +1211,10 @@ export function planTransition(
   const shapes = new Map<string, ShapeStats>()
 
   // Vocals estimated from the audio (no synced lyrics) count for less: they also catch leads and synths.
-  // Assumed vocals (nothing measured: one span over the song's body) have no lines to cut, so they don't count here.
-  const vocalTrust = (track: PreparedTrack) => (!track.vocalsKnown ? 0 : track.mix.vocalSource === 'lyrics' ? 1 : 0.6)
+  // Assumed vocals (nothing measured: the voice-like body sections) keep a clean mix from cutting into them like lines;
+  // party may cut them at a lower price.
+  const vocalTrust = (track: PreparedTrack) =>
+    track.vocalsAssumed ? (party ? 0.3 : 1) : !track.vocalsKnown ? 0 : track.mix.vocalSource === 'lyrics' ? 1 : 0.6
   const trustA = vocalTrust(a)
   const trustB = vocalTrust(b)
 
@@ -1656,8 +1657,8 @@ export function transitionIssues(transition: Transition, aMix: TrackMix | null, 
     for (let i = 0; i < sampled.voiceA.length - 1; i++) {
       const t = i * dt
       const tb = deckPosition(transition, 'b', t)
-      if (sampled.voiceB[i] <= VOICE_HEARD || tb === null || !b.vocalsKnown || !spanAt(b.vocals, tb)) continue
-      const direct = sampled.voiceA[i] > VOICE_HEARD && a.vocalsKnown && spanAt(a.vocals, at(t))
+      if (sampled.voiceB[i] <= VOICE_HEARD || tb === null || !spanAt(b.vocals, tb)) continue
+      const direct = sampled.voiceA[i] > VOICE_HEARD && spanAt(a.vocals, at(t))
       if (direct || (echoed !== null && echoed[i] >= ECHO_HEARD)) voices += dt
     }
   }

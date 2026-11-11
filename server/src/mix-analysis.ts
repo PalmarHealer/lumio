@@ -139,6 +139,19 @@ export interface TrackMix {
    * where is unknown); an estimate from the audio; or nothing found (no lyrics: maybe instrumental).
    */
   vocalSource: 'lyrics' | 'unplaced' | 'audio' | 'none'
+  /**
+   * The sung lines when `vocalSource` is 'lyrics', placed like `vocals` but unpadded: `time` where the line starts,
+   * `end` where it is estimated to end (see `vocals`), and `words`, its content words as 32-bit FNV-1a hashes of their
+   * UTF-8 (lowercased, accents folded, apostrophes removed, a plural -s or -ies taken off, English and German stopwords
+   * left out; each word once). Two songs' lines can be matched by word (wordplay: B's line answers A's with the same
+   * word) without their text. Empty otherwise and in analyses made before it.
+   */
+  lines: Array<{ time: number; end: number; words: number[] }>
+  /**
+   * The content words of the track's title, hashed like `lines` (what is in brackets, such as "(feat. …)", left out):
+   * a line with a title word is likely the hook. Empty when the title is unknown and in analyses made before it.
+   */
+  titleWords: number[]
   /** First phrase where the song is fully "in" (beat and bass), and where it starts to wind down after its last chorus/drop. */
   introEnd: number
   outroStart: number
@@ -1027,32 +1040,81 @@ function vocalActivity(spectra: ShortSpectra, frames: number): Float64Array | nu
 }
 
 /**
- * Sung stretches from synced lyrics. A line's end isn't known: it runs until shortly before the next line, at most as
- * long as its words take (about 3 a second, at least 1.5 s) and at most 1.25 times the song's typical line (the median
- * distance between line starts, within 2–8 s), so a last line before a long instrumental doesn't swallow it.
+ * The sung lines of synced lyrics with when each ends. A line's end isn't known: it runs until shortly before the next
+ * line, at most as long as its words take (about 3 a second, at least 1.5 s) and at most 1.25 times the song's typical
+ * line (the median distance between line starts, within 2–8 s), so a last line before a long instrumental doesn't
+ * swallow it. Empty lines (and "♪") mark instrumental parts and are left out.
  */
-export function lyricStretches(lines: LyricLine[]): Array<{ start: number; end: number }> {
+function sungLines(lines: LyricLine[]): Array<{ time: number; end: number; text: string }> {
   const sung = lines
     .filter((line) => Number.isFinite(line.time) && line.time >= 0)
     .sort((a, b) => a.time - b.time)
-    .map((line) => ({ time: line.time, words: (line.text.match(/[\p{L}\p{N}']+/gu) ?? []).length }))
+    .map((line) => ({ time: line.time, text: line.text, words: (line.text.match(/[\p{L}\p{N}']+/gu) ?? []).length }))
   const gaps = sung.flatMap((line, i) => (line.words && sung[i + 1] && sung[i + 1]!.time - line.time < 12 ? [sung[i + 1]!.time - line.time] : []))
   const longest = clamp(1.25 * (gaps.length ? median(gaps) : 4), 2, 8)
-  const stretches: Array<{ start: number; end: number }> = []
+  const out: Array<{ time: number; end: number; text: string }> = []
   for (let i = 0; i < sung.length; i++) {
     const line = sung[i]!
-    // Empty lines (and "♪") mark instrumental parts.
     if (!line.words) continue
     const next = sung[i + 1]?.time ?? Infinity
     // About 3 words a second, at least a second and a half, at most 8.
     const takes = Math.min(longest, clamp(0.8 + line.words * 0.35, 1.5, 8))
     const end = Math.min(next - 0.15, line.time + takes)
-    if (end <= line.time) continue
+    if (end > line.time) out.push({ time: line.time, end, text: line.text })
+  }
+  return out
+}
+
+/** Sung stretches from synced lyrics: their sung lines (see sungLines), joined where less than 1.2 s apart. */
+export function lyricStretches(lines: LyricLine[]): Array<{ start: number; end: number }> {
+  const stretches: Array<{ start: number; end: number }> = []
+  for (const line of sungLines(lines)) {
     const previous = stretches[stretches.length - 1]
-    if (previous && line.time - previous.end < 1.2) previous.end = Math.max(previous.end, end)
-    else stretches.push({ start: line.time, end })
+    if (previous && line.time - previous.end < 1.2) previous.end = Math.max(previous.end, line.end)
+    else stretches.push({ start: line.time, end: line.end })
   }
   return stretches
+}
+
+// Words that say nothing about what a line is about (English and German), left out of the word fingerprints.
+const STOPWORDS = new Set(
+  (
+    'a an the and or but if so as at by for from in into of off on onto out over to up with without about than then ' +
+    'i im ive id ill me my mine myself you youre youve youd youll your yours yourself he hes him his she shes her hers ' +
+    'it its itself we were weve our ours they theyre them their theirs this that these those there here what which who ' +
+    'whom whose when where why how all any both each few more most other some such no nor not only own same too very ' +
+    'can cant could couldnt will wont would wouldnt shall should shouldnt may might must do does did dont doesnt didnt ' +
+    'is isnt am are arent was wasnt be been being have has had havent hasnt hadnt get got gonna wanna gotta just now ' +
+    'yeah oh ooh ah uh hey la na da woah whoa ya ay ayy cause cuz lets thats whats ' +
+    'der die das den dem des ein eine einen einem einer eines und oder aber wenn weil dass als wie so zu zum zur im in ' +
+    'am an auf aus bei mit nach von vor fur uber unter um durch gegen ohne bis ich du er sie es wir ihr mich dich sich ' +
+    'uns euch mir dir ihm ihn ihnen mein meine dein deine sein seine unser euer nicht kein keine ist bin bist sind seid ' +
+    'war waren hab habe hast hat haben hatte wird werden wurde kann kannst konnen muss will soll auch noch schon nur ' +
+    'doch ja nein mal dann da hier dort was wer wo wann warum'
+  ).split(' '),
+)
+
+/** FNV-1a (32 bit) of a string's UTF-8 bytes. */
+function fnv1a(text: string) {
+  let hash = 0x811c9dc5
+  for (const byte of new TextEncoder().encode(text)) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0
+  return hash
+}
+
+/**
+ * The content words of a text as FNV-1a hashes (see TrackMix.lines): lowercased, accents folded, apostrophes removed,
+ * stopwords left out, a plural -s (or -ies) taken off; each word once.
+ */
+export function wordHashes(text: string): number[] {
+  const words = text
+    .normalize('NFKD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(/['’`´]/g, '')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((word) => word && !STOPWORDS.has(word))
+    .map((word) => (word.length > 4 && word.endsWith('ies') ? word.slice(0, -3) + 'y' : word.length > 3 && word.endsWith('s') && !word.endsWith('ss') ? word.slice(0, -1) : word))
+  return [...new Set(words)].map(fnv1a)
 }
 
 /**
@@ -1251,10 +1313,10 @@ function repetitionScore(lines: LyricLine[], offset: number, sound: (time: numbe
 
 /**
  * Analyses a whole song: its samples at `rate`, mono or as stereo channels (left, right; the stereo image helps find
- * the voice), with its synced lyrics when there are any. Null when there is too little (under 20 seconds) or only
- * silence.
+ * the voice), with its synced lyrics when there are any and its title when known. Null when there is too little
+ * (under 20 seconds) or only silence.
  */
-export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, lyrics?: LyricLine[]): TrackMix | null {
+export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, lyrics?: LyricLine[], title?: string): TrackMix | null {
   const channels = audio instanceof Float32Array ? [audio] : audio
   if (!channels.length || channels.some((channel) => channel.length !== channels[0]!.length)) return null
   // Everything but the voice is measured on the mono mix (the centre); the sides only for the voice.
@@ -1415,6 +1477,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   let vocalSource: TrackMix['vocalSource'] = 'none'
   /** The sung lyrics lines at their aligned times, with how often their words come in the song (the chorus' often). */
   let lyricLines: Array<{ time: number; count: number }> = []
+  /** The placed lines with their word hashes (TrackMix.lines). */
+  let wordLines: TrackMix['lines'] = []
   const usable = (lyrics ?? []).filter((line) => Number.isFinite(line.time) && line.time >= 0 && typeof line.text === 'string').sort((a, b) => a.time - b.time)
   const stretches = lyricStretches(usable)
   if (usable.length >= 4 && stretches.length) {
@@ -1490,6 +1554,12 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
         else vocals.push({ start, end })
       }
       vocalSource = 'lyrics'
+      const placedAt = offset
+      wordLines = sungLines(usable).map((line) => ({
+        time: round(clamp(line.time + placedAt, 0, duration), 2),
+        end: round(clamp(line.end + placedAt, 0, duration), 2),
+        words: wordHashes(line.text),
+      }))
       // Counted without what is in brackets (backing vocals, ad-libs), so "Don't show up (don't show up)" is the line.
       const normal = (text: string) => text.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
       const counts = new Map<string, number>()
@@ -1964,6 +2034,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     drops: drops.map((time) => round(time)),
     vocals: vocals.map((stretch) => ({ start: round(stretch.start, 2), end: round(stretch.end, 2) })),
     vocalSource,
+    lines: wordLines,
+    titleWords: title ? wordHashes(title.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')) : [],
     introEnd: round(introEnd),
     outroStart: round(outroStart),
     cuesIn: ranked(scoredIn),

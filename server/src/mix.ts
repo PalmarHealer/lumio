@@ -68,13 +68,13 @@ function analysisWorker() {
 }
 
 /** Analyses a WAV in the worker, after the ones before it. Its bytes are handed over (not copied): `wav` is emptied. */
-export function analyzeWav(wav: ArrayBuffer, lyrics?: LyricLine[]): Promise<TrackMix | null> {
+export function analyzeWav(wav: ArrayBuffer, lyrics?: LyricLine[], title?: string): Promise<TrackMix | null> {
   const run = queue.then(
     () =>
       new Promise<TrackMix | null>((resolve, reject) => {
         const id = ++jobs
         pending.set(id, { resolve, reject })
-        analysisWorker().postMessage({ id, wav, lyrics } satisfies MixJob, [wav])
+        analysisWorker().postMessage({ id, wav, lyrics, title } satisfies MixJob, [wav])
       }),
   )
   queue = run.catch(() => undefined)
@@ -145,7 +145,7 @@ export async function analyzeTrack(jellyfinUrl: string, token: string, track: Mi
     clearTimeout(timer)
   }
   const lyrics = await syncedLyrics(jellyfinUrl, token, track.Id, kept)
-  return analyzeWav(wav.buffer as ArrayBuffer, lyrics)
+  return analyzeWav(wav.buffer as ArrayBuffer, lyrics, track.Name)
 }
 
 // ---- a playlist's mixer settings (the app's PlaylistMixer, src/features/listen/mixer/types.ts) ----

@@ -10,6 +10,8 @@ export interface MixJob {
   id: number
   wav: ArrayBuffer
   lyrics?: LyricLine[]
+  /** The track's title (its words mark the hook in the lyrics). */
+  title?: string
 }
 
 parentPort?.on('message', (job: MixJob) => {
@@ -19,7 +21,7 @@ parentPort?.on('message', (job: MixJob) => {
     job.wav = new ArrayBuffer(0)
     const wav = readWavChannels(bytes)
     bytes = null
-    const mix = wav ? analyzeMix(wav.channels.slice(0, 2), wav.rate, job.lyrics) : null
+    const mix = wav ? analyzeMix(wav.channels.slice(0, 2), wav.rate, job.lyrics, job.title) : null
     parentPort!.postMessage({ id: job.id, mix })
   } catch (error) {
     parentPort!.postMessage({ id: job.id, error: error instanceof Error ? error.message : String(error) })

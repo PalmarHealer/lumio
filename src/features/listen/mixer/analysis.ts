@@ -54,7 +54,7 @@ export interface PreparedTrack {
   sungSeconds(from: number, to: number): number
   /**
    * The least clear attacks (0–1, the share of beats with an audible onset on the grid) over the phrases touching
-   * [from, to]; NaN when the analysis has no clarity per phrase.
+   * [from, to], 0 when it reaches before the song's first phrase or beat; NaN when the analysis has no clarity.
    */
   clarityBetween(from: number, to: number): number
 }
@@ -260,14 +260,14 @@ export function prepareTrack(mix: TrackMix | null | undefined): PreparedTrack | 
     cuesOut: Array.isArray(mix.cuesOut) ? mix.cuesOut.filter((t): t is number => finite(t) && t > 0 && t <= duration) : [],
     energyBetween,
     loudSeconds,
-    clarityBetween: phraseClarity(mix, duration),
+    clarityBetween: phraseClarity(mix, duration, beats.length > 0 ? beats[0] : 0),
     sungSeconds: (from: number, to: number) =>
       vocalsKnown ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
   }
 }
 
 /** Clarity per analysed phrase, kept only when it pairs up with the phrase list one to one. */
-function phraseClarity(mix: TrackMix, duration: number) {
+function phraseClarity(mix: TrackMix, duration: number, beatsStart: number) {
   const starts = Array.isArray(mix.phrases) ? mix.phrases : []
   const values = Array.isArray(mix.phraseClarity) ? mix.phraseClarity : []
   const pairs = starts
@@ -278,6 +278,8 @@ function phraseClarity(mix: TrackMix, duration: number) {
   const times = pairs.map((p) => p.t)
   return (from: number, to: number) => {
     if (!usable) return NaN
+    // Before the first phrase (or the first beat) the song has no grid at all: nothing there can be beatmatched.
+    if (from < Math.max(times[0], beatsStart) - 0.05) return 0
     let least = Infinity
     const first = Math.max(0, floorIndex(times, from))
     for (let i = first; i < pairs.length && pairs[i].t < to; i++) least = Math.min(least, clamp(pairs[i].clarity, 0, 1))

@@ -12,7 +12,9 @@ import type { Transition } from './types'
  * The rendered timeline: 0 is `preRoll` seconds before A's `aOut`; the transition starts at `preRoll` (B's `bIn`
  * starts there; with a negative `bIn` B's top starts `-bIn / rate` seconds later), A stops `length` seconds later, and the
  * render ends `postRoll` seconds after that. Both decks go through the player's master limiter (−1 dBFS); its lookahead
- * delay is taken out again, so the timeline stays exact to the sample.
+ * delay is taken out again, so the timeline stays exact to the sample. As in the player the limiter only acts from just
+ * before the transition until it is over (and its release has run out): the rolls before and after are the sources
+ * as they are.
  */
 export interface RenderTransitionOptions {
   a: AudioBuffer
@@ -30,6 +32,9 @@ export interface RenderTransitionOptions {
 
 /** Sample-rate independent time → frame conversion used for the render's length. */
 const frames = (seconds: number, sampleRate: number) => Math.max(1, Math.round(seconds * sampleRate))
+
+/** The limiter is engaged this long before the transition, while B is still silent. */
+const LIMITER_LEAD_S = 0.05
 
 /** How finely the sources' speed curves (brake, B's easing) are sampled. */
 const RATE_CURVE_RATE = 100
@@ -86,6 +91,8 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   // As in the player: A's echo rings out after A is gone; B glides back to neutral and plays on.
   releaseEcho(deckA, end)
   resetDeck(deckB, end, 0.05)
+  master.engage(true, Math.max(0, start - LIMITER_LEAD_S))
+  master.engage(false, end + 0.05)
 
   // Without the limiter's delay at the front.
   const rendered = await ctx.startRendering()

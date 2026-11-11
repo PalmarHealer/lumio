@@ -16,8 +16,9 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  *   dips around the crossovers; a short crossfade keeps that brief (measured: about −10 dB for 2 ms near 200 Hz and
  *   2 kHz, where 30 ms gave up to −32 dB for 17 ms) and is still a ramp, not a jump.
  * - All decks meet in the master (`createMaster`): a lookahead limiter (AudioWorklet) with a −1 dBFS ceiling on
- *   estimated true peaks, transparent until needed. Two loud tracks overlapping, or the coloured path, can exceed full
- *   scale; the limiter catches that instead of the output clipping.
+ *   estimated true peaks. Two loud tracks overlapping, or the coloured path, can exceed full scale; the limiter
+ *   catches that instead of the output clipping. It only acts while a transition runs (`engage`): a single neutral
+ *   deck passes exactly as the plain player plays it, loud masters' own peaks included.
  *
  * - `brake` is the brake effect's fade, `gain` the transition's volume curve, `level` the player's own volume,
  *   normalization and pause fades (left at 1 when rendering). `level` comes last, so a pause also silences an echo
@@ -646,9 +647,18 @@ const LIMITER_RELEASE_S = 0.15
  * window: the gain is down by the time a peak comes out of the delay line, never later, and ramps there instead of
  * jumping (no distortion). It recovers with a 150 ms release. Both channels share one gain (the stereo image stays).
  * The audio is delayed by the lookahead (`latency` in the node's options).
+ *
+ * The `active` param says whether it may act. The audio always takes the same delayed path; what changes is how much
+ * of the gain reduction is applied (`mix`): engaging and letting go never shift the sound in time or mix two versions
+ * of it. Off, the output is exactly the delayed input. It engages within 5 ms and lets go over the release time (150
+ * ms), so a reduction still under way rises back like an ordinary release; it can't wait for the reduction to end on
+ * its own, as a loud master alone may keep it reducing (its peaks then pass, as in the plain player).
  */
 const LIMITER_PROCESSOR = `
 class LumioLimiter extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [{ name: 'active', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' }]
+  }
   constructor(options) {
     super()
     const o = options.processorOptions || {}
@@ -669,15 +679,19 @@ class LumioLimiter extends AudioWorkletProcessor {
     this.boxAt = 0
     this.boxSum = this.box
     this.gain = 1
+    this.mix = 0
+    this.mixUp = 1 / Math.max(1, Math.round(0.005 * sampleRate))
+    this.mixDown = 1 / Math.max(1, Math.round(o.release * sampleRate))
     this.n = 0
     this.frames = 0
     this.limited = 0
     this.minGain = 1
   }
-  process(inputs, outputs) {
+  process(inputs, outputs, parameters) {
     const input = inputs[0]
     const output = outputs[0]
     const length = output[0].length
+    const target = parameters.active[0]
     for (let i = 0; i < length; i++) {
       let peak = 0
       for (let c = 0; c < 2; c++) {
@@ -707,11 +721,14 @@ class LumioLimiter extends AudioWorkletProcessor {
       if ((n & 4095) === 0) this.boxSum = this.boxValues.reduce((sum, value) => sum + value, 0)
       const smooth = Math.min(1, this.boxSum / this.box)
       this.gain = smooth < this.gain ? smooth : this.gain + (smooth - this.gain) * this.release
+      if (this.mix < target) this.mix = Math.min(target, this.mix + this.mixUp)
+      else if (this.mix > target) this.mix = Math.max(target, this.mix - this.mixDown)
+      const applied = this.mix === 0 ? 1 : 1 - this.mix * (1 - this.gain)
       const read = (this.write + 1) % (this.delay + 1)
-      for (let c = 0; c < output.length; c++) output[c][i] = this.lines[Math.min(c, 1)][read] * this.gain
+      for (let c = 0; c < output.length; c++) output[c][i] = this.lines[Math.min(c, 1)][read] * applied
       this.write = read
-      if (this.gain < 0.9999) this.limited++
-      if (this.gain < this.minGain) this.minGain = this.gain
+      if (applied < 0.9999) this.limited++
+      if (applied < this.minGain) this.minGain = applied
     }
     this.frames += length
     if (this.report && this.frames % this.report < length) this.port.postMessage({ frames: this.frames, limited: this.limited, minGain: this.minGain })
@@ -733,6 +750,8 @@ export interface Master {
   input: GainNode
   /** How much later the sound comes out (the limiter's lookahead), in seconds. */
   latency: number
+  /** Lets the limiter act from context time `time` on (a transition starts), or lets it go (it is over). */
+  engage(on: boolean, time?: number): void
   dispose(): void
 }
 
@@ -764,9 +783,15 @@ export async function createMaster(ctx: BaseAudioContext, destination: AudioNode
   })
   if (options.onStats) limiter.port.onmessage = (event: MessageEvent<LimiterStats>) => options.onStats!(event.data)
   input.connect(limiter).connect(destination)
+  const active = limiter.parameters.get('active')!
   return {
     input,
     latency: limiterLatency(ctx.sampleRate) / ctx.sampleRate,
+    engage(on, time = ctx.currentTime) {
+      const at = Math.max(ctx.currentTime, time)
+      holdAt(active, at)
+      setAt(active, at, on ? 1 : 0)
+    },
     dispose() {
       input.disconnect()
       limiter.disconnect()

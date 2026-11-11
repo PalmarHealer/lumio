@@ -1722,6 +1722,8 @@ function begin(p: Plan, late: number) {
   }
   running = r
   cancelEase()
+  // The limiter acts from now on (B isn't sounding yet) until the transition is over.
+  master?.engage(true)
   const from = Math.max(0, context.currentTime - r.start)
   if (!safely(() => scheduleTransition({ a: deckA, b: deckB }, transition, r.start, { from }))) return abortRunning()
   follow(r)
@@ -1829,6 +1831,8 @@ function finishRunning(r: Running) {
   retire(r.a, ECHO_TAIL_S)
   const deckB = decks.get(r.b)
   if (deckB) safely(() => resetDeck(deckB, deckB.ctx.currentTime, SETTLE_S))
+  // B alone and neutral again: the limiter lets go (once its release has run out).
+  if (deckB) master?.engage(false, deckB.ctx.currentTime + SETTLE_S)
   if (r.transition.rate !== 1) easeRate(r.b, r.transition)
   else r.b.playbackRate = 1
   mixerTick()
@@ -1850,6 +1854,7 @@ function abortRunning() {
   keep.playbackRate = 1
   const deck = decks.get(keep)
   if (deck) safely(() => resetDeck(deck, deck.ctx.currentTime, SETTLE_S))
+  if (deck) master?.engage(false, deck.ctx.currentTime + SETTLE_S)
   planSoon()
 }
 

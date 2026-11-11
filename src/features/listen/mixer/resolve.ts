@@ -1,5 +1,5 @@
 import { mixOf, type MixLookup } from './analysis.ts'
-import { finalizeTransition, planFallback, planTransition } from './planner.ts'
+import { MIN_B_IN, finalizeTransition, planFallback, planTransition } from './planner.ts'
 import { PRESETS } from './presets.ts'
 import { pairKey, type MixStyle, type PlaylistMixer, type Transition, type TrackMix } from './types.ts'
 
@@ -39,13 +39,17 @@ export function storedFits(transition: unknown, fromId: string, toId: string, aD
   const t = transition as Transition
   if (t.v !== 1 || t.from !== fromId || t.to !== toId) return false
   if (!(PRESETS as readonly string[]).includes(t.preset)) return false
-  if (![t.aOut, t.bIn, t.length, t.rate].every(finite) || t.length < 0 || t.aOut < 0 || t.bIn < 0) return false
-  if (!t.a || !t.b || !Array.isArray(t.effects)) return false
+  if (![t.aOut, t.bIn, t.length, t.rate].every(finite) || t.length < 0 || t.aOut < 0 || t.bIn < MIN_B_IN) return false
+  // The rates the player can play, and automation it can read.
+  if (t.rate < 0.5 || t.rate > 2) return false
+  const decks = [t.a, t.b]
+  if (!decks.every((deck) => deck && typeof deck === 'object' && (['gain', 'low', 'mid', 'high', 'filter'] as const).every((band) => Array.isArray(deck[band])))) return false
+  if (!Array.isArray(t.effects)) return false
   // Stored before the tempo was part of a transition: the echo and the rate easing can't be counted, so plan again.
   if (!t.tempo || !finite(t.tempo.a) || !finite(t.tempo.b) || t.tempo.a <= 0 || t.tempo.b <= 0) return false
   // The songs may have been analysed again since (another edit of the file): the times must still lie inside them.
   if (finite(aDuration) && t.aOut + t.length > aDuration + 0.05) return false
-  if (finite(bDuration) && t.bIn >= bDuration) return false
+  if (finite(bDuration) && (t.bIn >= bDuration || t.bIn + t.length * t.rate > bDuration + 0.05)) return false
   return true
 }
 

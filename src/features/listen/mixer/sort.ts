@@ -16,9 +16,9 @@ import { pairKey, type MixStyle, type TrackMix, type Transition } from './types.
  * song's energy curve is relative to its own loudest moment.
  *
  * Finding the order is a shortest-path problem over these costs (an open path, both directions differ). It's solved
- * with nearest neighbour from several starts, then improved by 2-opt (reversing a stretch) and or-opt (moving one to
- * three songs elsewhere) until nothing improves or the time budget is spent. A few hundred songs sort well within a
- * second.
+ * with nearest neighbour from several starts, then improved by 2-opt (reversing a stretch), or-opt (moving one to
+ * three songs elsewhere) and exchanges (swapping two songs) until nothing improves or a fixed budget of work is spent,
+ * so the same playlist always comes out in the same order. A few hundred songs sort within a second.
  *
  * Songs without a usable analysis (none yet, or no beat grid) can't be scored; they keep their place in the playlist
  * (the same index) and the analysed songs are sorted into the other places around them, so a half-analysed playlist
@@ -26,9 +26,14 @@ import { pairKey, type MixStyle, type TrackMix, type Transition } from './types.
  */
 
 export interface SortOptions {
-  /** Stop improving after this many milliseconds (default 700). */
-  timeBudgetMs?: number
+  /**
+   * How much improving to do at most, in evaluated moves (default 60 million, well under a second for 300 songs). A
+   * budget of work rather than of time keeps the result the same on every device and every run.
+   */
+  maxWork?: number
 }
+
+const DEFAULT_WORK = 60_000_000
 
 interface Features {
   track: PreparedTrack
@@ -133,8 +138,13 @@ function arcTargets(n: number, style: MixStyle): Float64Array {
   return ranks
 }
 
-/** Improves an open path in place: 2-opt and or-opt with first improvement, until stable or out of time. */
-function improve(tour: Int32Array, cost: Float64Array, arc: Float64Array | null, n: number, deadline: number) {
+/**
+ * Improves an open path in place with first improvement, until stable or the work budget is spent: 2-opt (reverse a
+ * stretch), or-opt (move one to three songs elsewhere) and exchange (swap two songs, which moves a song across the
+ * playlist to the place in the energy arc it fits without disturbing the rest). Returns the work left.
+ */
+function improve(tour: Int32Array, cost: Float64Array, arc: Float64Array | null, n: number, budget: number): number {
+  let work = budget
   const c = (x: number, y: number) => cost[x * n + y]
   const place = (track: number, position: number) => (arc ? arc[track * n + position] : 0)
   const forward = new Float64Array(n)
@@ -147,11 +157,36 @@ function improve(tour: Int32Array, cost: Float64Array, arc: Float64Array | null,
   }
   const eps = 1e-9
   let improved = true
-  while (improved && Date.now() < deadline) {
+  while (improved && work > 0) {
     improved = false
+    // Exchange: swap tour[i] and tour[j].
+    for (let i = 0; i < n - 1 && work > 0; i++) {
+      work -= n - i
+      for (let j = i + 1; j < n; j++) {
+        const x = tour[i]
+        const y = tour[j]
+        const before = i > 0 ? tour[i - 1] : -1
+        const after = j + 1 < n ? tour[j + 1] : -1
+        let delta = place(x, j) + place(y, i) - place(x, i) - place(y, j)
+        if (before >= 0) delta += c(before, y) - c(before, x)
+        if (after >= 0) delta += c(x, after) - c(y, after)
+        if (j === i + 1) delta += c(y, x) - c(x, y)
+        else {
+          const nextI = tour[i + 1]
+          const prevJ = tour[j - 1]
+          delta += c(y, nextI) - c(x, nextI) + c(prevJ, x) - c(prevJ, y)
+        }
+        if (delta < -eps) {
+          tour[i] = y
+          tour[j] = x
+          improved = true
+        }
+      }
+    }
     prefix()
     // 2-opt: reverse tour[i..j].
-    for (let i = 0; i < n - 1 && Date.now() < deadline; i++) {
+    for (let i = 0; i < n - 1 && work > 0; i++) {
+      work -= arc ? ((n - i) * (n - i + 3)) / 2 : n - i
       for (let j = i + 1; j < n; j++) {
         let delta = backward[j] - backward[i] - (forward[j] - forward[i])
         if (i > 0) delta += c(tour[i - 1], tour[j]) - c(tour[i - 1], tour[i])
@@ -166,7 +201,8 @@ function improve(tour: Int32Array, cost: Float64Array, arc: Float64Array | null,
     }
     // Or-opt: move tour[i..i+s-1] elsewhere, keeping its direction.
     for (let s = 1; s <= 3; s++) {
-      for (let i = 0; i + s <= n && Date.now() < deadline; i++) {
+      for (let i = 0; i + s <= n && work > 0; i++) {
+        work -= n * (1 + s)
         const first = tour[i]
         const last = tour[i + s - 1]
         const before = i > 0 ? tour[i - 1] : -1
@@ -213,6 +249,7 @@ function improve(tour: Int32Array, cost: Float64Array, arc: Float64Array | null,
       }
     }
   }
+  return work
 }
 
 function pathCost(tour: Int32Array, cost: Float64Array, arc: Float64Array | null, n: number) {
@@ -249,10 +286,9 @@ function nearestNeighbour(start: number, cost: Float64Array, arc: Float64Array |
 }
 
 /** Orders analysed songs (indices into `list`) for the style. */
-function orderAnalysed(list: Features[], style: MixStyle, budgetMs: number): number[] {
+function orderAnalysed(list: Features[], style: MixStyle, maxWork: number): number[] {
   const n = list.length
   if (n <= 1) return list.map((_, i) => i)
-  const started = Date.now()
   // Intensity as a rank within the playlist.
   const byIntensity = [...list.keys()].sort((p, q) => list[p].intensity - list[q].intensity)
   byIntensity.forEach((index, k) => (list[index].rank = k / (n - 1)))
@@ -276,13 +312,15 @@ function orderAnalysed(list: Features[], style: MixStyle, budgetMs: number): num
     .slice(0, 3)
 
   let best = tours[0]
+  let remaining = maxWork
   for (const [k, candidate] of tours.entries()) {
-    const remaining = budgetMs - (Date.now() - started)
     if (remaining <= 0) break
-    // The best start gets most of the time; the others a share each.
-    improve(candidate.tour, cost, arc, n, Date.now() + (k === 0 ? remaining * 0.6 : remaining / (tours.length - k)))
+    // The best start gets most of the work; the others a share each (what one leaves passes on).
+    const share = k === 0 ? remaining * 0.6 : remaining / (tours.length - k)
+    remaining -= share - improve(candidate.tour, cost, arc, n, share)
     candidate.cost = pathCost(candidate.tour, cost, arc, n)
-    if (candidate.cost < best.cost) best = candidate
+    // Ties keep the earlier start, so equal costs never depend on anything but the input.
+    if (candidate.cost < best.cost - 1e-12) best = candidate
   }
   return Array.from(best.tour)
 }
@@ -302,7 +340,7 @@ export function sortForMix(tracks: Array<{ id: string; mix: TrackMix | null }>, 
   const order = orderAnalysed(
     analysed.map((entry) => entry.features),
     style,
-    opts.timeBudgetMs ?? 700,
+    opts.maxWork ?? DEFAULT_WORK,
   )
   const result: string[] = []
   let next = 0

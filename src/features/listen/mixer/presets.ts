@@ -8,8 +8,9 @@ import type { DeckAutomation, Keyframe, PresetId, TransitionEffect } from './typ
  * Rules every shape keeps, so the planner and the tests can rely on them:
  * - Never two basslines: B's low band stays killed until the swap and A's is killed from it on (a 20 ms gap, no
  *   overlap). A crossfade swaps the lows halfway through instead of blending them.
- * - The lead (the mid band, where voices live) changes deck around the swap in the shapes meant for long overlaps:
- *   A's mids leave in the beat before it, B's arrive in the beat after. Whether the voices really keep apart depends
+ * - The lead (the mid band, where voices live, with the highs of A that carry a voice's air) changes deck around the
+ *   swap in the shapes meant for long overlaps: A's mids and highs leave in the beat before it, B's mids arrive in the
+ *   beat after (B's highs come in early: hi-hats under A, which is fine as long as B isn't singing yet). Whether the voices really keep apart depends
  *   on where the planner puts the swap; it checks that against both songs' vocals.
  * - At `length` A is silent (gain 0) and B is neutral (gain 1, bands 1, filter open), so nothing jumps when the
  *   transition ends. Shapes without overlap (hard cut, drop swap without pre-roll, none) have length 0 and no
@@ -205,9 +206,10 @@ function bassSwap(ctx: PresetContext): PresetShape {
         [swap - beat, 1],
         [swap, 0.2],
       ],
+      // A voice lives in the highs too (its air and consonants): they leave with the mids.
       high: [
-        [swap, 1],
-        [length, 0.6],
+        [swap - beat, 1],
+        [swap, 0.2],
       ],
     }),
     b: automation(length, {
@@ -252,6 +254,10 @@ function filterBuild(ctx: PresetContext): PresetShape {
       gain: [[swap, 1], ...powerFade(swap, length, true, 4)],
       low: [[0, 1], ...stepAt(swap, 1, 0)],
       mid: [
+        [swap - beat, 1],
+        [swap, 0.2],
+      ],
+      high: [
         [swap - beat, 1],
         [swap, 0.2],
       ],

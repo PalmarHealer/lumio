@@ -26,7 +26,7 @@ export interface PreparedTrack {
    * would count to when the analysis found only the bigger section changes.
    */
   phraseGrid: number[]
-  /** Median seconds per beat. */
+  /** Seconds per beat over the whole song (median of 16-beat slopes). */
   period: number
   bpm: number
   bpmConfidence: number
@@ -192,9 +192,11 @@ export function prepareTrack(mix: TrackMix | null | undefined): PreparedTrack | 
 
   // The beat grid: usable when there are enough beats at a sane tempo on a song long enough to mix.
   const beats = cleanTimes(mix.beats, duration)
-  const intervals: number[] = []
-  for (let i = 1; i < beats.length; i++) intervals.push(beats[i] - beats[i - 1])
-  let period = median(intervals)
+  // The song's beat length: the median of 16-beat slopes, unbiased by grids alternating long and short beats and
+  // robust to a gap where the analysis lost a few beats.
+  const slopes: number[] = []
+  for (let i = 0; i + 16 < beats.length; i++) slopes.push((beats[i + 16] - beats[i]) / 16)
+  let period = median(slopes)
   const grid = duration >= 30 && beats.length >= 32 && finite(period) && period >= 0.24 && period <= 1.6
   if (!grid) period = finite(mix.bpm) && mix.bpm >= 40 && mix.bpm <= 250 ? 60 / mix.bpm : 0.5
 
@@ -254,15 +256,44 @@ export function prepareTrack(mix: TrackMix | null | undefined): PreparedTrack | 
   }
 }
 
-/** Seconds per beat around a moment (median of the 16 beats around it), or the song's median. */
+/**
+ * Seconds per beat around a moment: the slope over the 16 beats around it ((beats[i+8] − beats[i−8]) / 16), which a
+ * grid alternating long and short beats (swing, a tracker's jitter) doesn't bias the way a median of intervals does.
+ * The song's median only when the beats there are missing or absurd (more than 20 % off).
+ */
 export function periodAt(track: PreparedTrack, t: number): number {
   const i = floorIndex(track.beats, t)
-  const from = Math.max(1, i - 8)
-  const to = Math.min(track.beats.length - 1, i + 8)
-  const local: number[] = []
-  for (let k = from; k <= to; k++) local.push(track.beats[k] - track.beats[k - 1])
-  const value = median(local)
-  return finite(value) && Math.abs(value / track.period - 1) < 0.08 ? value : track.period
+  const from = Math.max(0, i - 8)
+  const to = Math.min(track.beats.length - 1, Math.max(i, 0) + 8)
+  const value = to > from ? (track.beats[to] - track.beats[from]) / (to - from) : NaN
+  return finite(value) && Math.abs(value / track.period - 1) < 0.2 ? value : track.period
+}
+
+/**
+ * Seconds per beat over a stretch of the song: the least-squares slope of beat time over beat number for the beats in
+ * [from, to] (what a constant playback rate has to match there), or `periodAt` its middle when it holds under 8 beats.
+ */
+export function periodOver(track: PreparedTrack, from: number, to: number): number {
+  const first = Math.max(0, floorIndex(track.beats, from - 1e-6) + 1)
+  const last = floorIndex(track.beats, to + 1e-6)
+  const n = last - first + 1
+  if (n < 8) return periodAt(track, (from + to) / 2)
+  let sumX = 0
+  let sumY = 0
+  for (let k = 0; k < n; k++) {
+    sumX += k
+    sumY += track.beats[first + k]
+  }
+  const meanX = sumX / n
+  const meanY = sumY / n
+  let num = 0
+  let den = 0
+  for (let k = 0; k < n; k++) {
+    num += (k - meanX) * (track.beats[first + k] - meanY)
+    den += (k - meanX) ** 2
+  }
+  const value = num / den
+  return finite(value) && Math.abs(value / track.period - 1) < 0.2 ? value : periodAt(track, (from + to) / 2)
 }
 
 /** Analyses by track id, as a Map or a plain object (missing or null: not analysed yet). */

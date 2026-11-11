@@ -65,6 +65,11 @@ export interface TrackMix {
    * can't be trusted to line up audibly.
    */
   phraseClarity: number[]
+  /**
+   * Per bar (same index as `downbeats`, each up to the next downbeat or the end): the same measure for that bar's beats
+   * alone. Lets a beatmatch use the clear bars of a phrase that is unclear elsewhere. Empty in analyses made before it.
+   */
+  barClarity: number[]
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean
@@ -1268,8 +1273,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   // Sung lines that mostly start on beat 2 or 3 (not on 1 or its pickup) contradict the count: then it stays a guess.
   const linesAt = [0, 1, 2, 3].map((q) => mean(evidence.lines.filter((_, k) => positions[k] === q)))
   const linesDisagree = lyricLines.length >= 16 && Math.max(linesAt[1]!, linesAt[2]!) >= 0.5 && Math.max(linesAt[1]!, linesAt[2]!) > Math.max(linesAt[0]!, linesAt[3]!) + 0.3
-  const barClarity = linesDisagree ? 0.3 : clamp(Math.min(profile[0]! - Math.max(profile[1]!, profile[2]!, profile[3]!), profile[0]! - profile[2]!) / 0.5)
-  const bpmConfidence = round(tempoConfidence * (0.5 + 0.5 * barClarity), 2)
+  const countClarity = linesDisagree ? 0.3 : clamp(Math.min(profile[0]! - Math.max(profile[1]!, profile[2]!, profile[3]!), profile[0]! - profile[2]!) / 0.5)
+  const bpmConfidence = round(tempoConfidence * (0.5 + 0.5 * countClarity), 2)
   const downbeats = downbeatIndex.map((i) => beats[i]!)
 
   // ---- 4. per bar: features, self-similarity, novelty, phrases ----
@@ -1316,6 +1321,11 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const beatClear = beatProfiles(beats, onsets, 0.08).map((profile) => profile.prominence >= 0.6 && Math.abs(profile.shift) <= 0.012 && profile.rival < 0.75)
   const phraseClarity = phrases.map((start, p) => {
     const end = phraseEnd(p)
+    const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
+    return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
+  })
+  const barClarity = downbeats.map((start, b) => {
+    const end = downbeats[b + 1] ?? duration
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
     return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
   })
@@ -1598,6 +1608,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     downbeats: downbeats.map((time) => round(time)),
     phrases: phrases.map((time) => round(time)),
     phraseClarity,
+    barClarity,
     key: top.key,
     minor: top.minor,
     keyClarity: round(Math.max(0, top.r)),

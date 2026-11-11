@@ -103,8 +103,12 @@ export interface TrackMix {
    * padding are merged.
    */
   vocals: Array<{ start: number; end: number }>
-  /** Where `vocals` came from: synced lyrics aligned to the audio, an estimate from the audio, or nothing found. */
-  vocalSource: 'lyrics' | 'audio' | 'none'
+  /**
+   * Where `vocals` came from: synced lyrics aligned to the audio; `unplaced` when the song has lyrics but they couldn't
+   * be placed on this recording (another version, or a check that failed: `vocals` is empty although someone sings,
+   * where is unknown); an estimate from the audio; or nothing found (no lyrics: maybe instrumental).
+   */
+  vocalSource: 'lyrics' | 'unplaced' | 'audio' | 'none'
   /** First phrase where the song is fully "in" (beat and bass), and where it starts to wind down after its last chorus/drop. */
   introEnd: number
   outroStart: number

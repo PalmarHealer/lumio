@@ -82,6 +82,8 @@ export interface PreparedTrack {
 
 /** A section's mean mid band (against the song's loud mids) from which it may hold a voice, when nothing was measured. */
 const ASSUMED_VOICE_MID = 0.5
+/** The same where the song has lyrics that couldn't be placed (singing is certain, only where is unknown). */
+const UNPLACED_VOICE_MID = 0.35
 
 const finite = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x))
@@ -258,7 +260,7 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
   const introEnd = finite(mix.introEnd) ? clamp(mix.introEnd, 0, duration) : 0
   const outroStart = finite(mix.outroStart) && mix.outroStart > introEnd ? clamp(mix.outroStart, 0, duration) : duration
 
-  // Vocals: as measured; when nothing was found (lyrics missing or not placeable), assume singing in every body section
+  // Vocals: as measured; when nothing was placed (no lyrics, or lyrics not placeable), assume singing in every body section
   // with a voice-like mid band, a bar of margin each side, so no voice of the other song lands on it and a clean mix
   // doesn't cut into it. A song without such sections (thin mids: an instrumental) gets none.
   const vocalsKnown = (mix.vocalSource === 'lyrics' || mix.vocalSource === 'audio') && Array.isArray(mix.vocals)
@@ -267,6 +269,8 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
   let vocals = vocalsKnown ? cleanSpans(mix.vocals, duration) : []
   if (!vocalsKnown) {
     const pad = 4 * period
+    // Lyrics exist but couldn't be placed: someone certainly sings, so thinner mids count too.
+    const voiceMid = mix.vocalSource === 'unplaced' ? UNPLACED_VOICE_MID : ASSUMED_VOICE_MID
     const midOver = (from: number, to: number) => {
       let sum = 0
       let count = 0
@@ -277,7 +281,7 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
       return count > 0 ? sum / count : 0
     }
     const assumed = sections
-      .filter((s) => s.kind !== 'intro' && s.kind !== 'outro' && s.kind !== 'break' && midOver(s.start, s.end) >= ASSUMED_VOICE_MID)
+      .filter((s) => s.kind !== 'intro' && s.kind !== 'outro' && s.kind !== 'break' && midOver(s.start, s.end) >= voiceMid)
       .map((s) => ({ start: Math.max(0, s.start - pad), end: Math.min(duration, s.end + pad) }))
     vocals = cleanSpans(assumed, duration)
   }

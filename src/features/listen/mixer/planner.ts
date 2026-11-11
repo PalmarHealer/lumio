@@ -9,7 +9,7 @@ import {
   spansTouch,
   type PreparedTrack,
 } from './analysis.ts'
-import { NEEDS_BEATMATCH, keyframes, matchLevels, plainCrossfade, presetShape, valueAt, type ConcretePreset, type PresetShape } from './presets.ts'
+import { NEEDS_BEATMATCH, RAMP, keyframes, matchLevels, plainCrossfade, presetShape, valueAt, type ConcretePreset, type PresetShape } from './presets.ts'
 import { deckPosition, laneBeats, lanePosition, laneReach, laneStretches, rateAdvance, type Lane } from './timeline.ts'
 import type { DeckAutomation, DeckSegment, Keyframe, MixStyle, PresetId, TrackMix, Transition } from './types.ts'
 
@@ -1627,27 +1627,83 @@ function toTransition(
           { t: length + 4 * GLIDE_BARS_B * periodAt(b, positionB(p, shape.length) ?? p.laneB.start), v: 1 },
         ]
       : []
-  return {
-    v: 2,
-    from: ids.from,
-    to: ids.to,
-    style,
-    preset: shape.preset,
-    aOut,
-    bAt,
-    bIn: p.laneB.start,
-    length: shape.length > 0 ? length : 0,
-    pathA: shape.length > 0 ? pathA : [],
-    pathB: shape.length > 0 ? p.laneB.path : [],
-    rateA: rateCurveA,
-    rateB: rateCurveB,
-    tempo,
-    a: moveDeck(shape.a),
-    b: moveDeck(shape.b),
-    effects: shape.effects.map((e) => (e.kind === 'brake' ? { ...e, at: clock(e.at), length: e.length / rateA } : { ...e, at: clock(e.at) })),
-    custom: false,
-    confidence,
+  return leadIns(
+    {
+      v: 2,
+      from: ids.from,
+      to: ids.to,
+      style,
+      preset: shape.preset,
+      aOut,
+      bAt,
+      bIn: p.laneB.start,
+      length: shape.length > 0 ? length : 0,
+      pathA: shape.length > 0 ? pathA : [],
+      pathB: shape.length > 0 ? p.laneB.path : [],
+      rateA: rateCurveA,
+      rateB: rateCurveB,
+      tempo,
+      a: moveDeck(shape.a),
+      b: moveDeck(shape.b),
+      effects: shape.effects.map((e) => (e.kind === 'brake' ? { ...e, at: clock(e.at), length: e.length / rateA } : { ...e, at: clock(e.at) })),
+      custom: false,
+      confidence,
+    },
+    b,
+  )
+}
+
+/** How far before the attack a loop jumps (its stretch moved earlier by this, its length kept). */
+const JOIN_LEAD = 0.02
+/** How far before its first attack B starts playing (and fading in), when it would start on or just after one. */
+const START_LEAD = 0.04
+
+/**
+ * Keeps attacks whole where a deck starts or jumps: a loop's stretch moves JOIN_LEAD earlier (same length, so the
+ * beat runs on as before; the jump lands just before the loop's first attack instead of on it), and B, when it would
+ * start on or just after one of its beats, starts START_LEAD before that beat, its fade-in and EQ start moved along
+ * (its bass stays where it meets A's).
+ */
+function leadIns(tr: Transition, b: PreparedTrack): Transition {
+  const lead = (path: DeckSegment[]): DeckSegment[] => {
+    if (!path.some((segment) => segment.repeat > 1)) return path
+    const out: DeckSegment[] = []
+    path.forEach((segment, i) => {
+      if (segment.to - segment.from <= 4 * JOIN_LEAD) {
+        out.push(segment)
+        return
+      }
+      if (i === 0) {
+        // The deck's start stays where it is; only the repeats jump to the earlier stretch.
+        out.push({ from: segment.from, to: segment.to - JOIN_LEAD, repeat: 1 })
+        if (segment.repeat > 1) out.push({ from: segment.from - JOIN_LEAD, to: segment.to - JOIN_LEAD, repeat: segment.repeat - 1 })
+      } else out.push({ from: segment.from - JOIN_LEAD, to: segment.to - JOIN_LEAD, repeat: segment.repeat })
+    })
+    return out
   }
+  let pathA = lead(tr.pathA)
+  let pathB = lead(tr.pathB)
+  let { bAt, bIn, rateB } = tr
+  let automation = tr.b
+  if (tr.length > 0) {
+    const i = floorIndex(b.beats, bIn + 0.1)
+    const beat = i >= 0 ? b.beats[i] : NaN
+    const shift = bIn - (beat - START_LEAD)
+    const rate = rateB.length > 0 ? rateB[0].v : 1
+    if (Number.isFinite(beat) && shift > 0 && shift <= 0.1 + START_LEAD && bIn - shift >= 0 && bAt - shift / rate >= 0) {
+      const earlier = shift / rate
+      const from = bAt
+      bIn -= shift
+      bAt -= earlier
+      if (pathB.length > 0) pathB = [{ ...pathB[0], from: bIn }, ...pathB.slice(1)]
+      rateB = rateB.map((k, n) => (n === 0 ? { ...k, t: bAt } : k))
+      const move = (list: Keyframe[]) => list.map((k) => (k.t <= from + 2 * RAMP + 1e-6 ? { ...k, t: Math.max(0, k.t - earlier) } : k))
+      automation = { ...automation, gain: move(automation.gain), mid: move(automation.mid), high: move(automation.high), filter: move(automation.filter) }
+    }
+  }
+  pathA = pathA.map((s) => ({ ...s, from: round(s.from), to: round(s.to) }))
+  pathB = pathB.map((s) => ({ ...s, from: round(s.from), to: round(s.to) }))
+  return { ...tr, pathA, pathB, bAt, bIn, rateB, b: automation }
 }
 
 /**

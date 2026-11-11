@@ -100,8 +100,12 @@ const PHASE_SLACK = 0.05
  * with lag3 on the 25 songs, such beatmatches are where the flams are (9 at no floor, 1 at 0.4, for 13 fewer blends).
  */
 const MIN_VERIFIABLE = 0.4
-/** A deck's low band coming through at least this much (gain × EQ × filter): its kick is heard. */
-const KICK_HEARD = 0.5
+/**
+ * A deck's beats are heard (and can flam) from this level of the band carrying them on (gain × EQ, -10 dB): its kick
+ * where its low band comes through that much, its snares, claps and hats where its mids or highs do.
+ */
+const BEAT_HEARD = 0.3
+const KICK_HEARD = BEAT_HEARD
 /** Clarity at which a beatmatch counts as fully verifiable (below it, a soft cost). */
 const MIN_CLARITY = 0.6
 /** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
@@ -511,15 +515,15 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
     const pa = filterBands(fa)
     const pb = filterBands(fb)
     // A voice comes through as gain × the louder of the mid band (its body) and the high band (its air and consonants,
-    // which carry a voice on their own), damped by a closed filter. A deck's beats are loud where any band that carries
-    // them is up to half (kick in the lows, snare in the mids, hats in the highs: each can flam on its own) and no
-    // filter is past half.
+    // which carry a voice on their own), damped by a closed filter. A deck's beats are heard where its kick (gain × low,
+    // no high-pass) or its accents (gain × the louder of mids and highs, no low-pass) are up to BEAT_HEARD: each can
+    // flam on its own, hats at -8 dB too.
     voiceA[i] = ga * Math.max(ma, ha) * da
     voiceB[i] = gb * Math.max(mb, hb) * db
     gainA[i] = ga
     gainB[i] = gb
-    loudA[i] = Math.abs(fa) <= 0.5 && ga * Math.max(la, Math.max(ma, ha) * da) >= 0.5 ? 1 : 0
-    loudB[i] = Math.abs(fb) <= 0.5 && gb * Math.max(lb, Math.max(mb, hb) * db) >= 0.5 ? 1 : 0
+    loudA[i] = (ga * la >= BEAT_HEARD && fa <= 0.4) || (ga * Math.max(ma, ha) >= BEAT_HEARD && fa >= -0.4) ? 1 : 0
+    loudB[i] = (gb * lb >= BEAT_HEARD && fb <= 0.4) || (gb * Math.max(mb, hb) >= BEAT_HEARD && fb >= -0.4) ? 1 : 0
     passA.low[i] = ga * la * pa.low
     passA.mid[i] = ga * ma * pa.mid
     passA.high[i] = ga * ha * pa.high
@@ -841,9 +845,8 @@ function alignPhase(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
   if (!fitted) return { rate: p.rate, bStart: p.bStart - p.slack, laneB: p.laneB }
   // The grid sits on a song's attacks overall; its kick and its claps/snares may lie a little behind it, each by its own
   // amount. B moves so the kicks' lag and the accents' lag between the decks are as small as they can be together
-  // (least squares): kicks and accents weigh alike where one deck's bass is up (the other kick's click still sounds),
-  // the kicks 2:1 where both basses sound.
-  const kickWeight = 1 + p.stats.kicksTogether
+  // (least squares): the accents always, the kicks 2:1 for the share of the time both basses sound.
+  const kickWeight = 2 * p.stats.kicksTogether
   const kicks = offsetOf(b.mix, 'kickOffset') - offsetOf(a.mix, 'kickOffset')
   const accents = offsetOf(b.mix, 'accentOffset') - offsetOf(a.mix, 'accentOffset')
   const shift = (kickWeight * kicks + accents) / (kickWeight + 1)

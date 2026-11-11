@@ -516,6 +516,9 @@ export function matchLevels(shape: PresetShape, beat: number, difference: number
  * - Keys that clash: the tonal content changes deck at the middle instead (see `midSwap`).
  * Needs B beatmatched; the planner loops bars of either song so neither runs into singing or a drop meanwhile.
  */
+/** A band EQ'd out in a blend: about -16 dB, under the -10 dB from which a deck's hats and snares are heard to flam. */
+const EQ_OUT = 0.15
+
 function blend(ctx: PresetContext): PresetShape {
   const bars = Math.max(1, ctx.bars)
   const length = bars * 4 * ctx.beat
@@ -577,7 +580,7 @@ function blend(ctx: PresetContext): PresetShape {
     : filterOut === 'eq' && middle > 0
       ? [
           [Math.max(0, middle - 4 * ctx.beat), 1],
-          [middle, 0.3],
+          [middle, EQ_OUT],
         ]
       : volume === 'fade'
         ? aBand
@@ -590,24 +593,25 @@ function blend(ctx: PresetContext): PresetShape {
     : volume === 'fade'
       ? bBand
       : []
-  // A's EQ worked down (gap for B): highs over the bars before the swap, mids in its last bar, the bass on it.
+  // A's EQ worked down (gap for B): highs over the bars before the swap, mids in its last bar, the bass on it. Down to
+  // EQ_OUT, below where its hats and snares would still be heard (and flam) under B's.
   const gap = filterOut === 'eq' && middle > 0
   const aHigh: Point[] = ctx.midSwap
     ? [
         [middle - beat, 1],
-        [middle, 0.4],
+        [middle, EQ_OUT],
       ]
     : gap
       ? [
           [Math.max(0, middle - 16 * ctx.beat), 1],
-          [Math.max(0, middle - 4 * ctx.beat), 0.3],
+          [Math.max(0, middle - 4 * ctx.beat), EQ_OUT],
         ]
       : volume === 'fade'
         ? aBand
         : []
   const bHigh: Point[] = ctx.midSwap
     ? [
-        [middle, 0.4],
+        [middle, EQ_OUT],
         [middle + beat, 1],
       ]
     : volume === 'fade'

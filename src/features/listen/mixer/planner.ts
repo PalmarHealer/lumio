@@ -273,7 +273,7 @@ interface Variant {
   filter: boolean
   midSwap: boolean
   /** Blend: volume shape, where the bass changes deck, the filters in on B and out on A (see the blend preset). */
-  volume?: 'overlap' | 'fade' | 'scurve'
+  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup'
   bassAt?: 'start' | 'middle' | 'none'
   filterIn?: 'hp' | 'lp' | null
   filterOut?: 'hp' | 'lp' | 'eq' | null
@@ -297,7 +297,7 @@ const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwa
  * 24 and 8; 4 bars and the seamless S-curve over 2 as the fallback. Which EQ and
  * filter it gets is chosen per placement (`blendFinishes`).
  */
-const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
+const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
   // B's event lands on A's boundary after `pre` bars of B under A; A plays on, thinned, for `post` bars to its next
   // section, where it leaves. Pop: 4-bar phrases, 8-bar blends; dance music: 8 + 8 or more.
   // Preferred in that order (the user: "you can really take more time"): 16 bars, then 32, then 8; 4 bars and the
@@ -312,6 +312,9 @@ const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve'; pre: number;
   { volume: 'overlap', pre: 0, post: 8, prior: -0.1, party: true, clean: true },
   { volume: 'overlap', pre: 0, post: 4, prior: -0.5, party: true, clean: true },
   { volume: 'scurve', pre: 1, post: 1, prior: -0.6, party: true, clean: true },
+  // The mashup: only where its conditions hold (see `mashupFits`), and then it's the one to have.
+  { volume: 'mashup', pre: 12, post: 4, prior: 0.15, party: true, clean: true },
+  { volume: 'mashup', pre: 28, post: 4, prior: 0.12, party: true, clean: true },
 ]
 
 /**
@@ -322,6 +325,7 @@ function blendFinishes(variant: Variant, clash: boolean): Variant[] {
   // The bass changes deck on the swap (A's boundary): 'start' when B's event opens the blend.
   const at: NonNullable<Variant['bassAt']> = (variant.pre ?? 0) === 0 ? 'start' : 'middle'
   if (variant.volume === 'scurve') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: clash }]
+  if (variant.volume === 'mashup') return clash ? [] : [{ ...variant, bassAt: 'middle', filterIn: 'lp', filterOut: 'hp', midSwap: false, prior: variant.prior + BEST_FINISH }]
   const finishes: Array<[NonNullable<Variant['bassAt']>, Variant['filterIn'], Variant['filterOut'], number]> = [
     // The user's Spotify favourites mostly take a filter out on A (high-pass), in on B as well, or a low-pass pair.
     [at, null, 'hp', 0.05],
@@ -947,6 +951,28 @@ function alignPhase(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
 function offsetOf(mix: TrackMix, field: 'kickOffset' | 'accentOffset') {
   const value: unknown = mix[field]
   return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 0.05 ? value : 0
+}
+
+/**
+ * Whether a mashup fits: keys the same or relative (harmonic score ≥ 0.9), the phrases meeting at the swap alike in
+ * harmony (chroma cosine ≥ 0.8), and exactly one deck singing in the overlap (its voice heard for 2 s or more, the
+ * other's for a quarter second at most) — one song's vocals over the other's instrumental part.
+ */
+function mashupFits(p: Placement, a: PreparedTrack, b: PreparedTrack, harmony: number) {
+  if (harmony < 0.9) return false
+  const { stats } = p
+  const swap = stats.shape.swap
+  if (cosine(a.chromaAt(positionA(p, swap)), b.chromaAt(positionB(p, swap) ?? p.laneB.start)) < 0.8) return false
+  let singsA = 0
+  let singsB = 0
+  for (let i = 0; i < stats.voiceA.length - 1; i++) {
+    const t = i * stats.dt
+    if (t < p.bStart || t > stats.shape.length) continue
+    const tb = positionB(p, t)
+    if (stats.voiceA[i] > VOICE_HEARD && spanAt(a.vocals, positionA(p, t))) singsA += stats.dt
+    if (tb !== null && stats.voiceB[i] > VOICE_HEARD && spanAt(b.vocals, tb)) singsB += stats.dt
+  }
+  return (singsA >= 2 && singsB <= 0.25) || (singsB >= 2 && singsA <= 0.25)
 }
 
 /** A song's accent spread (seconds); 0 when unknown. */
@@ -1686,6 +1712,8 @@ export function planTransition(
   /** The sampled checks of one placement: its score, or null when it breaks a rule. */
   const judge = (start: Placement): { placement: Placement; score: number } | null => {
     let placement = start
+    const isMashup = placement.variant.volume === 'mashup'
+    if (isMashup && !mashupFits(placement, a, b, harmony)) return null
     if (placement.beatmatched) {
       const aligned = alignPhase(placement, a, b, tempo.multiple)
       // Grids that disagree by more than a few tens of milliseconds where they meet aren't to be trusted with a beatmatch
@@ -1705,6 +1733,8 @@ export function planTransition(
       if (clarity < 0) return null
       let checked: Placement = shifted
       if (!Number.isNaN(clarity) && clarity < MIN_VERIFIABLE) {
+        // Both decks in full: nothing may be ducked.
+        if (isMashup) return null
         // A few risky bars: the deck they belong to has its accents ducked there, as a DJ would, so they aren't heard
         // over the other's; what's still heard on both must then pass.
         const ducked = duckRisky(shifted, a, b)
@@ -1745,7 +1775,8 @@ export function planTransition(
     let energyTerm = 0
     if (stats.shape.length > 0) {
       const energy = overlapEnergy(placement, a, b)
-      if (energy.over > (placement.variant.volume === 'overlap' ? MAX_OVER_DB_OVERLAP : MAX_OVER_DB) || energy.basses > 0) return null
+      const full = placement.variant.volume === 'overlap' || placement.variant.volume === 'mashup'
+      if (energy.over > (full ? MAX_OVER_DB_OVERLAP : MAX_OVER_DB) || energy.basses > 0) return null
       if (placement.variant.preset === 'blend') {
         energyTerm = 0.05 * Math.max(0, HOLE_DB - energy.mean)
         // Busy parts (mids and highs up) take a filter, thin ones blend open; long blends suit thin parts, the short

@@ -65,9 +65,11 @@ export interface PresetContext {
    * Blend: how the volumes run. 'overlap' (both decks at full volume the whole time, A out at the end of the last bar:
    * the usual DJ blend, loudness kept by choosing thin parts and by EQ and filters), 'fade' (B fades in over the first
    * half, the bands cross equal-power: the long party blend), 'scurve' (A out and B in on S-curves across a short
-   * blend: the seamless crossfade).
+   * blend: the seamless crossfade), 'mashup' (B in on an S-curve under an opening low-pass over the first fifth, then
+   * both at full volume, one singing over the other's instrumental; the bass hands over gradually on the swap, late,
+   * and A leaves under a rising high-pass over the last fifth).
    */
-  volume?: 'overlap' | 'fade' | 'scurve'
+  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup'
   /** Blend: where the bass changes deck (start, middle) or 'none' (one of the two parts has no bass of its own). */
   bassAt?: 'start' | 'middle' | 'none'
   /**
@@ -516,10 +518,59 @@ export function matchLevels(shape: PresetShape, beat: number, difference: number
  * - Keys that clash: the tonal content changes deck at the middle instead (see `midSwap`).
  * Needs B beatmatched; the planner loops bars of either song so neither runs into singing or a drop meanwhile.
  */
+/**
+ * The mashup (the user's "eher Mashup-Mixing"): B comes in on an S-curve under a low-pass opening over the first fifth,
+ * then both play at full volume (B's voice over A's instrumental part, or the other way round); A's low goes down over
+ * the 2 bars before the swap and B's comes up over the 2 bars after it (never two basslines); A leaves under a
+ * high-pass rising over the last fifth and is cut at the end.
+ */
+function mashup(ctx: PresetContext): PresetShape {
+  const bars = Math.max(4, ctx.bars)
+  const length = bars * 4 * ctx.beat
+  const swap = Math.min(length - 8 * ctx.beat, Math.max(8 * ctx.beat, (ctx.swapBar ?? Math.round(bars * 0.85)) * 4 * ctx.beat))
+  const edge = length / 5
+  const bGain: Point[] = []
+  for (let i = 0; i <= 8; i++) {
+    const x = i / 8
+    bGain.push([edge * x, x * x * (3 - 2 * x)])
+  }
+  return {
+    preset: 'blend',
+    length,
+    a: automation(length, {
+      gain: [[0, 1], ...stepAt(length, 1, 0)],
+      low: [
+        [swap - 8 * ctx.beat, 1],
+        [swap, 0],
+      ],
+      filter: [
+        [length - edge, 0],
+        [length, 0.6],
+      ],
+    }),
+    b: automation(length, {
+      gain: bGain,
+      low: [
+        [swap, 0],
+        [swap + 8 * ctx.beat, 1],
+      ],
+      filter: [
+        [0, -0.6],
+        [edge, 0],
+      ],
+    }),
+    effects: [],
+    anchorA: 0,
+    anchorB: 0,
+    swap,
+  }
+}
+
 /** A band EQ'd out in a blend: about -16 dB, under the -10 dB from which a deck's hats and snares are heard to flam. */
 const EQ_OUT = 0.15
 
 function blend(ctx: PresetContext): PresetShape {
+  if (ctx.volume === 'mashup') return mashup(ctx)
   const bars = Math.max(1, ctx.bars)
   const length = bars * 4 * ctx.beat
   // The swap: on the bar the planner lines up with A's section boundary (0 = the start).

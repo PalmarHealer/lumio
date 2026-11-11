@@ -54,11 +54,21 @@ export interface TrackMix {
    */
   phraseChroma: number[][]
   /**
-   * How far the kick drum's attack lags the beat grid (seconds, the song's median; the grid sits on the accents and
-   * broadband attacks). Aligning two songs by their grids leaves their kicks this much apart, so beatmatching aims at a
-   * compromise between the grids and the kicks. 0 when unknown.
+   * Seconds the song's kick attacks lie behind its beat grid (the grid follows the broadband and snare/clap attacks;
+   * a kick's low rise peaks later by a song-specific amount): the median over the 2-bar stretches with one clear kick
+   * attack. 0 when unknown (fewer than 4 such stretches) and in analyses made before it.
    */
   kickOffset: number
+  /**
+   * Seconds the song's snare/clap/hat attacks (1.5–5 kHz) lie behind its beat grid: the median over the 2-bar stretches
+   * with one clear accent attack. 0 when unknown (fewer than 4 such stretches) and in analyses made before it.
+   */
+  accentOffset: number
+  /**
+   * Where the off-beat 16ths fall, as a share of the beat between two 8ths (0.5 = straight, about 0.6–0.67 = swung): a
+   * swung and a straight groove can't both be loud without flamming. 0.5 when unknown and in analyses made before it.
+   */
+  swing: number
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean

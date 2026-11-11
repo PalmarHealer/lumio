@@ -31,7 +31,7 @@ import { MAJOR, MINOR, fft, pearson } from './sound-analysis.ts'
 // ---- the contract (an identical copy of src/features/listen/mixer/types.ts: the server can't import from src/) ----
 
 /** Raised when the analysis changes, so songs are analysed again. */
-export const MIX_VERSION = 2
+export const MIX_VERSION = 3
 
 export type SectionKind = 'intro' | 'verse' | 'chorus' | 'drop' | 'build' | 'break' | 'outro' | 'other'
 
@@ -450,6 +450,105 @@ function estimateTempo(envelope: Float64Array, frameRate: number): Tempo {
     if ([0.5, 1, 2].some((multiple) => Math.abs(ratio / multiple - 1) < 0.04)) agree++
   }
   return { period: global.period, strength: global.value, stability: agree / local.length }
+}
+
+/**
+ * The audible onsets at millisecond resolution, for putting the beats on them: the samples band-passed to 40–4000 Hz
+ * (Butterworth high- and low-pass sections, run forwards and backwards so nothing is delayed), their RMS per
+ * millisecond in log, averaged over 10 ms, and how much that rises from one millisecond to the next.
+ */
+function fineOnsets(samples: Float32Array, rate: number): { rise: Float32Array; step: number } {
+  const filtered = Float32Array.from(samples)
+  const pass = (kind: 'low' | 'high', frequency: number) => {
+    const w = (2 * Math.PI * frequency) / rate
+    const alpha = Math.sin(w) / (2 * Math.SQRT1_2)
+    const cos = Math.cos(w)
+    const a0 = 1 + alpha
+    const b0 = (kind === 'low' ? (1 - cos) / 2 : (1 + cos) / 2) / a0
+    const b1 = (kind === 'low' ? 1 - cos : -(1 + cos)) / a0
+    const b2 = b0
+    const a1 = (-2 * cos) / a0
+    const a2 = (1 - alpha) / a0
+    for (const backwards of [false, true]) {
+      let x1 = 0
+      let x2 = 0
+      let y1 = 0
+      let y2 = 0
+      for (let n = 0; n < filtered.length; n++) {
+        const i = backwards ? filtered.length - 1 - n : n
+        const x = filtered[i]!
+        const y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2 = x1
+        x1 = x
+        y2 = y1
+        y1 = y
+        filtered[i] = y
+      }
+    }
+  }
+  // Each pass twice: fourth-order slopes (eighth with the backward runs), as a broadband onset measure usually has.
+  pass('high', 40)
+  pass('high', 40)
+  if (rate / 2 > 4500) {
+    pass('low', 4000)
+    pass('low', 4000)
+  }
+  const hop = Math.max(1, Math.round(rate / 1000))
+  const count = Math.floor(filtered.length / hop)
+  const level = new Float64Array(count)
+  for (let k = 0; k < count; k++) {
+    let sum = 0
+    for (let i = k * hop; i < (k + 1) * hop; i++) sum += filtered[i]! * filtered[i]!
+    level[k] = Math.log(Math.sqrt(sum / hop) + 1e-7)
+  }
+  // The mean of the 10 ms around each millisecond (5 before, 4 after).
+  const averaged = new Float64Array(count)
+  for (let k = 0; k < count; k++) {
+    let sum = 0
+    for (let j = k - 5; j <= k + 4; j++) sum += j >= 0 && j < count ? level[j]! : 0
+    averaged[k] = sum / 10
+  }
+  const rise = new Float32Array(count)
+  for (let k = 1; k < count; k++) rise[k] = Math.max(0, averaged[k]! - averaged[k - 1]!)
+  return { rise, step: hop / rate }
+}
+
+/**
+ * Puts the beats on the audible onsets. The beat tracker's frames are 23 ms apart and its flux reacts to the whole
+ * spectrum; what a listener (and a beatmatch) hears is the broadband attack. Each beat's strongest attack within
+ * ±50 ms gives a correction; the corrections are smoothed with a median over two bars (8 beats), so a fill or an
+ * off-beat hi-hat can't pull single beats, and beats without a clear attack take their neighbours' correction.
+ */
+function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: number }): number[] {
+  const { rise, step } = onsets
+  const reach = Math.round(0.05 / step)
+  const found = beats.map((time) => {
+    const centre = Math.round(time / step)
+    let best = -1
+    let at = centre
+    for (let k = Math.max(0, centre - reach); k <= Math.min(rise.length - 1, centre + reach); k++) {
+      if (rise[k]! > best) {
+        best = rise[k]!
+        at = k
+      }
+    }
+    return { shift: (at - centre) * step, strength: best }
+  })
+  // A clear attack: at least half the typical one around it (four bars each side: quiet intros and outros count by
+  // their own measure, not the loud parts').
+  const strengths = found.map((entry) => entry.strength)
+  const shifts = found.map((entry, i) => {
+    const around = median(strengths.slice(Math.max(0, i - 16), i + 17))
+    return entry.strength > 0 && entry.strength >= 0.5 * around ? entry.shift : NaN
+  })
+  // Per two bars: the median correction. Where the attacks are diffuse (a pad, a wash) the median of their strongest
+  // moments still follows where the sound's energy rises, which is what another song's beat is heard against.
+  const known = shifts.filter((shift) => !Number.isNaN(shift))
+  const overall = known.length ? median(known) : 0
+  return beats.map((time, i) => {
+    const near = shifts.slice(Math.max(0, i - 4), i + 4).filter((shift) => !Number.isNaN(shift))
+    return time + (near.length >= 3 ? median(near) : overall)
+  })
 }
 
 /**
@@ -911,8 +1010,9 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const lowEnvelope = onsetEnvelope(spectra.lowFlux, frameRate)
   const tempo = estimateTempo(envelope, frameRate)
   const beatFrames = trackBeats(envelope, tempo.period)
-  // Between frames: the onset peak's top by parabolic interpolation (frames are 23 ms apart).
-  const beats = beatFrames.map((frame) => {
+  // Between frames: the onset peak's top by parabolic interpolation (frames are 23 ms apart); then onto the audible
+  // attacks.
+  const trackedBeats = beatFrames.map((frame) => {
     const left = envelope[frame - 1] ?? 0
     const centre = envelope[frame]!
     const right = envelope[frame + 1] ?? 0
@@ -920,6 +1020,11 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     const shift = centre >= left && centre >= right && curvature < 0 ? clamp((left - right) / (2 * curvature), -0.5, 0.5) : 0
     return spectra.time(frame + shift) + BEAT_DELAY
   })
+  // Twice: the second pass looks around the corrected beats (a large first correction leaves attacks at the window's
+  // edge out of the first look).
+  const onsets = fineOnsets(samples, rate)
+  // (Never more than 50 ms from where the tracker put them, in all.)
+  const beats = onAudibleOnsets(onAudibleOnsets(trackedBeats, onsets), onsets).map((time, i) => clamp(time, trackedBeats[i]! - 0.05, trackedBeats[i]! + 0.05))
   // The tempo the beats keep: a line through beat number and time (robust to a drifting or missed beat in between).
   let bpm = (60 * frameRate) / tempo.period
   if (beats.length >= 8) {

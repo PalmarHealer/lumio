@@ -15,9 +15,9 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  *   moment the deck is silent, else with a 5 ms crossfade. The two paths differ in phase, so while they mix the sum
  *   dips around the crossovers; a short crossfade keeps that brief (measured: about −10 dB for 2 ms near 200 Hz and
  *   2 kHz, where 30 ms gave up to −32 dB for 17 ms) and is still a ramp, not a jump.
- * - All decks meet in the master (`createMaster`): a lookahead limiter (AudioWorklet) with a −1 dBFS ceiling on
- *   estimated true peaks. Two loud tracks overlapping, or the coloured path, can exceed full scale; the limiter
- *   catches that instead of the output clipping. It only acts while a transition runs (`engage`): a single neutral
+ * - All decks meet in the master (`createMaster`): a lookahead limiter (AudioWorklet) at full scale (0 dBFS sample
+ *   peaks). Two loud tracks overlapping, or the coloured path, can exceed full scale; the limiter catches that instead
+ *   of the output clipping. It only acts while a transition runs (`engage`): a single neutral
  *   deck passes exactly as the plain player plays it, loud masters' own peaks included.
  *
  * - `brake` is the brake effect's fade, `gain` the transition's volume curve, `level` the player's own volume,
@@ -635,15 +635,20 @@ export function asPlayed(transition: Transition, aEnd?: number): Transition {
 
 // ---- the master: a lookahead limiter after all decks ----
 
-/** The limiter's ceiling (on estimated true peaks) and lookahead. */
-export const LIMITER_CEILING_DB = -1
+/**
+ * The limiter's ceiling (on sample peaks) and lookahead. At full scale, a loud master on its own never reaches it (its
+ * samples are at most full scale), so engaging the limiter changes nothing until two tracks really add up past it. A
+ * lower ceiling, or one on true peaks, would also turn down single masters that are mastered that hot (measured: at
+ * −0.1 dBFS, Don't You Worry Child and Animals alone were turned down on 84 % / 67 % of frames; at 0 dBTP true peak
+ * by up to 1.05 dB), which would be heard as a level step whenever a transition starts.
+ */
+export const LIMITER_CEILING_DB = 0
 const LIMITER_LOOKAHEAD_S = 0.005
 const LIMITER_RELEASE_S = 0.15
 
 /**
- * The limiter, run as an AudioWorklet. Per sample it estimates the peak (the sample itself and three cubic-interpolated
- * points between the samples before it: 4x oversampling, a cheap stand-in for true peak), asks for the gain that keeps
- * it under the ceiling, takes the minimum of that over the lookahead window and smooths it with a moving average as long as the
+ * The limiter, run as an AudioWorklet. Per sample it takes the louder channel's peak, asks for the gain that keeps it
+ * under the ceiling, takes the minimum of that over the lookahead window and smooths it with a moving average as long as the
  * window: the gain is down by the time a peak comes out of the delay line, never later, and ramps there instead of
  * jumping (no distortion). It recovers with a 150 ms release. Both channels share one gain (the stereo image stays).
  * The audio is delayed by the lookahead (`latency` in the node's options).
@@ -669,7 +674,6 @@ class LumioLimiter extends AudioWorkletProcessor {
     this.release = 1 - Math.exp(-1 / (o.release * sampleRate))
     this.report = o.report ? Math.round(sampleRate / 10) : 0
     this.lines = [new Float32Array(this.delay + 1), new Float32Array(this.delay + 1)]
-    this.history = [new Float32Array(4), new Float32Array(4)]
     this.write = 0
     this.minValues = new Float64Array(this.window + 1)
     this.minIndex = new Float64Array(this.window + 1)
@@ -685,6 +689,7 @@ class LumioLimiter extends AudioWorkletProcessor {
     this.n = 0
     this.frames = 0
     this.limited = 0
+    this.deep = 0
     this.minGain = 1
   }
   process(inputs, outputs, parameters) {
@@ -697,14 +702,7 @@ class LumioLimiter extends AudioWorkletProcessor {
       for (let c = 0; c < 2; c++) {
         const source = input[Math.min(c, input.length - 1)]
         const x = source ? source[i] : 0
-        const h = this.history[c]
-        h[0] = h[1]; h[1] = h[2]; h[2] = h[3]; h[3] = x
         peak = Math.max(peak, Math.abs(x))
-        // Between the samples before (4x oversampled, cubic): where a reconstructed wave peaks above its samples.
-        for (let f = 0.25; f < 1; f += 0.25) {
-          const v = h[1] + 0.5 * f * (h[2] - h[0] + f * (2 * h[0] - 5 * h[1] + 4 * h[2] - h[3] + f * (3 * (h[1] - h[2]) + h[3] - h[0])))
-          peak = Math.max(peak, Math.abs(v))
-        }
         this.lines[c][this.write] = x
       }
       const wanted = peak > this.ceiling ? this.ceiling / peak : 1
@@ -728,20 +726,22 @@ class LumioLimiter extends AudioWorkletProcessor {
       for (let c = 0; c < output.length; c++) output[c][i] = this.lines[Math.min(c, 1)][read] * applied
       this.write = read
       if (applied < 0.9999) this.limited++
+      if (applied < 0.944) this.deep++
       if (applied < this.minGain) this.minGain = applied
     }
     this.frames += length
-    if (this.report && this.frames % this.report < length) this.port.postMessage({ frames: this.frames, limited: this.limited, minGain: this.minGain })
+    if (this.report && this.frames % this.report < length) this.port.postMessage({ frames: this.frames, limited: this.limited, deep: this.deep, minGain: this.minGain })
     return true
   }
 }
 registerProcessor('lumio-limiter', LumioLimiter)
 `
 
-/** What the limiter did so far (when asked to report): frames seen, frames it turned down, its deepest gain. */
+/** What the limiter did so far (when asked to report): frames seen, frames turned down (at all, by over 0.5 dB), deepest gain. */
 export interface LimiterStats {
   frames: number
   limited: number
+  deep: number
   minGain: number
 }
 

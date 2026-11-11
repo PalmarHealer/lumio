@@ -11,7 +11,7 @@ import type { Transition } from './types'
  *
  * The rendered timeline: 0 is `preRoll` seconds before A's `aOut`; the transition starts at `preRoll` (B's `bIn`
  * starts there; with a negative `bIn` B's top starts `-bIn / rate` seconds later), A stops `length` seconds later, and the
- * render ends `postRoll` seconds after that. Both decks go through the player's master limiter (−1 dBFS); its lookahead
+ * render ends `postRoll` seconds after that. Both decks go through the player's master limiter (0 dBFS); its lookahead
  * delay is taken out again, so the timeline stays exact to the sample. As in the player the limiter only acts from just
  * before the transition until it is over (and its release has run out): the rolls before and after are the sources
  * as they are.

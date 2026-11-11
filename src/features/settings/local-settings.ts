@@ -100,8 +100,11 @@ export interface LocalSettings {
   apps: 'both' | 'watch' | 'listen'
   /** Highest music quality in kbps (above it the server converts to MP3); null = the original file where possible. */
   musicQuality: number | null
-  /** The same on mobile data; -1 = as on Wi-Fi. */
-  musicQualityCellular: number | null
+  /**
+   * The same on mobile data; -1 = as on Wi-Fi. Moderate by default (lossless over mobile data is slow and costly).
+   * Replaces `musicQualityCellular`, whose default was "as on Wi-Fi" (see parse).
+   */
+  musicQualityMobile: number | null
   /** Downloads (and preparing episodes) wait for Wi-Fi instead of using mobile data. */
   downloadsWifiOnly: boolean
   /** Quality downloads are kept in, in kbps; null = the original file. Changing it fetches every download again. */
@@ -223,7 +226,7 @@ export const DEFAULT_SETTINGS: LocalSettings = {
   syncPlay: DEFAULT_SYNCPLAY,
   apps: 'both',
   musicQuality: null,
-  musicQualityCellular: -1,
+  musicQualityMobile: 160,
   downloadsWifiOnly: true,
   musicDownloadQuality: null,
   musicPrefetch: 2,
@@ -243,8 +246,8 @@ export const DEFAULT_SETTINGS: LocalSettings = {
 export const SAME_AS_WIFI = -1
 
 /** The music quality to stream in now: the mobile-data one while on mobile data (if set). */
-export function streamingMusicQuality(settings: Pick<LocalSettings, 'musicQuality' | 'musicQualityCellular'>) {
-  return onCellular() && settings.musicQualityCellular !== SAME_AS_WIFI ? settings.musicQualityCellular : settings.musicQuality
+export function streamingMusicQuality(settings: Pick<LocalSettings, 'musicQuality' | 'musicQualityMobile'>) {
+  return onCellular() && settings.musicQualityMobile !== SAME_AS_WIFI ? settings.musicQualityMobile : settings.musicQuality
 }
 
 /** The video bitrate limit now: the mobile-data one while on mobile data (if set). */
@@ -272,10 +275,15 @@ function readRaw(userId: string): string | null {
 function parse(raw: string | null): LocalSettings {
   if (!raw) return DEFAULT_SETTINGS
   try {
-    const stored = JSON.parse(raw) as Partial<LocalSettings>
+    const stored = JSON.parse(raw) as Partial<LocalSettings> & { musicQualityCellular?: number | null }
+    // The old mobile-data quality carries over when it was chosen; its untouched default ("as on Wi-Fi") gives way to
+    // the new moderate one.
+    const legacyMobile = stored.musicQualityCellular
+    const mobile = stored.musicQualityMobile === undefined && legacyMobile !== undefined && legacyMobile !== SAME_AS_WIFI ? { musicQualityMobile: legacyMobile } : {}
     return {
       ...DEFAULT_SETTINGS,
       ...stored,
+      ...mobile,
       segmentActions: { ...DEFAULT_SETTINGS.segmentActions, ...stored.segmentActions },
       syncPlay: { ...DEFAULT_SYNCPLAY, ...stored.syncPlay },
     }

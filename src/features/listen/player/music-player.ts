@@ -12,7 +12,7 @@ import { podcastProgress, recordPodcastProgress } from '../podcasts'
 import { reportActivity } from '@/features/social/social'
 import { flushPlayback, rememberPlayback } from '@/lib/playback-outbox'
 import { recordRecent } from '../recent'
-import { adoptIntoCache, audioCacheAvailable, cachedAudioUrl, cachedKey, prefetchAudio, recordCachedPlay } from './audio-cache'
+import { adoptIntoCache, audioCacheAvailable, cachedAudioUrl, cachedKey, cancelPrefetches, prefetchAudio, prefetchDone, prefetchProgress, recordCachedPlay } from './audio-cache'
 import { isOffline, onCellular } from '@/lib/network'
 import { inJellyfinApp, setAppPlaybackManager, updateAppMediaSession } from '@/lib/native-app'
 import { inCapacitor } from '@/lib/capacitor'
@@ -470,6 +470,8 @@ if (audio) {
     const item = currentTrack()
     if (item && connection && !audio.src.startsWith('blob:') && streamRetries < STREAM_RETRIES) {
       streamRetries++
+      // The connection is this song's alone while it recovers.
+      cancelPrefetches()
       const at = audio.currentTime || time.position
       setState({ buffering: true })
       window.setTimeout(() => {
@@ -588,6 +590,17 @@ async function go(index: number, startAt?: number, reason: StartReason = 'clickr
   // a connection), else streamed.
   const downloaded = await downloadedAudioUrl(downloadId(item, externalOf(item)?.guid))
   const wanted = downloaded ? null : cacheKey(item)
+  // The song starting gets the connection: downloads of other songs into the cache stop (they go on once it is
+  // loaded, see cacheAhead). One of this very song that is well on its way is waited for rather than loading the song
+  // a second time beside it.
+  aheadRound++
+  const progress = wanted ? prefetchProgress(wanted) : null
+  const waitFor = wanted && progress !== null && progress >= PREFETCH_WAIT_FROM ? wanted : null
+  cancelPrefetches(waitFor)
+  if (waitFor) {
+    await prefetchDone(waitFor)
+    if (currentTrack() !== item) return
+  }
   // On mobile data (or offline) a copy cached in another quality plays rather than streaming the song again.
   const key = wanted ? cachedKey(wanted, onCellular() || isOffline()) : null
   const cached = key ? await cachedAudioUrl(key) : null
@@ -696,28 +709,29 @@ function cacheKey(item: BaseItemDto) {
 /** Bumped on every track change, so a running round of downloads stops when the queue moved on. */
 let aheadRound = 0
 
+/** A download of the song about to start that is this far is waited for instead of streaming the song beside it. */
+const PREFETCH_WAIT_FROM = 0.5
+
 /**
- * While a song plays, the next ones (as many as set) are downloaded into the cache one after another, then the song
- * playing itself, so a song heard again comes from the cache. Off when "ahead" is set to none.
+ * Once the song playing is fully loaded (it always goes first), the next ones (as many as set; one on mobile data)
+ * are downloaded into the cache one after another, so they start from the cache: no song is loaded twice. Off when
+ * "ahead" is set to none.
  */
 async function cacheAhead() {
   if (!connection || !audioCacheAvailable) return
   const settings = readLocalSettings(connection.userId)
   if (!settings.musicPrefetch) return
-  const round = ++aheadRound
+  const round = aheadRound
   const limits = { maxBytes: settings.musicCacheMb * 1024 * 1024, keepOftenPlayed: settings.musicKeepOften }
-  // On mobile data the connection is shared with the song playing: the next one only once this one is fully loaded,
-  // just one ahead, and the playing song isn't fetched a second time (that doubled the data and starved the stream).
+  if (!(await fullyBuffered(round))) return
   const cellular = onCellular()
-  if (cellular && !(await fullyBuffered(round))) return
   const upcoming = state.queue.slice(state.index + 1, state.index + 1 + (cellular ? 1 : settings.musicPrefetch))
-  const playing = cellular ? undefined : currentTrack()
-  for (const item of [...upcoming, ...(playing ? [playing] : [])]) {
+  for (const item of upcoming) {
     if (round !== aheadRound || !connection) return
     const key = cacheKey(item)
     // Downloaded songs need no copy in the cache, nor do songs cached already (in any quality on mobile data).
-    if (!key || isDownloaded(item.Id) || (cellular && cachedKey(key, true))) continue
-    await prefetchAudio(key, streamUrl(item, crypto.randomUUID()), limits, item === playing ? 1 : 0)
+    if (!key || isDownloaded(item.Id) || cachedKey(key, cellular)) continue
+    await prefetchAudio(key, streamUrl(item, crypto.randomUUID()), limits)
   }
 }
 

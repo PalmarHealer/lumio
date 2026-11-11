@@ -407,6 +407,9 @@ interface ShapeStats {
    */
   loudA: Uint8Array
   loudB: Uint8Array
+  /** Per sample and band: what of each deck comes through (gain × the band's EQ × the filter's pass). */
+  passA: BandSamples
+  passB: BandSamples
   tonal: number
   basses: number
   /**
@@ -416,15 +419,14 @@ interface ShapeStats {
   tonalBoth: number
 }
 
+interface BandSamples {
+  low: Float32Array
+  mid: Float32Array
+  high: Float32Array
+}
+
 const filterDamp = (f: number) => (Math.abs(f) <= 0.4 ? 1 : 1 - ((Math.abs(f) - 0.4) / 0.6) * 0.7)
 const bassThrough = (f: number) => (f > 0.5 ? 0.3 : 1)
-
-/**
- * How loud a voice on a deck comes through: gain x the louder of the mid band (its body) and the high band (its air
- * and consonants, which carry a voice on their own), damped by a closed filter.
- */
-const voiceLevel = (automation: DeckAutomation, t: number, gain: number, filter: number) =>
-  gain * Math.max(valueAt(automation.mid, t, 1), valueAt(automation.high, t, 1)) * filterDamp(filter)
 
 /** How a filter knob passes each band: a high-pass takes the lows first, then the mids; a low-pass the highs first. */
 function filterBands(f: number) {
@@ -433,19 +435,23 @@ function filterBands(f: number) {
   return { low: 1, mid: clamp01(1 - Math.max(0, -f - 0.4) / 0.4), high: clamp01(1 + f / 0.4) }
 }
 
-/** How much of a deck's tonal content (chords, melody, voice) comes through: gain × max(mid, half the high), filtered. */
-const tonalLevel = (automation: DeckAutomation, t: number, gain: number, filter: number) => {
-  const pass = filterBands(filter)
-  return gain * Math.max(valueAt(automation.mid, t, 1) * pass.mid, 0.5 * valueAt(automation.high, t, 1) * pass.high)
-}
-
 /**
- * A deck's beats are loud: any band that carries them up to half (kick in the lows, snare in the mids, hats in the
- * highs: each can flam on its own), no filter past half.
+ * An automation curve read at growing times (as valueAt: linear between keyframes, held outside, `fallback` when empty),
+ * keeping its place instead of searching each time.
  */
-const beatsLoud = (automation: DeckAutomation, t: number, gain: number, filter: number) =>
-  Math.abs(filter) <= 0.5 &&
-  gain * Math.max(valueAt(automation.low, t, 1), Math.max(valueAt(automation.mid, t, 1), valueAt(automation.high, t, 1)) * filterDamp(filter)) >= 0.5
+function walker(curve: readonly Keyframe[], fallback: number) {
+  let k = 0
+  return (t: number) => {
+    if (curve.length === 0) return fallback
+    if (t <= curve[0].t) return curve[0].v
+    const last = curve[curve.length - 1]
+    if (t >= last.t) return last.v
+    while (k + 1 < curve.length && curve[k + 1].t <= t) k++
+    const p = curve[k]
+    const q = curve[k + 1]
+    return q.t > p.t ? p.v + ((q.v - p.v) * (t - p.t)) / (q.t - p.t) : q.v
+  }
+}
 
 export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number) {
   const steps = length > 0 ? Math.min(800, Math.max(2, Math.ceil(length / 0.04))) : 0
@@ -456,6 +462,9 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
   const gainB = new Float32Array(steps + 1)
   const loudA = new Uint8Array(steps + 1)
   const loudB = new Uint8Array(steps + 1)
+  const bandSamples = (): BandSamples => ({ low: new Float32Array(steps + 1), mid: new Float32Array(steps + 1), high: new Float32Array(steps + 1) })
+  const passA = bandSamples()
+  const passB = bandSamples()
   let aGone = 0
   let bHere = -1
   let bVoice = -1
@@ -467,18 +476,48 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
   let basses = 0
   let loudBoth = 0
   let kicksBoth = 0
+  // Every curve read once per sample, walking forward (the samples' times only grow).
+  const curves = (d: DeckAutomation) => ({
+    gain: walker(d.gain, 1),
+    low: walker(d.low, 1),
+    mid: walker(d.mid, 1),
+    high: walker(d.high, 1),
+    filter: walker(d.filter, 0),
+  })
+  const ca = curves(a)
+  const cb = curves(b)
   for (let i = 0; i <= steps; i++) {
     const t = i * dt
-    const ga = valueAt(a.gain, t, 1)
-    const gb = valueAt(b.gain, t, 1)
-    const fa = valueAt(a.filter, t, 0)
-    const fb = valueAt(b.filter, t, 0)
-    voiceA[i] = voiceLevel(a, t, ga, fa)
-    voiceB[i] = voiceLevel(b, t, gb, fb)
+    const ga = ca.gain(t)
+    const gb = cb.gain(t)
+    const fa = ca.filter(t)
+    const fb = cb.filter(t)
+    const la = ca.low(t)
+    const lb = cb.low(t)
+    const ma = ca.mid(t)
+    const mb = cb.mid(t)
+    const ha = ca.high(t)
+    const hb = cb.high(t)
+    const da = filterDamp(fa)
+    const db = filterDamp(fb)
+    const pa = filterBands(fa)
+    const pb = filterBands(fb)
+    // A voice comes through as gain × the louder of the mid band (its body) and the high band (its air and consonants,
+    // which carry a voice on their own), damped by a closed filter. A deck's beats are loud where any band that carries
+    // them is up to half (kick in the lows, snare in the mids, hats in the highs: each can flam on its own) and no
+    // filter is past half.
+    voiceA[i] = ga * Math.max(ma, ha) * da
+    voiceB[i] = gb * Math.max(mb, hb) * db
     gainA[i] = ga
     gainB[i] = gb
-    loudA[i] = beatsLoud(a, t, ga, fa) ? 1 : 0
-    loudB[i] = beatsLoud(b, t, gb, fb) ? 1 : 0
+    loudA[i] = Math.abs(fa) <= 0.5 && ga * Math.max(la, Math.max(ma, ha) * da) >= 0.5 ? 1 : 0
+    loudB[i] = Math.abs(fb) <= 0.5 && gb * Math.max(lb, Math.max(mb, hb) * db) >= 0.5 ? 1 : 0
+    passA.low[i] = ga * la * pa.low
+    passA.mid[i] = ga * ma * pa.mid
+    passA.high[i] = ga * ha * pa.high
+    passB.low[i] = gb * lb * pb.low
+    passB.mid[i] = gb * mb * pb.mid
+    passB.high[i] = gb * hb * pb.high
     if (ga > 0.05) aGone = t + dt
     if (gb > 0.05 && bHere < 0) bHere = t
     if (voiceB[i] > VOICE_HEARD && bVoice < 0) bVoice = t
@@ -488,12 +527,15 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
         if (togetherFrom < 0) togetherFrom = t
         togetherTo = t + dt
       }
-      if (ga * valueAt(a.mid, t, 1) * filterDamp(fa) > VOICE_HEARD && gb * valueAt(b.mid, t, 1) * filterDamp(fb) > VOICE_HEARD) tonal += dt
-      if (ga * valueAt(a.low, t, 1) * bassThrough(fa) > 0.5 && gb * valueAt(b.low, t, 1) * bassThrough(fb) > 0.5) basses += dt
-      if (tonalLevel(a, t, ga, fa) > 0.3 && tonalLevel(b, t, gb, fb) > 0.3) tonalBoth += dt
+      if (ga * ma * da > VOICE_HEARD && gb * mb * db > VOICE_HEARD) tonal += dt
+      const bassA = ga * la * bassThrough(fa)
+      const bassB = gb * lb * bassThrough(fb)
+      if (bassA > 0.5 && bassB > 0.5) basses += dt
+      // Tonal content: gain × max(mid, half the high), filtered (as tonalLevel).
+      if (ga * Math.max(ma * pa.mid, 0.5 * ha * pa.high) > 0.3 && gb * Math.max(mb * pb.mid, 0.5 * hb * pb.high) > 0.3) tonalBoth += dt
       if (loudA[i] && loudB[i]) {
         loudBoth++
-        if (ga * valueAt(a.low, t, 1) * bassThrough(fa) >= 0.5 && gb * valueAt(b.low, t, 1) * bassThrough(fb) >= 0.5) kicksBoth++
+        if (bassA >= 0.5 && bassB >= 0.5) kicksBoth++
       }
     }
   }
@@ -505,6 +547,8 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
     gainB,
     loudA,
     loudB,
+    passA,
+    passB,
     aGone: Math.min(aGone, length),
     bHere: Math.max(0, bHere < 0 ? length : bHere),
     bVoice: Math.max(0, bVoice < 0 ? length : bVoice),
@@ -632,6 +676,16 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   let basses = 0
   let busy = 0
   if (length <= 0 || dt <= 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0 }
+  const { passA, passB } = stats
+  // Two basslines, at every sample (the moments around a swap matter): checked first, it rejects.
+  for (let i = 0; i < stats.gainA.length; i++) {
+    const t = i * dt
+    if (t < p.bStart || t > length || passA.low[i] * 1.5 <= 0.5 || passB.low[i] * 1.5 <= 0.5) continue
+    const atB = positionB(p, t)
+    if (atB === null) continue
+    if (passA.low[i] * a.bandsAt(positionA(p, t)).low > 0.5 && passB.low[i] * b.bandsAt(atB).low > 0.5) basses += dt
+  }
+  if (basses > 0) return { over: -Infinity, mean: 0, basses, busy: 0 }
   const step = Math.max(1, Math.round(0.1 / dt))
   for (let i = 0; i < stats.gainA.length; i += step) {
     const t = i * dt
@@ -640,15 +694,11 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     if (atB === null) continue
     const eA = a.bandsAt(positionA(p, t))
     const eB = b.bandsAt(atB)
-    const fA = filterBands(valueAt(shape.a.filter, t, 0))
-    const fB = filterBands(valueAt(shape.b.filter, t, 0))
-    const gA = stats.gainA[i]
-    const gB = stats.gainB[i]
     let worst = -Infinity
     let sum = 0
     for (const band of ['low', 'mid', 'high'] as const) {
-      const pa = gA * valueAt(shape.a[band], t, 1) * fA[band] * eA[band] * a.level
-      const pb = gB * valueAt(shape.b[band], t, 1) * fB[band] * eB[band] * b.level
+      const pa = passA[band][i] * eA[band] * a.level
+      const pb = passB[band][i] * eB[band] * b.level
       // Against the louder of the songs' loud level and what either deck plays on its own (a song's own peaks are fine).
       const power = (pa * pa + pb * pb) / Math.max(reference, pa * pa, pb * pb)
       worst = Math.max(worst, 10 * Math.log10(Math.max(power, 1e-9)))
@@ -658,16 +708,6 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     total += sum / 3
     samples++
     busy += Math.min(1, (eA.mid + eA.high + eB.mid + eB.high) / 4)
-  }
-  // Two basslines, at every sample (the moments around a swap matter).
-  for (let i = 0; i < stats.gainA.length; i++) {
-    const t = i * dt
-    if (t < p.bStart || t > length) continue
-    const atB = positionB(p, t)
-    if (atB === null) continue
-    const bassA = stats.gainA[i] * valueAt(shape.a.low, t, 1) * filterBands(valueAt(shape.a.filter, t, 0)).low * a.bandsAt(positionA(p, t)).low
-    const bassB = stats.gainB[i] * valueAt(shape.b.low, t, 1) * filterBands(valueAt(shape.b.filter, t, 0)).low * b.bandsAt(atB).low
-    if (bassA > 0.5 && bassB > 0.5) basses += dt
   }
   if (samples === 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0 }
   over.sort((x, y) => x - y)
@@ -1466,15 +1506,11 @@ export function planTransition(
     if (best && placement.bound <= best.score) break
     // Clean style never skips a sung line: such a placement is out.
     if (!party && placement.sung > 0.5) continue
-    const tries =
-      placement.variant.preset === 'blend'
-        ? blendFinishes(placement.variant, clash).map((variant) => {
-            const stats = shapeFor(variant, placement.stats.beat)
-            return { ...placement, variant, stats }
-          })
-        : [placement]
-    for (const candidate of tries) {
-      if (best && placement.bound + candidate.variant.prior - placement.variant.prior - BEST_FINISH <= best.score) continue
+    // A blend's finishes, each sampled only when it could still beat the best.
+    const tries = placement.variant.preset === 'blend' ? blendFinishes(placement.variant, clash) : [placement.variant]
+    for (const variant of tries) {
+      if (best && placement.bound + variant.prior - placement.variant.prior - BEST_FINISH <= best.score) continue
+      const candidate = variant === placement.variant ? placement : { ...placement, variant, stats: shapeFor(variant, placement.stats.beat) }
       if (candidate.stats.basses > 0.001 && candidate.variant.bassAt !== 'none') continue
       const judged = judge(candidate)
       if (judged && (!best || judged.score > best.score)) best = judged

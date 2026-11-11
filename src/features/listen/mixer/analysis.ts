@@ -168,8 +168,18 @@ function durationOf(mix: TrackMix): number {
 }
 
 /** Cleans an analysis; null when not even the song's length can be told. */
+/** Prepared tracks by analysis object: "sort & build" plans each song twice (as A and as B). */
+const prepared = new WeakMap<object, PreparedTrack | null>()
+
 export function prepareTrack(mix: TrackMix | null | undefined): PreparedTrack | null {
   if (!mix || typeof mix !== 'object') return null
+  if (prepared.has(mix)) return prepared.get(mix)!
+  const track = prepareUncached(mix)
+  prepared.set(mix, track)
+  return track
+}
+
+function prepareUncached(mix: TrackMix): PreparedTrack | null {
   const duration = durationOf(mix)
   if (!finite(duration) || duration <= 0) return null
 

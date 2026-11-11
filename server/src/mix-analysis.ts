@@ -1449,7 +1449,17 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   // isn't used: a bass line moving in the same band makes it ambiguous in most pop.)
   const unambiguous = (profile: { prominence: number; shift: number; rival: number }) => profile.prominence >= 0.6 && Math.abs(profile.shift) <= 0.012 && profile.rival < 0.75
   const accentClear = beatProfiles(beats, accents, 0.08).map(unambiguous)
-  const beatClear = beatProfiles(beats, onsets, 0.08).map((profile, i) => unambiguous(profile) || accentClear[i]!)
+  // How late the kick attacks lie behind the grid (the grid follows the broadband and accent attacks; a kick's low
+  // rise peaks later by a song-specific amount): per 2 bars, the kick band's averaged attack where it has one clear
+  // peak; the median over those, 0 with fewer than 4 of them.
+  const kickBeats = beatProfiles(beats, fineOnsets(samples, rate, 40, 150), 0.08)
+  const kickProfiles = kickBeats.filter((profile, i) => i % 8 === 4 && profile.prominence >= 0.6 && profile.rival < 0.75)
+  const kickOffset = kickProfiles.length >= 4 ? round(median(kickProfiles.map((profile) => profile.shift)), 3) : 0
+  // A beat whose kick plays off the grid (a syncopated or doubled kick: its averaged attack stands out but not within
+  // 25 ms of where the song's kicks usually sit) isn't clear either: two songs' kicks would flam there although their
+  // claps and hats line up.
+  const kickAgrees = kickBeats.map((profile) => profile.prominence < 0.6 || Math.abs(profile.shift - kickOffset) <= 0.025)
+  const beatClear = beatProfiles(beats, onsets, 0.08).map((profile, i) => (unambiguous(profile) || accentClear[i]!) && kickAgrees[i]!)
   const phraseClarity = phrases.map((start, p) => {
     const end = phraseEnd(p)
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
@@ -1458,8 +1468,6 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   // How late the kick attacks lie behind the grid (the grid follows the broadband and accent attacks; a kick's low
   // rise peaks later by a song-specific amount): per 2 bars, the kick band's averaged attack (see beatProfiles) where it
   // has one clear peak; the median over those, 0 with fewer than 4 of them.
-  const kickProfiles = beatProfiles(beats, fineOnsets(samples, rate, 40, 150), 0.08).filter((profile, i) => i % 8 === 4 && profile.prominence >= 0.6 && profile.rival < 0.75)
-  const kickOffset = kickProfiles.length >= 4 ? round(median(kickProfiles.map((profile) => profile.shift)), 3) : 0
   const barClarity = downbeats.map((start, b) => {
     const end = downbeats[b + 1] ?? duration
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))

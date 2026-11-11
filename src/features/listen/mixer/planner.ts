@@ -465,6 +465,51 @@ function phaseError(stats: ShapeStats, a: PreparedTrack, b: PreparedTrack, aOut:
   return { median: offsets[offsets.length >> 1], p90: offsets[Math.floor(offsets.length * 0.9)], checked: offsets.length / heard, worstWindow }
 }
 
+/**
+ * Puts B's beats exactly on A's: the signed offsets of B's beats from A's nearest ones, where both decks are heard, are
+ * fitted with a line over the overlap (least squares). Its slope is a tempo left over (the rate is corrected by it, at
+ * most 0.5 %), its level a constant lag (bIn moves by it). A grid fitted per song can still sit a few milliseconds
+ * apart over the stretch both play; this takes the two grids together.
+ */
+function alignPhase(stats: ShapeStats, a: PreparedTrack, b: PreparedTrack, aOut: number, bIn: number, rate: number, multiple: number) {
+  const { dt } = stats
+  const length = stats.shape.length
+  let fitIn = bIn
+  let fitRate = rate
+  for (let round = 0; round < 2 && dt > 0; round++) {
+    const ts: number[] = []
+    const offsets: number[] = []
+    for (let k = Math.max(0, floorIndex(b.beats, Math.max(0, fitIn)) + 1); k < b.beats.length && b.beats[k] <= fitIn + length * fitRate; k++) {
+      const t = (b.beats[k] - fitIn) / fitRate
+      const i = Math.round(t / dt)
+      if (i < 0 || i >= stats.gainA.length || stats.gainA[i] < 0.2 || stats.gainB[i] < 0.2) continue
+      const ta = aOut + t
+      let signed = ta - nearest(a.beats, ta)
+      if (multiple === 0.5 && Math.abs(signed) > stats.beat / 4) signed -= Math.sign(signed) * (stats.beat / 2)
+      if (Math.abs(signed) >= stats.beat * 0.3) continue
+      ts.push(t)
+      offsets.push(signed)
+    }
+    if (ts.length < 4) break
+    const meanT = ts.reduce((sum, t) => sum + t, 0) / ts.length
+    const meanO = offsets.reduce((sum, o) => sum + o, 0) / offsets.length
+    let num = 0
+    let den = 0
+    for (let i = 0; i < ts.length; i++) {
+      num += (ts[i] - meanT) * (offsets[i] - meanO)
+      den += (ts[i] - meanT) ** 2
+    }
+    const slope = den > 0 ? num / den : 0
+    // B late by o at transition time t: B's audio must be o earlier there. A slope s stretches B's time by (1 − s).
+    const nextRate = Math.abs(slope) < 0.005 ? fitRate / (1 - slope) : fitRate
+    // The constant part, read at the start of the overlap after the slope is gone: o(0) = meanO − slope · meanT.
+    const level = nextRate === fitRate ? meanO : meanO - slope * meanT
+    fitIn = fitIn + level * nextRate
+    fitRate = nextRate
+  }
+  return { bIn: fitIn, rate: fitRate }
+}
+
 interface Placement {
   stats: ShapeStats
   variant: Variant
@@ -799,6 +844,13 @@ export function planTransition(
     if (best && placement.bound <= best.score) break
     // Clean style never skips a sung line: such a placement is out.
     if (!party && placement.sung > 0.5) continue
+    if (placement.beatmatched) {
+      const aligned = alignPhase(placement.stats, a, b, placement.aOut, placement.bIn, placement.rate, tempo.multiple)
+      if (aligned.bIn >= MIN_B_IN && Math.abs(aligned.rate - 1) <= MAX_TEMPO_DIFF && aligned.bIn + placement.stats.shape.length * aligned.rate <= b.duration - 2) {
+        placement.bIn = aligned.bIn
+        placement.rate = aligned.rate
+      }
+    }
     const { clash, lostA, lostB } = vocalCost(placement.stats, a, b, placement.aOut, placement.bIn, placement.rate)
     if (clash > 0.1) continue
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the

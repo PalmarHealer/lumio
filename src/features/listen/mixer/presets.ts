@@ -12,6 +12,9 @@ import type { DeckAutomation, Keyframe, PresetId, TransitionEffect } from './typ
  *   swap in the shapes meant for long overlaps: A's mids and highs leave in the beat before it, B's mids arrive in the
  *   beat after (B's highs come in early: hi-hats under A, which is fine as long as B isn't singing yet). Whether the voices really keep apart depends
  *   on where the planner puts the swap; it checks that against both songs' vocals.
+ * - Constant power: in every band the two decks' summed power (gain × band, squared) stays at about one deck's, so a
+ *   transition is never louder than the songs around it. Highs and mids cross over equal-power (both near 0.7 while
+ *   both are up), the lows swap in one step.
  * - At `length` A is silent (gain 0) and B is neutral (gain 1, bands 1, filter open), so nothing jumps when the
  *   transition ends. Shapes without overlap (hard cut, drop swap without pre-roll, none) have length 0 and no
  *   keyframes; the engine declicks the cut.
@@ -118,6 +121,23 @@ function powerFade(t0: number, t1: number, out: boolean, steps = 8): Point[] {
   return points
 }
 
+/**
+ * Equal-power pair over [t0, t1]: the angle θ moves from `from` to `to` (radians, 0 = all A, π/2 = all B) and A gets
+ * cos θ, B sin θ, so the two decks' power in the band always adds up to one deck's.
+ */
+function powerPair(t0: number, t1: number, from: number, to: number, steps = 6): { a: Point[]; b: Point[] } {
+  const a: Point[] = []
+  const b: Point[] = []
+  for (let i = 0; i <= steps; i++) {
+    const x = i / steps
+    const angle = from + (to - from) * x
+    const t = t0 + (t1 - t0) * x
+    a.push([t, Math.cos(angle)])
+    b.push([t, Math.sin(angle)])
+  }
+  return { a, b }
+}
+
 /** A step from `from` to `to` landing exactly at `t`. */
 const stepAt = (t: number, from: number, to: number): Point[] => [
   [t - RAMP, from],
@@ -195,7 +215,10 @@ function bassSwap(ctx: PresetContext): PresetShape {
   const length = freeLength(ctx)
   const beat = Math.min(ctx.beat, length / 8)
   const swap = ctx.synced ? swapTime(ctx, length, length / (8 * ctx.beat)) : length / 2
-  const inEnd = Math.max(beat, swap / 2)
+  const inEnd = Math.max(beat, Math.min(swap / 2, swap - beat))
+  // Highs: B's hi-hats come in to half power (A's go down to it) over the first half, the rest of the way at the swap.
+  const early = powerPair(0, inEnd, 0, Math.PI / 4)
+  const late = powerPair(Math.max(inEnd, swap - beat), swap, Math.PI / 4, Math.PI / 2, 3)
   return {
     preset: 'bassSwap',
     length,
@@ -207,22 +230,16 @@ function bassSwap(ctx: PresetContext): PresetShape {
         [swap, 0.2],
       ],
       // A voice lives in the highs too (its air and consonants): they leave with the mids.
-      high: [
-        [swap - beat, 1],
-        [swap, 0.2],
-      ],
+      high: [...early.a, ...late.a],
     }),
     b: automation(length, {
-      gain: powerFade(0, inEnd, false),
+      gain: powerFade(0, beat, false, 4),
       low: [[0, 0], ...stepFrom(swap, 0, 1)],
       mid: [
         [swap, 0.15],
         [swap + beat, 1],
       ],
-      high: [
-        [0, 0.5],
-        [inEnd, 1],
-      ],
+      high: [...early.b, ...late.b],
     }),
     effects: [],
     anchorA: 0,
@@ -242,6 +259,12 @@ function filterBuild(ctx: PresetContext): PresetShape {
   const swap = ctx.synced ? swapTime(ctx, sweep, Math.round(sweep / bar) - 1) : sweep
   const length = ctx.synced ? Math.max(swap + Math.min(bar, sweep - swap), swap + ctx.beat) : swap + ctx.beat
   const beat = Math.min(ctx.beat, swap / 2 || ctx.beat)
+  // Highs cross equal-power as in the bass swap: B's halfway in over the first three quarters, the rest at the swap.
+  const inEnd = Math.max(beat, Math.min(swap * 0.75, swap - beat))
+  const highs = {
+    early: powerPair(0, inEnd, 0, Math.PI / 4),
+    late: powerPair(Math.max(inEnd, swap - beat), swap, Math.PI / 4, Math.PI / 2, 3),
+  }
   return {
     preset: 'filterBuild',
     length,
@@ -257,23 +280,20 @@ function filterBuild(ctx: PresetContext): PresetShape {
         [swap - beat, 1],
         [swap, 0.2],
       ],
-      high: [
+      high: ctx.synced ? [...highs.early.a, ...highs.late.a] : [
         [swap - beat, 1],
         [swap, 0.2],
       ],
     }),
     b: ctx.synced
       ? automation(length, {
-          gain: powerFade(0, Math.max(beat, swap * 0.75), false),
+          gain: powerFade(0, beat, false, 4),
           low: [[0, 0], ...stepFrom(swap, 0, 1)],
           mid: [
             [swap, 0.15],
             [swap + beat, 1],
           ],
-          high: [
-            [0, 0.6],
-            [swap, 1],
-          ],
+          high: [...highs.early.b, ...highs.late.b],
         })
       : automation(length, { gain: [[0, 0], ...stepFrom(swap, 0, 1)], low: [[0, 0], ...stepFrom(swap, 0, 1)] }),
     effects: [],
@@ -370,6 +390,8 @@ function dropSwap(ctx: PresetContext): PresetShape {
       ],
       low: [...stepAt(length, 0, 1)],
       mid: [...stepAt(length, 0.25, 1)],
+      // Under A at full, B's build stays below half power in the highs too.
+      high: [...stepAt(length, 0.6, 1)],
     }),
     effects: [],
     anchorA: length,
@@ -391,6 +413,40 @@ function brake(ctx: PresetContext): PresetShape {
     anchorB: meet,
     swap: meet,
   }
+}
+
+/**
+ * Matches both songs' levels during the overlap: the louder deck is brought down by the difference of their loudness
+ * (dB, A − B, at most 6 dB). A, when louder, eases down over the first bar and leaves at that level; B, when louder,
+ * plays lower until the swap and comes up to its own level by the end, so nothing jumps when the transition is over.
+ * Only ever lowers a deck, so a shape's constant power and its rules (one bassline, one voice) still hold.
+ */
+export function matchLevels(shape: PresetShape, beat: number, difference: number): PresetShape {
+  const length = shape.length
+  const db = Math.min(6, Math.abs(difference))
+  if (length <= 0 || !Number.isFinite(db) || db < 0.5) return shape
+  const k = 10 ** (-db / 20)
+  const bar = 4 * beat
+  const scale = (gain: Keyframe[], level: Point[], step: number): Keyframe[] => {
+    const times = new Set<number>([...gain.map((key) => key.t), ...level.map(([t]) => t)])
+    for (let t = 0; t <= length; t += step) times.add(t)
+    times.add(length)
+    const points = [...times].sort((p, q) => p - q).map((t): Point => [t, valueAt(gain, t, 1) * valueAt(keyframes(level, length), t, 1)])
+    return keyframes(points, length)
+  }
+  if (difference > 0) {
+    const level: Point[] = [
+      [0, 1],
+      [Math.min(bar, length / 4), k],
+    ]
+    return { ...shape, a: { ...shape.a, gain: scale(shape.a.gain, level, bar / 4) } }
+  }
+  const rise = Math.min(Math.max(shape.swap, 0), length - Math.min(bar, length / 4))
+  const level: Point[] = [
+    [rise, k],
+    [length, 1],
+  ]
+  return { ...shape, b: { ...shape.b, gain: scale(shape.b.gain, level, bar / 4) } }
 }
 
 /** The shape of a preset in the given context. */

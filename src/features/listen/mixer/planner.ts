@@ -9,7 +9,7 @@ import {
   spansTouch,
   type PreparedTrack,
 } from './analysis.ts'
-import { NEEDS_BEATMATCH, keyframes, plainCrossfade, presetShape, valueAt, type ConcretePreset, type PresetShape } from './presets.ts'
+import { NEEDS_BEATMATCH, keyframes, matchLevels, plainCrossfade, presetShape, valueAt, type ConcretePreset, type PresetShape } from './presets.ts'
 import type { DeckAutomation, MixStyle, PresetId, TrackMix, Transition } from './types.ts'
 
 /**
@@ -723,7 +723,9 @@ export function planTransition(
   }
 
   const { placement } = best
-  const { shape } = placement.stats
+  // The louder song comes down by the loudness difference while both play (both analyses must have measured it).
+  const louder = Number.isFinite(a.mix.loudness) && Number.isFinite(b.mix.loudness) ? a.mix.loudness - b.mix.loudness : 0
+  const shape = matchLevels(placement.stats.shape, placement.stats.beat, louder)
   const overlapping = shape.length > 0
   let confidence = 0.9
   if (tempo.synced && overlapping) confidence *= 0.55 + 0.45 * minConfidence

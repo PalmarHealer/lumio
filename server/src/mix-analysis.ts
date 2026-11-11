@@ -1239,10 +1239,17 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const phraseBars = barCount ? findPhrases(boundary, barCount) : []
   const phrases = phraseBars.map((b) => barStarts[b]!)
   const phraseEnd = (p: number) => (p + 1 < phraseBars.length ? barStarts[phraseBars[p + 1]!]! : duration)
-  // How clearly each phrase's beats are heard as attacks: the share of its beats with a clear attack (see
-  // clearAttacks) within 12 ms of the grid.
+  // How clearly each phrase's beats are heard as attacks that agree: a beat counts when its attack is clear (see
+  // clearAttacks) and lies within 12 ms of the median offset of the clear attacks around it (two bars). Where the
+  // strongest moments scatter from beat to beat (a wash, a pad, a riff without a beat) the phrase scores low even
+  // though attacks exist.
   const beatAttacks = attacksNear(beats, onsets)
-  const beatClear = clearAttacks(beatAttacks).map((clear, i) => clear && Math.abs(beatAttacks[i]!.shift) <= 0.012)
+  const attackClear = clearAttacks(beatAttacks)
+  const beatClear = beatAttacks.map((attack, i) => {
+    if (!attackClear[i]) return false
+    const around = beatAttacks.slice(Math.max(0, i - 4), i + 4).filter((_, k) => attackClear[Math.max(0, i - 4) + k])
+    return around.length >= 3 && Math.abs(attack.shift - median(around.map((entry) => entry.shift))) <= 0.012
+  })
   const phraseClarity = phrases.map((start, p) => {
     const end = phraseEnd(p)
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))

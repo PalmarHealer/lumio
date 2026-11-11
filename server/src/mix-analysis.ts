@@ -711,7 +711,10 @@ function steadyBeats(beats: number[]): number[] {
       for (let time = start + ref; time <= last; time += ref) after.push(time)
       out = [...out.slice(0, j + 1), ...after]
     } else {
-      const count = Math.max(1, whole)
+      // Laid out evenly between its ends: with as many beats as the steady tempo fits when that count is clear (a beat
+      // the tracker added or dropped), else with the tracker's own count (no phase change in the middle of a song is
+      // guessed: which side would be right can't be told from the beats).
+      const count = Math.abs(span - whole) <= 0.15 ? Math.max(1, whole) : i + 1 - j
       const even = Array.from({ length: count - 1 }, (_, k) => start + ((end - start) * (k + 1)) / count)
       out = [...out.slice(0, j + 1), ...even, ...out.slice(i + 1)]
     }

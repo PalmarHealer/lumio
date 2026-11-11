@@ -42,6 +42,11 @@ export interface TrackMix {
    * can't be trusted to line up audibly.
    */
   phraseClarity: number[]
+  /**
+   * Per bar (same index as `downbeats`, each up to the next downbeat or the end): the same measure for that bar's beats
+   * alone. Lets a beatmatch use the clear bars of a phrase that is unclear elsewhere. Empty in analyses made before it.
+   */
+  barClarity: number[]
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean

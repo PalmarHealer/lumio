@@ -123,14 +123,25 @@ function roomScore(a: Features, b: Features, style: MixStyle) {
   return blend
 }
 
+/**
+ * A long blend is the transition worth building a playlist around: the tempos within reach of a beatmatch (6 %, also
+ * half or double time, with a sure analysis) and clear beats for 4 bars or more at A's end and B's start.
+ */
+function blendable(a: Features, b: Features) {
+  let diff = Infinity
+  for (const multiple of [1, 2, 0.5]) diff = Math.min(diff, Math.abs(b.track.period / (multiple * a.track.period) - 1))
+  const sure = Math.min(a.track.bpmConfidence, b.track.bpmConfidence) >= 0.45
+  return sure && diff <= 0.06 && a.clearOut >= 4 && b.clearIn >= 4
+}
+
 function scoreFeatures(a: Features, b: Features, style: MixStyle, useRank: boolean) {
   const harmony = harmonicScore(a.track, b.track)
   const tempo = tempoScore(a.track, b.track, style)
   const energy = energyScore(useRank ? a.rank : a.intensity, useRank ? b.rank : b.intensity, style)
   const room = roomScore(a, b, style)
-  return style === 'clean'
-    ? 0.35 * harmony + 0.3 * tempo + 0.15 * energy + 0.2 * room
-    : 0.2 * harmony + 0.3 * tempo + 0.2 * energy + 0.3 * room
+  const rest = style === 'clean' ? 0.35 * harmony + 0.3 * tempo + 0.15 * energy + 0.2 * room : 0.2 * harmony + 0.3 * tempo + 0.2 * energy + 0.3 * room
+  // A pair that can blend outweighs one that only fits on paper (a key-perfect pair that ends in an echo out).
+  return 0.45 * (blendable(a, b) ? 1 : 0) + 0.55 * rest
 }
 
 /**

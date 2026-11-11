@@ -53,8 +53,9 @@ export interface PreparedTrack {
   /** Seconds of singing between two moments (0 when the vocals are only assumed). */
   sungSeconds(from: number, to: number): number
   /**
-   * The least clear attacks (0–1, the share of beats with an audible onset on the grid) over the phrases touching
-   * [from, to], 0 when it reaches before the song's first phrase or beat; NaN when the analysis has no clarity.
+   * The least clear attacks (0–1, the share of beats with an audible onset on the grid) over [from, to]: per bar where
+   * the analysis measured bars, else per phrase; 0 where it reaches before the song's first phrase or beat; NaN when
+   * the analysis has no clarity at all.
    */
   clarityBetween(from: number, to: number): number
 }
@@ -260,16 +261,25 @@ export function prepareTrack(mix: TrackMix | null | undefined): PreparedTrack | 
     cuesOut: Array.isArray(mix.cuesOut) ? mix.cuesOut.filter((t): t is number => finite(t) && t > 0 && t <= duration) : [],
     energyBetween,
     loudSeconds,
-    clarityBetween: phraseClarity(mix, duration, beats.length > 0 ? beats[0] : 0),
+    clarityBetween: clarity(mix, duration, beats.length > 0 ? beats[0] : 0),
     sungSeconds: (from: number, to: number) =>
       vocalsKnown ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
   }
 }
 
-/** Clarity per analysed phrase, kept only when it pairs up with the phrase list one to one. */
-function phraseClarity(mix: TrackMix, duration: number, beatsStart: number) {
-  const starts = Array.isArray(mix.phrases) ? mix.phrases : []
-  const values = Array.isArray(mix.phraseClarity) ? mix.phraseClarity : []
+/**
+ * Attack clarity over a stretch: from the clarity per bar when the analysis has it (pairing up with the downbeats one
+ * to one), else per phrase.
+ */
+function clarity(mix: TrackMix, duration: number, beatsStart: number) {
+  const bars = Array.isArray(mix.barClarity) && Array.isArray(mix.downbeats) && mix.barClarity.length === mix.downbeats.length && mix.barClarity.length > 0
+  return bars ? stretchClarity(mix.downbeats, mix.barClarity, duration, beatsStart) : stretchClarity(mix.phrases, mix.phraseClarity, duration, beatsStart)
+}
+
+/** Clarity per stretch (bar or phrase), kept only when the values pair up with the stretch starts one to one. */
+function stretchClarity(startList: unknown, valueList: unknown, duration: number, beatsStart: number) {
+  const starts = Array.isArray(startList) ? (startList as number[]) : []
+  const values = Array.isArray(valueList) ? (valueList as number[]) : []
   const pairs = starts
     .map((t, i) => ({ t, clarity: values[i] }))
     .filter((p) => finite(p.t) && p.t >= 0 && p.t <= duration && finite(p.clarity))

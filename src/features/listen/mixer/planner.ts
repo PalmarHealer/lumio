@@ -125,6 +125,8 @@ const MAX_WINDOW_DRIFT = 0.025
  * material is where a listener stops hearing a held groove and starts hearing a song that's stuck.
  */
 const MAX_LOOP_BARS = 16
+/** A loop plays its bars twice at most: more and the transition feels stuck (the user: "you're basically sampling it"). */
+const MAX_LOOP_PLAYS = 2
 /** Tempo corrections up to this are dropped (both decks at exactly 1) while the drift they leave stays under SNAP_DRIFT. */
 const SNAP_RATE = 0.001
 const SNAP_DRIFT = 0.005
@@ -942,6 +944,18 @@ function offsetOf(mix: TrackMix, field: 'kickOffset' | 'accentOffset') {
   return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 0.05 ? value : 0
 }
 
+/** A song's accent spread (seconds); 0 when unknown. */
+function spreadOf(mix: TrackMix) {
+  const value: unknown = mix.accentSpread
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value < 0.1 ? value : 0
+}
+
+/**
+ * Combined accent spread (both songs', root of squares) from which a long both-heard overlap starts to cost: above the
+ * user's approved Right Round → Beauty And A Beat (0.016) and Legendary Lovers → Heartbeat (0.018).
+ */
+const GROOVE_SPREAD = 0.02
+
 /** A song's swing (0.5 straight); 0.5 when unknown. */
 function swingOf(mix: TrackMix) {
   const value: unknown = mix.swing
@@ -969,15 +983,27 @@ function audibleClarity(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     // audible end): no beats of A there to flam with.
     if (atB < (b.beats[0] ?? 0) - 0.05) return -1
     if (atA > (a.beats[a.beats.length - 1] ?? Infinity) + 0.05) continue
-    // The accents/broadband attacks of both decks always; their kicks too where both lows come through (a killed or
-    // filtered low hides a kick: it can't flam).
-    let value = Math.min(a.clarityBetween(atA, atA + 0.01), b.clarityBetween(atB, atB + 0.01))
-    if (stats.passA.low[i] >= KICK_HEARD && stats.passB.low[i] >= KICK_HEARD)
-      value = Math.min(value, a.kickClarityBetween(atA, atA + 0.01), b.kickClarityBetween(atB, atB + 0.01))
+    const value = riskAt(stats, i, a, b, atA, atB).value
     if (Number.isNaN(value)) return NaN
     least = Math.min(least, value)
   }
   return Number.isFinite(least) ? least : 1
+}
+
+/**
+ * How safe the attacks both decks let be heard at a sample are (0–1): a deck's accent clarity where its snares, claps
+ * and hats come through (its mids or highs at BEAT_HEARD, through the filter), and both kicks' clarity where both lows
+ * do (a killed or filtered low hides a kick; a ducked deck is left with its kick alone). `riskyA`/`riskyB`: whose
+ * accents fall under MIN_VERIFIABLE; `kickRisk`: the kicks do.
+ */
+function riskAt(stats: ShapeStats, i: number, a: PreparedTrack, b: PreparedTrack, atA: number, atB: number) {
+  const accA = Math.max(stats.passA.mid[i], stats.passA.high[i]) >= BEAT_HEARD
+  const accB = Math.max(stats.passB.mid[i], stats.passB.high[i]) >= BEAT_HEARD
+  const cA = accA ? a.clarityBetween(atA, atA + 0.01) : 1
+  const cB = accB ? b.clarityBetween(atB, atB + 0.01) : 1
+  let kick = 1
+  if (stats.passA.low[i] >= KICK_HEARD && stats.passB.low[i] >= KICK_HEARD) kick = Math.min(a.kickClarityBetween(atA, atA + 0.01), b.kickClarityBetween(atB, atB + 0.01))
+  return { value: Math.min(cA, cB, kick), riskyA: cA < MIN_VERIFIABLE, riskyB: cB < MIN_VERIFIABLE, kickRisk: kick < MIN_VERIFIABLE, cA, cB }
 }
 
 /** Seconds (every 0.1 s) where both decks' beats are heard on a risky bar of either (clarity under MIN_VERIFIABLE). */
@@ -994,14 +1020,9 @@ function riskyTime(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     const atA = positionA(p, t)
     if (atA > lastBeatA + 0.05) continue
     const atB = positionB(p, t) ?? 0
-    if (Math.min(a.clarityBetween(atA, atA + 0.01), b.clarityBetween(atB, atB + 0.01)) < MIN_VERIFIABLE) risky += step * dt
+    if (riskAt(stats, i, a, b, atA, atB).value < MIN_VERIFIABLE) risky += step * dt
   }
   return risky
-}
-
-/** Whether a deck's kick counts as not heard at a sample (its filter is a high-pass past 0.4). */
-function kickHidden(stats: ShapeStats, i: number, deckA: boolean) {
-  return valueAt(deckA ? stats.shape.a.filter : stats.shape.b.filter, i * stats.dt, 0) > 0.4
 }
 
 /** The level a ducked deck's mids and highs go down to: under the -10 dB from which its accents are heard. */
@@ -1036,10 +1057,9 @@ function duckRisky(p: Placement, a: PreparedTrack, b: PreparedTrack): Placement 
     const atA = positionA(p, t)
     const atB = positionB(p, t) ?? 0
     if (atA > lastBeatA + 0.05) continue
-    if (stats.passA.low[i] >= KICK_HEARD && stats.passB.low[i] >= KICK_HEARD) {
-      if (Math.min(a.kickClarityBetween(atA, atA + 0.01), b.kickClarityBetween(atB, atB + 0.01)) < MIN_VERIFIABLE) return null
-    }
-    if (Math.min(a.clarityBetween(atA, atA + 0.01), b.clarityBetween(atB, atB + 0.01)) < MIN_VERIFIABLE) estimate += coarse * dt
+    const risk = riskAt(stats, i, a, b, atA, atB)
+    if (risk.kickRisk) return null
+    if (risk.riskyA || risk.riskyB) estimate += coarse * dt
     if (estimate > MAX_DUCK_BARS * 4 * stats.beat + 0.2) return null
   }
   let total = 0
@@ -1049,19 +1069,16 @@ function duckRisky(p: Placement, a: PreparedTrack, b: PreparedTrack): Placement 
     const atA = positionA(p, t)
     const atB = positionB(p, t) ?? 0
     if (atA > lastBeatA + 0.05) continue
-    if (stats.passA.low[i] >= KICK_HEARD && stats.passB.low[i] >= KICK_HEARD) {
-      if (Math.min(a.kickClarityBetween(atA, atA + 0.01), b.kickClarityBetween(atB, atB + 0.01)) < MIN_VERIFIABLE) return null
+    const risk = riskAt(stats, i, a, b, atA, atB)
+    if (risk.kickRisk) return null
+    if (!risk.riskyA && !risk.riskyB) continue
+    // The risky deck's accents go down; its kick alone is then all it lets be heard (checked against the other's).
+    for (const list of [risk.riskyA ? runs.a : null, risk.riskyB ? runs.b : null]) {
+      if (!list) continue
+      const last = list[list.length - 1]
+      if (last && t - last[1] <= 2 * dt) last[1] = t + dt
+      else list.push([t, t + dt])
     }
-    const ca = a.clarityBetween(atA, atA + 0.01)
-    const cb = b.clarityBetween(atB, atB + 0.01)
-    if (!(Math.min(ca, cb) < MIN_VERIFIABLE)) continue
-    const onA = ca <= cb
-    // A deck whose kick is still heard there keeps its beats heard however its accents are ducked: no help.
-    if ((onA ? stats.passA.low[i] : stats.passB.low[i]) >= KICK_HEARD && (onA ? stats.shape.a : stats.shape.b) && !kickHidden(stats, i, onA)) return null
-    const list = onA ? runs.a : runs.b
-    const last = list[list.length - 1]
-    if (last && t - last[1] <= 2 * dt) last[1] = t + dt
-    else list.push([t, t + dt])
     total += dt
   }
   if (total === 0 || total > MAX_DUCK_BARS * 4 * stats.beat) return null
@@ -1150,7 +1167,7 @@ function loopSplits(bars: number) {
     for (let straight = loopBars; straight < bars; straight += 4) {
       if ((bars - straight) % loopBars !== 0) continue
       const plays = (bars - straight) / loopBars + 1
-      if (plays * loopBars <= MAX_LOOP_BARS) splits.push({ straight, loopBars, plays })
+      if (plays * loopBars <= MAX_LOOP_BARS && plays <= MAX_LOOP_PLAYS) splits.push({ straight, loopBars, plays })
     }
   return splits
 }
@@ -1736,10 +1753,19 @@ export function planTransition(
       for (let i = 0; i < stats.loudA.length; i++) if (i * stats.dt >= placement.bStart && stats.loudA[i] && stats.loudB[i]) loudBoth += stats.dt
       swingTerm = 0.5 * Math.min(1, Math.max(0, loudBoth - 4 * stats.beat) / (16 * stats.beat))
     }
+    // Accents that wander against their own grid (accentSpread) flam in some bars of a long both-heard overlap whatever
+    // the alignment: a cost growing with the spread and the time, not a veto (the user's ears accept some).
+    let grooveTerm = 0
+    const spread = Math.hypot(spreadOf(a.mix), spreadOf(b.mix))
+    if (placement.beatmatched && spread > GROOVE_SPREAD) {
+      let loudBoth = 0
+      for (let i = 0; i < stats.loudA.length; i++) if (i * stats.dt >= placement.bStart && stats.loudA[i] && stats.loudB[i]) loudBoth += stats.dt
+      grooveTerm = 0.4 * Math.min(1, (spread - GROOVE_SPREAD) / GROOVE_SPREAD) * Math.min(1, loudBoth / (16 * stats.beat))
+    }
     const finish = placement.variant.preset === 'blend' ? placement.variant.prior - start.variant.prior - BEST_FINISH : 0
     const clarityTerm = Number.isNaN(placement.clarity) ? 0.1 : 0.3 * Math.max(0, 1 - placement.clarity / MIN_CLARITY)
     const duckTerm = (0.02 * (placement.ducked ?? 0)) / (4 * stats.beat)
-    const score = placement.bound + finish - tonalTerm - energyTerm - swingTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    const score = placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
   let best: { placement: Placement; score: number } | null = null

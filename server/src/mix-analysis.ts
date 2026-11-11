@@ -77,11 +77,11 @@ export interface TrackMix {
   drops: number[]
   /**
    * Stretches with singing, padded for safety ("never two vocals at once" may rely on them): synced lyrics give only
-   * line starts, and their timing may be off. Lyrics kept where they were timed (offset 0) are padded by one beat
-   * (at least 0.5 s) each side; lyrics the analysis had to move (another version) by 2 s each side, the measured
-   * placement error. A line's end isn't known: it ends 0.15 s before the next line, at most as long as its words take
-   * (about 3 a second, at least 1.5 s) and at most 1.25 times the song's median line distance (2–8 s); stretches
-   * that touch after padding are merged.
+   * line starts, and their timing may be off. Lyrics kept where they were timed (offset 0) are padded by one beat (at
+   * least 0.5 s) each side; lyrics the analysis had to move (another version) by 2 s each side, the measured placement
+   * error. A line's end isn't known: it ends 0.15 s before the next line, at most as long as its words take (about 3 a
+   * second, at least 1.5 s) and at most 1.25 times the song's median line distance (2–8 s); stretches that touch after
+   * padding are merged.
    */
   vocals: Array<{ start: number; end: number }>
   /** Where `vocals` came from: synced lyrics aligned to the audio, an estimate from the audio, or nothing found. */
@@ -834,8 +834,18 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const channels = audio instanceof Float32Array ? [audio] : audio
   if (!channels.length || channels.some((channel) => channel.length !== channels[0]!.length)) return null
   // Everything but the voice is measured on the mono mix (the centre); the sides only for the voice.
-  const samples = channels.length === 1 ? channels[0]! : Float32Array.from(channels[0]!, (left, i) => (left + channels[1]![i]!) / 2)
-  const sides = channels.length >= 2 ? Float32Array.from(channels[0]!, (left, i) => (left - channels[1]![i]!) / 2) : null
+  // (Plain loops: from() over a typed array would first make a list of every sample on the heap.)
+  let samples = channels[0]!
+  let sides: Float32Array | null = null
+  if (channels.length >= 2) {
+    const [left, right] = [channels[0]!, channels[1]!]
+    samples = new Float32Array(left.length)
+    sides = new Float32Array(left.length)
+    for (let i = 0; i < left.length; i++) {
+      samples[i] = (left[i]! + right[i]!) / 2
+      sides[i] = (left[i]! - right[i]!) / 2
+    }
+  }
   const duration = samples.length / rate
   if (duration < 20) return null
   let power = 0
@@ -851,7 +861,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
 
   // The curves at 10 frames a second: energy from the samples themselves, bands from the spectra (amplitude, the
   // square root of the power, so quiet parts still show).
-  const curveFrames = Math.ceil(duration * CURVE_RATE)
+  // As many frames as the duration given out (rounded to 10 ms) holds, so the curves and `duration` agree.
+  const curveFrames = Math.ceil(round(duration, 2) * CURVE_RATE - 1e-6)
   const energyCurve = new Float64Array(curveFrames)
   const blockSize = rate / CURVE_RATE
   for (let f = 0; f < curveFrames; f++) {

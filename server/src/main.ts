@@ -14,7 +14,7 @@ import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, 
 import { tasteSignals, type TasteSignals } from './taste.ts'
 import { SOUND_VERSION } from './sound-analysis.ts'
 import { MIX_VERSION } from './mix-analysis.ts'
-import { analyzeTrack, parsePlaylistMixer, type MixTrack } from './mix.ts'
+import { JellyfinError, analyzeTrack, parsePlaylistMixer, type MixTrack } from './mix.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
@@ -1018,19 +1018,38 @@ function queueSound(id: string, token: string) {
 
 /** A song that couldn't be analysed is tried again after a week (Jellyfin may have been away, the file replaced). */
 const MIX_RETRY = 7 * 24 * HOUR
-/** Songs being analysed right now (by the library run or the queue), so none is done twice at once. */
+/** Songs being analysed right now (by the library run or the queue), by lower-case id, so none is done twice at once. */
 const mixing = new Set<string>()
+/**
+ * Songs whose analysis failed for a passing reason (Jellyfin away, a timeout, the worker failing), by lower-case id,
+ * with until when they aren't asked again (an hour), so the apps' asking doesn't retry them on every request.
+ */
+const mixBackoff = new Map<string, number>()
+const MIX_BACKOFF = HOUR
 
-/** Analyses a song and keeps the result (null: it can't be). Returns whether it could be analysed. */
+/**
+ * Analyses a song and keeps the result (null: it can't be, also when Jellyfin says the song can't be fetched at all).
+ * Returns whether it could be analysed; throws on a passing failure (after noting it for the backoff).
+ */
 async function mixOf(token: string, track: MixTrack) {
-  if (mixing.has(track.Id)) return false
-  mixing.add(track.Id)
+  const id = track.Id.toLowerCase()
+  if (mixing.has(id)) return false
+  mixing.add(id)
   try {
-    const mix = await analyzeTrack(JELLYFIN_URL, token, track, store.lyrics(track.Id.toLowerCase())?.data as Parameters<typeof analyzeTrack>[3])
-    store.setTrackMix(track.Id, mix)
+    const mix = await analyzeTrack(JELLYFIN_URL, token, track, store.lyrics(id)?.data as Parameters<typeof analyzeTrack>[3])
+    store.setTrackMix(id, mix)
+    mixBackoff.delete(id)
     return !!mix
+  } catch (error) {
+    if (error instanceof JellyfinError && error.definitive) {
+      store.setTrackMix(id, null)
+      return false
+    }
+    if (mixBackoff.size > 10_000) mixBackoff.clear()
+    mixBackoff.set(id, Date.now() + MIX_BACKOFF)
+    throw error
   } finally {
-    mixing.delete(track.Id)
+    mixing.delete(id)
   }
 }
 
@@ -1041,9 +1060,9 @@ function scanMix(token: string, userId: string, scope: Scope = NO_SCOPE) {
     async () => {
       const done = store.currentTrackMixes(MIX_VERSION, MIX_RETRY)
       const tracks = await libraryItems<MixTrack & { Genres?: string[] }>(token, userId, '/Users/{user}/Items', { Recursive: 'true', IncludeItemTypes: 'Audio', Fields: 'Genres' }, scope.libraries)
-      return tracks.filter((track) => !done.has(track.Id) && !leftOut(scope, [...(track.Artists ?? []), track.AlbumArtist], track.Genres))
+      return tracks.filter((track) => !done.has(track.Id.toLowerCase()) && !leftOut(scope, [...(track.Artists ?? []), track.AlbumArtist], track.Genres))
     },
-    (track) => (store.hasTrackMix(track.Id, MIX_VERSION, MIX_RETRY) ? Promise.resolve(true) : mixOf(token, track)),
+    (track) => (store.hasTrackMix(track.Id.toLowerCase(), MIX_VERSION, MIX_RETRY) ? Promise.resolve(true) : mixOf(token, track)),
     (track) => ({ id: track.Id, title: track.Name ?? '', artist: track.Artists?.[0] ?? track.AlbumArtist ?? '' }),
   )
 }
@@ -1057,8 +1076,9 @@ const mixQueue = new Map<string, string>()
 const MIX_QUEUE_MAX = 2000
 let mixRunning = false
 
+/** Queues a song (by lower-case id) unless it is queued, under way, backing off, or the queue is full. */
 function queueMix(id: string, token: string) {
-  if (mixQueue.has(id) || mixing.has(id) || mixQueue.size >= MIX_QUEUE_MAX) return
+  if (mixQueue.has(id) || mixing.has(id) || (mixBackoff.get(id) ?? 0) > Date.now() || mixQueue.size >= MIX_QUEUE_MAX) return
   mixQueue.set(id, token)
   if (mixRunning) return
   mixRunning = true
@@ -1071,13 +1091,23 @@ function queueMix(id: string, token: string) {
           const person = tokens.get(nextToken)?.person
           if (!person || store.hasTrackMix(next, MIX_VERSION, MIX_RETRY)) continue
           const item = await fetch(`${JELLYFIN_URL}/Users/${person.id}/Items/${next}`, { headers: { Authorization: `MediaBrowser Token="${nextToken}"` }, signal: AbortSignal.timeout(15_000) })
-          if (!item.ok) continue
+          if (!item.ok) {
+            // Not there for this person (or not at all): asked again only after the backoff.
+            mixBackoff.set(next, Date.now() + MIX_BACKOFF)
+            continue
+          }
           const track = (await item.json()) as MixTrack & { Type?: string }
-          if (track.Type !== 'Audio') continue
+          if (track.Type !== 'Audio') {
+            mixBackoff.set(next, Date.now() + MIX_BACKOFF)
+            continue
+          }
           await mixOf(nextToken, track)
         } catch (error) {
+          mixBackoff.set(next, Date.now() + MIX_BACKOFF)
           console.warn(`Mix of ${next}: ${error instanceof Error ? error.message : String(error)}`)
         }
+        // A breath between songs, for Jellyfin's transcoder and the other requests.
+        await new Promise((resolve) => setTimeout(resolve, 1000))
       }
     } finally {
       mixRunning = false
@@ -1087,17 +1117,20 @@ function queueMix(id: string, token: string) {
 
 /**
  * What someone may do with a playlist, as Jellyfin decides it with their token: see it (it is a playlist they can
- * open), and edit it (they own it, or it is shared with them for editing). Asked again after a minute.
+ * open), and edit it (they own it, or it is shared with them for editing). Only a playlist someone may see is
+ * remembered, for a minute and for reading only: saving always asks Jellyfin afresh, and a Jellyfin error is never
+ * taken for a no (it throws).
  */
 const playlistAccess = new Map<string, { see: boolean; edit: boolean; until: number }>()
 
-async function accessToPlaylist(token: string, userId: string, playlistId: string) {
+async function accessToPlaylist(token: string, userId: string, playlistId: string, fresh: boolean) {
   const key = `${token}|${playlistId}`
   const cached = playlistAccess.get(key)
-  if (cached && cached.until > Date.now()) return cached
+  if (!fresh && cached && cached.until > Date.now()) return cached
   const headers = { Authorization: `MediaBrowser Token="${token}"` }
   const access = { see: false, edit: false, until: Date.now() + 60_000 }
   const item = await fetch(`${JELLYFIN_URL}/Users/${userId}/Items/${playlistId}?${new URLSearchParams({ Fields: 'CanDelete' })}`, { headers, signal: AbortSignal.timeout(15_000) })
+  if (item.status >= 500) throw new Error(`Jellyfin ${item.status}`)
   if (item.ok) {
     const playlist = (await item.json()) as { Type?: string; CanDelete?: boolean }
     access.see = playlist.Type === 'Playlist'
@@ -1105,11 +1138,13 @@ async function accessToPlaylist(token: string, userId: string, playlistId: strin
     if (access.see && playlist.CanDelete) access.edit = true
     else if (access.see) {
       const share = await fetch(`${JELLYFIN_URL}/Playlists/${playlistId}/Users/${userId}`, { headers, signal: AbortSignal.timeout(15_000) })
+      if (share.status >= 500) throw new Error(`Jellyfin ${share.status}`)
       access.edit = share.ok && !!((await share.json()) as { CanEdit?: boolean }).CanEdit
     }
-  } else if (item.status >= 500) throw new Error(`Jellyfin ${item.status}`)
+  }
   if (playlistAccess.size > 5000) playlistAccess.clear()
-  playlistAccess.set(key, access)
+  if (access.see) playlistAccess.set(key, access)
+  else playlistAccess.delete(key)
   return access
 }
 
@@ -1783,12 +1818,13 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
   if (path === '/music/mix' && request.method === 'GET') {
     const ids = (url.searchParams.get('ids') ?? '').split(',').filter(Boolean)
     if (!ids.length || ids.length > 200 || !ids.every((id) => /^[0-9a-f]{32}$/i.test(id))) return send(response, 400, { error: 'Bad ids' })
-    const known = store.trackMixes(ids, url.searchParams.get('summary') === '1')
+    // Kept and queued by lower-case id; answered by the ids as asked.
+    const known = store.trackMixes(ids.map((id) => id.toLowerCase()), url.searchParams.get('summary') === '1')
     const token = tokenOf(request, url)!
     const entries = ids.map((id) => {
-      const entry = known[id]
+      const entry = known[id.toLowerCase()]
       const current = entry?.json && entry.version === MIX_VERSION
-      if (!current && !(entry && !entry.json && Date.now() - entry.at < MIX_RETRY)) queueMix(id, token)
+      if (!current && !(entry && !entry.json && Date.now() - entry.at < MIX_RETRY)) queueMix(id.toLowerCase(), token)
       // The kept JSON as it is (it is large: no parsing and writing again).
       return `${JSON.stringify(id)}:${current ? entry.json : 'null'}`
     })
@@ -1798,30 +1834,36 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
 
   // GET /music/mixer/<playlistId>: a playlist's mixer settings and transitions (PlaylistMixer; off and empty when never
   // saved), for anyone who can see the playlist. PUT: saves them, for its owner and those it is shared with for editing.
-  // A PUT naming an older `updated` than the one kept is turned down (409, with the kept settings): someone else saved
-  // in between.
+  // Once settings are kept, a PUT must name the `updated` it started from; an older one (or none) is turned down with
+  // 409 and the kept settings: someone else saved in between. Transitions that don't pass the checks are left out
+  // (their pairs get automatic ones); the answer says how many in `dropped`.
   const mixer = path.match(/^\/music\/mixer\/([0-9a-f]{32})$/i)
   if (mixer && (request.method === 'GET' || request.method === 'PUT')) {
     const playlistId = mixer[1]!.toLowerCase()
     const token = tokenOf(request, url)!
     let access: { see: boolean; edit: boolean }
     try {
-      access = await accessToPlaylist(token, me.id, playlistId)
+      access = await accessToPlaylist(token, me.id, playlistId, request.method === 'PUT')
     } catch (error) {
       return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
     }
     if (!access.see) return send(response, 404, { error: 'No such playlist' })
-    const stored = store.playlistMixer(playlistId)
-    const current = stored ? { ...(stored.data as object), updated: stored.updated } : { on: false, style: 'clean', transitions: {}, updated: 0 }
-    if (request.method === 'GET') return send(response, 200, current)
+    const kept = () => {
+      const stored = store.playlistMixer(playlistId)
+      return { stored, current: stored ? { ...(stored.data as object), updated: stored.updated } : { on: false, style: 'clean', transitions: {}, updated: 0 } }
+    }
+    if (request.method === 'GET') return send(response, 200, kept().current)
     if (!access.edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
     const body = await readJson<Record<string, unknown>>(request, MIXER_BODY_LIMIT).catch(() => null)
-    const settings = parsePlaylistMixer(body)
-    if (!settings) return send(response, 400, { error: 'Bad mixer settings' })
-    if (stored && typeof body?.updated === 'number' && body.updated < stored.updated) return send(response, 409, current)
+    const parsed = parsePlaylistMixer(body)
+    if (!parsed) return send(response, 400, { error: 'Bad mixer settings' })
+    // Read again now that the body is in (another save may have landed meanwhile); from here on nothing waits.
+    const { stored, current } = kept()
+    if (stored && (typeof body?.updated !== 'number' || body.updated < stored.updated)) return send(response, 409, current)
+    if (parsed.dropped) console.warn(`Mixer of ${playlistId}: ${parsed.dropped} transition(s) left out`)
     const updated = Math.max(Date.now(), (stored?.updated ?? 0) + 1)
-    store.setPlaylistMixer(playlistId, settings, me.id, updated)
-    return send(response, 200, { ...settings, updated })
+    store.setPlaylistMixer(playlistId, parsed.settings, me.id, updated)
+    return send(response, 200, { ...parsed.settings, updated, dropped: parsed.dropped })
   }
 
   // GET /music/lyrics-search?q=…: songs whose lyrics have these words ({items, snippets: {id: lines around the match}}),

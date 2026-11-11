@@ -89,9 +89,10 @@ const MAX_OVER_DB_OVERLAP = 3
 const HOLE_DB = -6
 /**
  * Swing (where the off-beat 16ths fall) further apart than this: a swung and a straight groove flam wherever both are
- * loud, so such a pair hands over with little both-loud time (a bass swap handover, the short S-curve).
+ * loud, so such a pair hands over with little both-loud time (a bass swap handover, the short S-curve). Not lower: the
+ * user's favourite 16-bar Legendary Lovers → Heartbeat blend is 0.51 against 0.58.
  */
-const SWING_CLASH = 0.05
+const SWING_CLASH = 0.1
 /** Room (seconds) a blend's B gets to be moved earlier by the phase fit. */
 const PHASE_SLACK = 0.05
 /**

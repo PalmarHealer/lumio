@@ -365,7 +365,7 @@ function clarity(mix: TrackMix, duration: number, beatsStart: number) {
 }
 
 function kickClarity(mix: TrackMix, duration: number, beatsStart: number) {
-  const kicks: unknown = (mix as { barKickClarity?: unknown }).barKickClarity
+  const kicks: unknown = mix.barKickClarity
   const bars = Array.isArray(kicks) && Array.isArray(mix.downbeats) && kicks.length === mix.downbeats.length && kicks.length > 0
   return bars ? stretchClarity(mix.downbeats, kicks, duration, beatsStart) : clarity(mix, duration, beatsStart)
 }

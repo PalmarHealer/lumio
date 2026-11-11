@@ -38,8 +38,8 @@ export interface TrackMix {
   phrases: number[]
   /**
    * Per phrase (same index as `phrases`, each up to the next phrase or the end): how clearly its beats are heard as
-   * attacks (0–1, the share of beats with a clear onset on the grid). Beatmatching over a phrase with unclear attacks
-   * can't be trusted to line up audibly.
+   * attacks (0–1, the share of beats with one clear broadband or snare/clap/hat attack on the grid). Beatmatching over
+   * a phrase with unclear attacks can't be trusted to line up audibly. The kick is measured apart (`barKickClarity`).
    */
   phraseClarity: number[]
   /**
@@ -47,6 +47,12 @@ export interface TrackMix {
    * alone. Lets a beatmatch use the clear bars of a phrase that is unclear elsewhere. Empty in analyses made before it.
    */
   barClarity: number[]
+  /**
+   * Per bar (same index as `downbeats`): the share of its beats whose kick doesn't contradict the grid (no standing-out
+   * kick attack, or one within 25 ms of `kickOffset`). Low where the kick plays off the beat (syncopated or doubled):
+   * two decks' kicks flam there unless one deck's lows are down. Empty in analyses made before it.
+   */
+  barKickClarity: number[]
   /**
    * Per phrase (same index as `phrases`): what it plays harmonically, as 12 values (pitch classes from C, 0–1, the
    * strongest 1). Taken from the melody's range (C3–C6) with short transients (drums) held out, so phrases with similar

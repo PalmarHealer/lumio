@@ -81,7 +81,17 @@ const KEY_CLASH = 0.5
  * percentile over the overlap), and how far below them the overlap may sink on average before it's a hole.
  */
 const MAX_OVER_DB = 1.8
+/**
+ * The same for a full overlap (both decks at full volume, the user's favourite Spotify blends of two full pop songs):
+ * the master limiter catches true overs.
+ */
+const MAX_OVER_DB_OVERLAP = 3
 const HOLE_DB = -6
+/**
+ * Swing (where the off-beat 16ths fall) further apart than this: a swung and a straight groove flam wherever both are
+ * loud, so such a pair hands over with little both-loud time (a bass swap handover, the short S-curve).
+ */
+const SWING_CLASH = 0.05
 /** Room (seconds) a blend's B gets to be moved earlier by the phase fit. */
 const PHASE_SLACK = 0.05
 /**
@@ -254,14 +264,16 @@ const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwa
 const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
   // B's event lands on A's boundary after `pre` bars of B under A; A plays on, thinned, for `post` bars to its next
   // section, where it leaves. Pop: 4-bar phrases, 8-bar blends; dance music: 8 + 8 or more.
+  // Preferred in that order: 8 bars (Spotify's most common), then 16, then 4; the 2-bar S-curve only when nothing longer
+  // passes or the material is dense right at the boundary (its own energy term).
   { volume: 'overlap', pre: 4, post: 4, prior: 0, party: true, clean: true },
   { volume: 'overlap', pre: 0, post: 8, prior: 0, party: true, clean: true },
-  { volume: 'overlap', pre: 8, post: 8, prior: -0.03, party: true, clean: true },
-  { volume: 'overlap', pre: 0, post: 16, prior: -0.04, party: true, clean: true },
-  { volume: 'overlap', pre: 0, post: 4, prior: -0.04, party: true, clean: false },
-  { volume: 'overlap', pre: 16, post: 8, prior: -0.05, party: false, clean: true },
-  { volume: 'fade', pre: 8, post: 8, prior: -0.05, party: true, clean: true },
-  { volume: 'scurve', pre: 1, post: 1, prior: -0.25, party: true, clean: true },
+  { volume: 'overlap', pre: 8, post: 8, prior: -0.08, party: true, clean: true },
+  { volume: 'overlap', pre: 0, post: 16, prior: -0.09, party: true, clean: true },
+  { volume: 'fade', pre: 8, post: 8, prior: -0.1, party: true, clean: true },
+  { volume: 'overlap', pre: 16, post: 8, prior: -0.12, party: false, clean: true },
+  { volume: 'overlap', pre: 0, post: 4, prior: -0.16, party: true, clean: true },
+  { volume: 'scurve', pre: 1, post: 1, prior: -0.28, party: true, clean: true },
 ]
 
 /**
@@ -780,15 +792,27 @@ function alignPhase(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
   }
   // No beats of both loud at once (a shape that hands the beat over in one go): nothing to fit, B starts on its phrase.
   if (!fitted) return { rate: p.rate, bStart: p.bStart - p.slack, laneB: p.laneB }
-  // Each song's kick sits a little after its grid (its accents): meet between grid and kick alignment, halfway where only
-  // one deck's bass is up (the other kick's click still sounds), weighting the kicks 2:1 where both basses sound
-  // (B moves earlier by that share of the difference).
-  const kick = (mix: TrackMix) => {
-    const value = (mix as TrackMix & { kickOffset?: number }).kickOffset
-    return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 0.05 ? value : 0
-  }
-  const shift = (1 / 2 + (1 / 6) * p.stats.kicksTogether) * (kick(b.mix) - kick(a.mix))
+  // The grid sits on a song's attacks overall; its kick and its claps/snares may lie a little behind it, each by its own
+  // amount. B moves so the kicks' lag and the accents' lag between the decks are as small as they can be together
+  // (least squares): kicks and accents weigh alike where one deck's bass is up (the other kick's click still sounds),
+  // the kicks 2:1 where both basses sound.
+  const kickWeight = 1 + p.stats.kicksTogether
+  const kicks = offsetOf(b.mix, 'kickOffset') - offsetOf(a.mix, 'kickOffset')
+  const accents = offsetOf(b.mix, 'accentOffset') - offsetOf(a.mix, 'accentOffset')
+  const shift = (kickWeight * kicks + accents) / (kickWeight + 1)
   return { rate: current.rate, bStart: Math.max(0, current.bStart - shift), laneB: current.laneB }
+}
+
+/** A song's kick or accent offset behind its grid (seconds); 0 when unknown or implausible (older analyses lack it). */
+function offsetOf(mix: TrackMix, field: 'kickOffset' | 'accentOffset') {
+  const value: unknown = mix[field]
+  return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 0.05 ? value : 0
+}
+
+/** A song's swing (0.5 straight); 0.5 when unknown. */
+function swingOf(mix: TrackMix) {
+  const value: unknown = mix.swing
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0.4 && value <= 0.8 ? value : 0.5
 }
 
 /**
@@ -808,8 +832,10 @@ function audibleClarity(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     if (t > length || t < p.bStart || !stats.loudA[i] || !stats.loudB[i]) continue
     const atA = positionA(p, t)
     const atB = positionB(p, t) ?? 0
-    // Outside a song's beat grid (before its first beat, after its last) there's nothing to match: -1 rejects.
-    if (atB < (b.beats[0] ?? 0) - 0.05 || atA > (a.beats[a.beats.length - 1] ?? Infinity) + 0.05) return -1
+    // B before its first beat has no grid to match: -1 rejects. A after its last beat is its tail (a play-out to its
+    // audible end): no beats of A there to flam with.
+    if (atB < (b.beats[0] ?? 0) - 0.05) return -1
+    if (atA > (a.beats[a.beats.length - 1] ?? Infinity) + 0.05) continue
     const value = Math.min(a.clarityBetween(atA, atA + 0.01), b.clarityBetween(atB, atB + 0.01))
     if (Number.isNaN(value)) return NaN
     least = Math.min(least, value)
@@ -983,7 +1009,8 @@ export function finalizeTransition(transition: Transition, aDuration: number, bD
   // A must not run past its end: with no loop, cut the transition where A's material ends.
   if (pathA.length === 0) {
     const advance = rateAdvance(rateA, 0, length)
-    if (advance > aEnd - aOut && advance > 0) length *= (aEnd - aOut) / advance
+    // (to whole milliseconds downwards, so rounding can't carry A past its end)
+    if (advance > aEnd - aOut && advance > 0) length = Math.floor(length * ((aEnd - aOut) / advance) * 1000) / 1000
   }
   const bAt = Math.min(length, Math.max(0, finite(transition.bAt, 0)))
   const bIn = Math.max(0, Math.min(finite(transition.bIn, 0), Number.isFinite(bEnd) ? Math.max(0, bEnd - 1) : Infinity))
@@ -1120,6 +1147,13 @@ export function planTransition(
   targetBars = Math.min(targetBars, maxBars)
 
   const variants = variantsFor(style, tempo.synced, maxBars, forced)
+  // A's downbeats up to its audible end for clean play-outs: the grid's up to the first within a beat of that end, or
+  // bars of the song's length on past the grid's last downbeat while A still sounds more than a beat after it (its last
+  // sung line may run past the grid). Empty when that last bar would end more than a bar after A's audio.
+  const endBar = a.downbeats.findIndex((t) => t >= a.end - a.period)
+  const tailBars = endBar >= 0 ? a.downbeats.slice(0, endBar + 1) : [...a.downbeats]
+  while (tailBars.length > 0 && tailBars[tailBars.length - 1] < a.end - a.period) tailBars.push(tailBars[tailBars.length - 1] + 4 * a.period)
+  if (tailBars.length === 0 || tailBars[tailBars.length - 1] > a.duration + 4 * a.period) tailBars.length = 0
   const outs = outAnchors(a, style)
   const ins = inAnchors(b, style)
   const party = style === 'party'
@@ -1169,7 +1203,8 @@ export function planTransition(
     const skipB = b.loudSeconds(b.start, p.laneB.start)
     let bound = variant.prior + jitter(`${ids.from}>${ids.to}:${variant.preset}:${variant.preRollBars}:${variant.bars}:${variant.midSwap}`)
     bound += p.pa.bonus + p.pb.bonus - 0.02 * p.loops
-    if (FREE_LENGTH.has(variant.preset) || variant.preset === 'blend') bound -= 0.12 * Math.abs(Math.log2(variant.bars / targetBars))
+    // A blend's length preference is its layout's prior; a fade's or echo's leans to the target length.
+    if (FREE_LENGTH.has(variant.preset)) bound -= 0.12 * Math.abs(Math.log2(variant.bars / targetBars))
     if (party) {
       // Cutting intros and outros is the point; cutting away much more than that (a whole last chorus) is not.
       bound -= 0.015 * Math.max(0, skipA - a.duration * 0.25) + 0.01 * Math.max(0, skipB - b.duration * 0.3)
@@ -1252,28 +1287,35 @@ export function planTransition(
         return list
       }
       // Where A goes out: its boundaries on the phrase grid, A playing `post` bars on after them. In clean style also the
-      // play-out: from A's last boundary on the grid A plays on to its very last bar (nothing of A skipped, B's intro
-      // under it), as many bars as that takes.
-      const jobs: Array<{ pa: Anchor; after: number }> = outs.filter((anchor) => onGrid(a, anchor.t)).map((pa) => ({ pa, after: post }))
-      if (!party && (variant.volume === 'overlap' && (pre === 0 || pre === 4))) {
-        const lastBar = floorIndex(a.downbeats, a.end + 0.05)
+      // play-out: from A's last boundary on the grid A plays on to its audible end (nothing of A skipped, B's intro
+      // under it), as many bars as that takes; its last bar may run past A's grid (`tailBars`) and past the end of A's
+      // audio, where the transition is cut (finalizeTransition), so it ends where A does.
+      const jobs: Array<{ pa: Anchor; after: number; tail: boolean }> = outs.filter((anchor) => onGrid(a, anchor.t)).map((pa) => ({ pa, after: post, tail: false }))
+      if (!party && variant.volume === 'overlap' && (pre === 0 || pre === 4) && tailBars.length > 0) {
+        const lastBar = tailBars.length - 1
         for (const t of a.phraseGrid) {
           const i = floorIndex(a.downbeats, t + 0.05)
           const after = lastBar - i
-          if (i < 0 || after < 2 || after > 16 || after === post) continue
-          jobs.push({ pa: { t, bonus: 0, drop: false, chorus: false }, after })
+          if (i < 0 || after < 2 || after > 16 || (after === post && tailBars[lastBar] <= a.end)) continue
+          jobs.push({ pa: { t, bonus: 0, drop: false, chorus: false }, after, tail: true })
         }
       }
-      for (const { pa, after } of jobs) {
+      for (const { pa, after, tail } of jobs) {
         const start = shiftBars(a, pa.t, -pre)
         if (!Number.isFinite(start)) continue
         const job = after === post ? variant : { ...variant, bars: pre + after }
-        for (const fromA of lanesFrom(a, start, job.bars, pre)) {
+        const i0 = floorIndex(a.downbeats, start + 0.05)
+        const lanes: LaneOption[] = !tail
+          ? lanesFrom(a, start, job.bars, pre)
+          : tailBars[i0 + job.bars] !== undefined && keepsGrid(a, i0 + pre, i0, Math.min(i0 + job.bars, a.downbeats.length - 1))
+            ? [{ lane: { start, path: [] }, advance: tailBars[i0 + job.bars] - start, extra: 0 }]
+            : []
+        for (const fromA of lanes) {
           // The shape's beat: A's real bars over the material (loops included), so the swap lands on A's bar.
           const stats = shapeFor(job, fromA.advance / (4 * job.bars))
           if (stats.basses > 0.001) continue
           const length = stats.shape.length
-          if (laneReach(fromA.lane, length) > a.duration) continue
+          if (laneReach(fromA.lane, length) > a.duration + (tail ? 4 * a.period : 0)) continue
           for (const { pb, options } of lanesB(after))
             for (const toB of options) {
               // B's rate: its material over the blend's length, so B arrives where it should as A stops. Counted in bars, it
@@ -1386,7 +1428,7 @@ export function planTransition(
     let energyTerm = 0
     if (stats.shape.length > 0) {
       const energy = overlapEnergy(placement, a, b)
-      if (energy.over > MAX_OVER_DB || energy.basses > 0) return null
+      if (energy.over > (placement.variant.volume === 'overlap' ? MAX_OVER_DB_OVERLAP : MAX_OVER_DB) || energy.basses > 0) return null
       if (placement.variant.preset === 'blend') {
         energyTerm = 0.05 * Math.max(0, HOLE_DB - energy.mean)
         // Busy parts (mids and highs up) take a filter, thin ones blend open; long blends suit thin parts, the short
@@ -1394,7 +1436,8 @@ export function planTransition(
         const filtered = placement.variant.filterIn || placement.variant.filterOut ? 1 : 0
         energyTerm -= 0.02 * (filtered ? energy.busy : 1 - energy.busy)
         if (placement.variant.bars >= 16) energyTerm += 0.04 * energy.busy
-        if (placement.variant.bars <= 4) energyTerm += 0.04 * (1 - energy.busy)
+        if (placement.variant.volume === 'scurve') energyTerm += 0.3 * (1 - energy.busy)
+        else if (placement.variant.bars <= 4) energyTerm += 0.04 * (1 - energy.busy)
       }
     }
     const { clash: voices, lostA, lostB } = vocalCost(placement, a, b)
@@ -1405,9 +1448,17 @@ export function planTransition(
     // against A's beats. Judged two bars at a time too.
     const drift = placement.beatmatched ? phaseError(placement, a, b, tempo.multiple) : { median: 0, p90: 0, checked: 1, worstWindow: 0 }
     if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75 || drift.worstWindow > MAX_WINDOW_DRIFT) return null
+    // A swung groove against a straight one flams wherever both beats are loud: a little of that is a handover, more
+    // costs (up to a 16-beat stretch, then the full price).
+    let swingTerm = 0
+    if (placement.beatmatched && Math.abs(swingOf(a.mix) - swingOf(b.mix)) > SWING_CLASH) {
+      let loudBoth = 0
+      for (let i = 0; i < stats.loudA.length; i++) if (i * stats.dt >= placement.bStart && stats.loudA[i] && stats.loudB[i]) loudBoth += stats.dt
+      swingTerm = 0.5 * Math.min(1, Math.max(0, loudBoth - 4 * stats.beat) / (16 * stats.beat))
+    }
     const finish = placement.variant.preset === 'blend' ? placement.variant.prior - start.variant.prior - BEST_FINISH : 0
     const clarityTerm = Number.isNaN(placement.clarity) ? 0.1 : 0.3 * Math.max(0, 1 - placement.clarity / MIN_CLARITY)
-    const score = placement.bound + finish - tonalTerm - energyTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    const score = placement.bound + finish - tonalTerm - energyTerm - swingTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
   let best: { placement: Placement; score: number } | null = null

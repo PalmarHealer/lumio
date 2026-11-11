@@ -780,13 +780,14 @@ function alignPhase(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
   }
   // No beats of both loud at once (a shape that hands the beat over in one go): nothing to fit, B starts on its phrase.
   if (!fitted) return { rate: p.rate, bStart: p.bStart - p.slack, laneB: p.laneB }
-  // Each song's kick sits a little after its grid (its accents): where both kicks sound together, meet halfway between
-  // grid and kick alignment, weighting the kicks 2:1 (B moves earlier by that share of the difference).
+  // Each song's kick sits a little after its grid (its accents): meet between grid and kick alignment, halfway where only
+  // one deck's bass is up (the other kick's click still sounds), weighting the kicks 2:1 where both basses sound
+  // (B moves earlier by that share of the difference).
   const kick = (mix: TrackMix) => {
     const value = (mix as TrackMix & { kickOffset?: number }).kickOffset
     return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 0.05 ? value : 0
   }
-  const shift = (2 / 3) * p.stats.kicksTogether * (kick(b.mix) - kick(a.mix))
+  const shift = (1 / 2 + (1 / 6) * p.stats.kicksTogether) * (kick(b.mix) - kick(a.mix))
   return { rate: current.rate, bStart: Math.max(0, current.bStart - shift), laneB: current.laneB }
 }
 

@@ -126,8 +126,12 @@ export interface TrackMix {
    * padding are merged.
    */
   vocals: Array<{ start: number; end: number }>
-  /** Where `vocals` came from: synced lyrics aligned to the audio, an estimate from the audio, or nothing found. */
-  vocalSource: 'lyrics' | 'audio' | 'none'
+  /**
+   * Where `vocals` came from: synced lyrics aligned to the audio; `unplaced` when the song has lyrics but they couldn't
+   * be placed on this recording (another version, or a check that failed: `vocals` is empty although someone sings,
+   * where is unknown); an estimate from the audio; or nothing found (no lyrics: maybe instrumental).
+   */
+  vocalSource: 'lyrics' | 'unplaced' | 'audio' | 'none'
   /** First phrase where the song is fully "in" (beat and bass), and where it starts to wind down after its last chorus/drop. */
   introEnd: number
   outroStart: number
@@ -1137,10 +1141,14 @@ function phraseBass(samples: Float32Array, rate: number, times: number[]) {
   return counts
 }
 
-/** Where lyrics might belong on the audio: an offset (seconds) and how well the sung stretches fit there (0–1). */
+/**
+ * Where lyrics might belong on the audio: an offset (seconds), how well the sung stretches fit there (0–1), and how far
+ * that fit stands above the fits at every offset tried (standard units; for staying only).
+ */
 interface Placement {
   offset: number
   fit: number
+  z?: number
 }
 
 /**
@@ -1161,7 +1169,9 @@ function lyricsPlacements(stretches: Array<{ start: number; end: number }>, acti
   const shifts: number[] = []
   for (let shift = -reach; shift <= reach; shift++) if (fits(shift)) shifts.push(shift)
   const scores = shifts.map(correlation)
-  const placements: Placement[] = fits(0) ? [{ offset: 0, fit: correlation(0) }] : []
+  const average = mean(scores)
+  const spread = Math.sqrt(mean(scores.map((value) => (value - average) ** 2))) || 1e-9
+  const placements: Placement[] = fits(0) ? [{ offset: 0, fit: correlation(0), z: (correlation(0) - average) / spread }] : []
   // The best local maxima, each at least 3 seconds from the ones taken.
   const peaks = shifts.map((shift, i) => ({ shift, value: scores[i]! })).filter((_, i) => (i === 0 || scores[i]! >= scores[i - 1]!) && (i === scores.length - 1 || scores[i]! >= scores[i + 1]!))
   peaks.sort((a, b) => b.value - a.value)
@@ -1419,14 +1429,18 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     // right here and nowhere better. Thresholds from 11 songs, each with its own and every other one's lyrics.
     const stayFits = !!stay && stay.fit >= 0.3 && placed.every((placement) => placement.fit <= stay.fit + 0.02 && (placement.repetition ?? 0) < 2)
     let offset: number | null = null
-    if (best && best.repetition === null) offset = stay && placed.every((placement) => placement.fit <= stay.fit + 0.1) ? 0 : null
     // Staying with moderate repetition evidence is fine too when staying is the best place on both counts (its
     // repeated lines sound most alike there, and its stretches fit the activity best there): a chorus sung once over
     // a breakdown and once over the drop sounds less alike, but nowhere else fits better.
     const stayBest = !!stay && stay.fit >= 0.2 && (stay.repetition ?? -Infinity) >= 3 && placed.every((placement) => placement.fit <= stay.fit && (placement.repetition ?? -Infinity) <= stay.repetition!)
+    // Staying is also fine where its stretches fit the activity clearly (well above the fit at the other offsets, and
+    // best of all placements) and its repeated lines sound somewhat alike there: a song whose chorus comes back over
+    // changing backings (Outside). Thresholds from 25 songs, each with every song's lyrics: no other song's lyrics
+    // pass it.
+    const stayClear = !!stay && (stay.z ?? 0) >= 1.8 && stay.fit >= 0.3 && (stay.repetition ?? 0) >= 2 && placed.every((placement) => placement.fit <= stay.fit)
     if (best && best.repetition === null) offset = stay && placed.every((placement) => placement.fit <= stay.fit + 0.1) ? 0 : null
-    else if (best && best.offset === 0) offset = best.repetition! >= 4 || stayFits || stayBest ? 0 : null
-    else if (best) offset = best.repetition! >= 5 && best.fit >= 0.2 && best.fit >= (stay?.fit ?? -1) + 0.08 ? best.offset : stayFits ? 0 : null
+    else if (best && best.offset === 0) offset = best.repetition! >= 4 || stayFits || stayBest || stayClear ? 0 : null
+    else if (best) offset = best.repetition! >= 5 && best.fit >= 0.2 && best.fit >= (stay?.fit ?? -1) + 0.08 ? best.offset : stayFits || stayClear ? 0 : null
     if (offset !== null) {
       // Padded by how far they may be off (see TrackMix.vocals): a beat for lyrics kept where they were timed, two
       // seconds for lyrics that had to be moved; stretches that then touch are merged.
@@ -1449,6 +1463,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
       lyricLines = usable.filter((line) => normal(line.text)).map((line) => ({ time: line.time + offset, count: counts.get(normal(line.text))! }))
     }
   }
+  // Lyrics that couldn't be placed (or too few lines to check) still say someone sings.
+  if (vocalSource === 'none' && stretches.length) vocalSource = 'unplaced'
   // ---- 3. per beat: chroma, timbre, loudness; then the bars ----
   const beatPeriod = 60 / bpm
   const beatEnds = beats.map((time, i) => beats[i + 1] ?? time + beatPeriod)
@@ -1711,7 +1727,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const chorusGroups = new Set<number>()
   const candidates = groupScores
     .map((group, c) => ({ c, score: group.level / loud + (vocalSource === 'lyrics' ? 0.6 * group.lyrics : 0) + 0.1 * Math.min(4, group.members.length) }))
-    .filter(({ c }) => groupScores[c]!.repeated && groupScores[c]!.level >= 0.8 * loud && (vocalSource === 'none' || groupScores[c]!.sung > 0.15))
+    .filter(({ c }) => groupScores[c]!.repeated && groupScores[c]!.level >= 0.8 * loud && (vocalSource !== 'lyrics' || groupScores[c]!.sung > 0.15))
     .sort((a, b) => b.score - a.score)
   if (candidates.length) {
     chorusGroups.add(candidates[0]!.c)
@@ -1783,7 +1799,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   for (let p = 0; p < phraseCount; p++) {
     if (kinds[p] !== 'other') continue
     const info = phraseInfo[p]!
-    if (vocalSource !== 'none' ? info.sung > 0.3 : info.occurrences >= 2 && info.level >= 0.5 * loud) kinds[p] = 'verse'
+    if (vocalSource === 'lyrics' ? info.sung > 0.3 : info.occurrences >= 2 && info.level >= 0.5 * loud) kinds[p] = 'verse'
   }
 
   // Sections: runs of phrases of one kind (a new section where a drop or a new chorus starts, or a group repeats).

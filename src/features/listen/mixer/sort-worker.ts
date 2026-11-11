@@ -11,6 +11,8 @@ import type { MixStyle, PlaylistMixer, TrackMix, Transition } from './types.ts'
 export interface SortRequest {
   /** Matches the answer to the ask (only the newest answer counts). */
   ask: number
+  /** What the ask was made from (style, songs, analyses, "keep custom" …), handed back so the dialog can tell whether the answer still fits. */
+  inputs: string
   /** The playlist in its current order (a song twice appears twice). */
   tracks: Array<{ id: string; mix: TrackMix | null }>
   style: MixStyle
@@ -24,6 +26,7 @@ export interface SortRequest {
 
 export interface SortResult {
   ask: number
+  inputs: string
   order: string[]
   transitions: Record<string, Transition>
   replacedCustom: number
@@ -33,9 +36,9 @@ export interface SortResult {
 const scope = self as unknown as { onmessage: ((event: MessageEvent<SortRequest>) => void) | null; postMessage: (message: SortResult) => void }
 
 scope.onmessage = (event) => {
-  const { ask, tracks, style, existing, keepCustom, durations } = event.data
+  const { ask, inputs, tracks, style, existing, keepCustom, durations } = event.data
   const mixes = Object.fromEntries(tracks.map((track) => [track.id, track.mix]))
   const order = event.data.order ?? sortForMix(tracks, style)
   const { transitions, replacedCustom } = buildTransitions(order, mixes, style, existing, { keepCustom, durations })
-  scope.postMessage({ ask, order, transitions, replacedCustom, length: estimateMixLength(order, mixes, transitions, durations) })
+  scope.postMessage({ ask, inputs, order, transitions, replacedCustom, length: estimateMixLength(order, mixes, transitions, durations) })
 }

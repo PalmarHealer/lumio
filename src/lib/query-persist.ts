@@ -14,10 +14,11 @@ const SAVE_AFTER_MS = 2000
 export const RESTORE_TIMEOUT_MS = 400
 
 /**
- * Queries not worth keeping: typed searches, answers that change by the minute, what the browser measures itself, and
- * the mixer's whole-track analyses (tens of kilobytes a song; the server has them at hand).
+ * Queries not worth keeping: typed searches, answers that change by the minute, what the browser measures itself, the
+ * mixer's whole-track analyses (tens of kilobytes a song; the server has them at hand) and playlists' mixer settings
+ * (their transitions add up, and an old copy would make a playlist mix or not mix by what it was once).
  */
-const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'track-mix'])
+const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'track-mix', 'playlist-mixer'])
 
 interface Saved {
   savedAt: number

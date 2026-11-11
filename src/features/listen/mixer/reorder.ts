@@ -4,7 +4,9 @@
  * list without it). Few moves: the longest run of entries already in the right relative order stays where it is, only
  * the others move, each in target order, right behind the entry that comes before it in the target (or to the front).
  * By then that entry is in place relative to all others already settled, so after the last move the order is the
- * target. Pure, so node can check it.
+ * target. This holds while every song in the playlist is visible to the person (Jellyfin counts positions among the
+ * visible ones), and needs entries that can be told apart: current Jellyfin hands out the song's id as the entry id,
+ * so a song in the playlist twice can't be moved on its own (`hasSharedEntries`). Pure, so node can check it.
  */
 
 export interface Move {
@@ -58,8 +60,8 @@ export function planMoves(current: readonly string[], target: readonly string[])
 }
 
 /**
- * Turns a sorted list of track ids back into playlist entries: a song in the playlist twice has two entries, handed
- * out in their current order.
+ * Turns a sorted list of track ids back into playlist entries. Entries must be told apart (see `hasSharedEntries`);
+ * where a server still hands out own entry ids for a song in the playlist twice, they are handed out in their order.
  */
 export function entriesInOrder(tracks: ReadonlyArray<{ id: string; entry: string }>, order: readonly string[]): string[] {
   const byId = new Map<string, string[]>()
@@ -71,4 +73,18 @@ export function entriesInOrder(tracks: ReadonlyArray<{ id: string; entry: string
   })
   if ([...byId.values()].some((left) => left.length)) throw new Error('The order leaves songs out')
   return entries
+}
+
+/**
+ * Whether entries can't be told apart: current Jellyfin hands out the song's own id as the entry id, so a song in a
+ * playlist twice has two equal entries, and moving "that entry" always moves the first of them. Such a playlist can't
+ * be put into an order entry by entry.
+ */
+export function hasSharedEntries(entries: ReadonlyArray<string | null | undefined>): boolean {
+  const seen = new Set<string>()
+  for (const entry of entries) {
+    if (!entry || seen.has(entry)) return true
+    seen.add(entry)
+  }
+  return false
 }

@@ -38,8 +38,6 @@ export function MixerHost() {
   const lumioFetch = useStableLumioFetch()
   const queryClient = useQueryClient()
   const on = !!playlistId && mixer.data?.on === true
-  const style = mixer.data?.style
-  const updated = mixer.data?.updated
 
   useEffect(() => {
     if (!on || !playlistId) return
@@ -56,8 +54,9 @@ export function MixerHost() {
     }
     setTransitionProvider(provider)
     return () => setTransitionProvider(null)
-    // Registered anew when the settings change, so the player asks again for the transition it has planned already.
-  }, [on, playlistId, style, updated, queryClient, lumioFetch])
+    // Registered once per playlist and switch: setting it again would call off a transition under way. A save (style,
+    // "sort & build") counts from the next transition the player asks for.
+  }, [on, playlistId, queryClient, lumioFetch])
 
   // The songs coming up get their analyses loaded ahead (the server queues those it hasn't done yet).
   useEffect(() => {

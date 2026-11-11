@@ -411,7 +411,7 @@ export function PlaylistPage() {
                 <AddToPlaylist tracks={async () => list} label={t.addToOtherPlaylist} exclude={id} />
                 <DownloadMenuItem downloadKey={`playlist:${id}`} name={item?.Name ?? ''} items={tracks.data} collection={item} />
                 <TasteMenuItem kind="playlists" id={id} />
-                {canEdit && <MixerMenuItems playlistId={id} trackCount={list.length} onBuild={() => setBuilding(true)} />}
+                {canEdit && <MixerMenuItems playlistId={id} onBuild={() => setBuilding(true)} />}
                 {mine && (
                   <>
                     <DropdownMenuSeparator />

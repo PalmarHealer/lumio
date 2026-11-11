@@ -86,52 +86,81 @@ export function usePlaylistMixer(playlistId: string | null | undefined) {
   return useQuery({ ...mixerOptions(lumioFetch, playlistId ?? ''), enabled: !!playlistId })
 }
 
-/** Why saving the settings failed: 403 (not an editor), 409 (someone else saved in between), anything else. */
+/** Why saving the settings failed: 403 (not an editor), 409 (someone else saved in between; `current` is theirs), other. */
 export class MixerSaveError extends Error {
   readonly status: number
-  constructor(status: number) {
+  readonly current: PlaylistMixer | null
+  constructor(status: number, current: PlaylistMixer | null = null) {
     super(`Saving the mixer settings failed (${status})`)
     this.status = status
+    this.current = current
   }
 }
 
 export type MixerChange = Partial<Pick<PlaylistMixer, 'on' | 'style' | 'transitions'>>
 
+interface PendingSave {
+  change: MixerChange
+}
+
+/** Saves under way per playlist, oldest first: what is answered later must not undo a change still waiting. */
+const pendingSaves = new Map<string, PendingSave[]>()
+
+/** The changes made after this save, merged (the newest wins), which the settings shown must keep. */
+function changesAfter(playlistId: string, save: PendingSave | undefined): MixerChange {
+  const list = pendingSaves.get(playlistId) ?? []
+  const index = save ? list.indexOf(save) : -1
+  return Object.assign({}, ...list.slice(index + 1).map((entry) => entry.change)) as MixerChange
+}
+
 /**
- * Saves changes to a playlist's mixer settings (only its editors may). The page shows them at once; on failure it goes
- * back to what was there, or, when someone else saved in between (409), to what they saved.
+ * Saves changes to a playlist's mixer settings (only its editors may). The page shows them at once.
+ *
+ * Saves of one playlist run one after the other (a mutation scope). Each sends its own change on top of the settings
+ * as they are by then, with the `updated` the previous save got back; the server turns down a save based on an older
+ * one (409). Whatever answers, changes made after it and not yet saved stay in place: on success the server's settings
+ * plus those; on failure only this change goes back, and on a 409 the other person's settings come in, plus those.
  */
 export function useSaveMixer(playlistId: string) {
   const lumioFetch = useStableLumioFetch()
   const queryClient = useQueryClient()
   const key = mixerKey(playlistId)
   return useMutation({
-    // One save after the other: each sends the `updated` the previous one got back (else the server sees a conflict).
     scope: { id: `playlist-mixer:${playlistId}` },
-    // The change itself is already in the cache by now (onMutate runs first): the whole settings are sent.
-    mutationFn: async (_change: MixerChange) => {
-      const current = queryClient.getQueryData<PlaylistMixer>(key) ?? DEFAULT_MIXER
-      // The optimistic copy carries the `updated` it was based on, which is what the server checks against.
-      const response = await lumioFetch(`/music/mixer/${playlistId}`, { method: 'PUT', body: JSON.stringify(current) })
-      if (response.status === 409) {
-        queryClient.setQueryData(key, readMixer(await response.json().catch(() => null)))
-        throw new MixerSaveError(409)
-      }
+    mutationFn: async (change: MixerChange) => {
+      const latest = queryClient.getQueryData<PlaylistMixer>(key) ?? DEFAULT_MIXER
+      // `latest.updated` is the server's (changes shown early never touch it).
+      const body: PlaylistMixer = { ...latest, ...change, updated: latest.updated }
+      const response = await lumioFetch(`/music/mixer/${playlistId}`, { method: 'PUT', body: JSON.stringify(body) })
+      if (response.status === 409) throw new MixerSaveError(409, readMixer(await response.json().catch(() => null)))
       if (!response.ok) throw new MixerSaveError(response.status)
       return readMixer(await response.json())
     },
     onMutate: async (change) => {
       await queryClient.cancelQueries({ queryKey: key })
-      const previous = queryClient.getQueryData<PlaylistMixer>(key)
-      queryClient.setQueryData<PlaylistMixer>(key, { ...(previous ?? DEFAULT_MIXER), ...change })
-      return { previous }
+      const previous = queryClient.getQueryData<PlaylistMixer>(key) ?? DEFAULT_MIXER
+      const save: PendingSave = { change }
+      pendingSaves.set(playlistId, [...(pendingSaves.get(playlistId) ?? []), save])
+      queryClient.setQueryData<PlaylistMixer>(key, { ...previous, ...change })
+      return { previous, save }
     },
-    onError: (error, _change, context) => {
-      // A conflict already put the other person's settings in place.
-      if (error instanceof MixerSaveError && error.status === 409) return
-      queryClient.setQueryData(key, context?.previous ?? DEFAULT_MIXER)
+    onSuccess: (saved, _change, context) => queryClient.setQueryData<PlaylistMixer>(key, { ...saved, ...changesAfter(playlistId, context?.save) }),
+    onError: (error, change, context) => {
+      const later = changesAfter(playlistId, context?.save)
+      if (error instanceof MixerSaveError && error.status === 409 && error.current) {
+        queryClient.setQueryData<PlaylistMixer>(key, { ...error.current, ...later })
+        return
+      }
+      // Only this change goes back (to what was shown before it).
+      const previous = context?.previous ?? DEFAULT_MIXER
+      const undone = Object.fromEntries(Object.keys(change).map((field) => [field, previous[field as keyof MixerChange]])) as MixerChange
+      queryClient.setQueryData<PlaylistMixer>(key, (current) => ({ ...(current ?? DEFAULT_MIXER), ...undone, ...later }))
     },
-    onSuccess: (saved) => queryClient.setQueryData(key, saved),
+    onSettled: (_data, _error, _change, context) => {
+      const rest = (pendingSaves.get(playlistId) ?? []).filter((entry) => entry !== context?.save)
+      if (rest.length) pendingSaves.set(playlistId, rest)
+      else pendingSaves.delete(playlistId)
+    },
   })
 }
 
@@ -146,33 +175,56 @@ function readMix(raw: unknown): TrackMix | null {
   return mix.v === MIX_VERSION && Number.isFinite(mix.duration) && mix.duration > 0 ? mix : null
 }
 
+/** Tempo and key of a song as the whole-track analysis found them (`/music/mix?summary=1`), for showing them. */
+export interface MixSummary {
+  bpm: number
+  bpmConfidence: number
+  key: number
+  minor: boolean
+  keyClarity: number
+  duration: number
+}
+
+export const mixSummaryKey = (id: string) => ['track-mix-summary', MIX_VERSION, id] as const
+
+function readSummary(raw: unknown): MixSummary | null {
+  if (!raw || typeof raw !== 'object') return null
+  const value = raw as MixSummary
+  return [value.bpm, value.key, value.duration].every((x) => typeof x === 'number' && Number.isFinite(x)) ? value : null
+}
+
 interface Waiting {
   id: string
-  resolve: (mix: TrackMix | null) => void
+  resolve: (answer: unknown) => void
   reject: (error: unknown) => void
 }
 
-let waiting: Waiting[] = []
-let waitingFetch: LumioFetch | null = null
-let flushTimer: ReturnType<typeof setTimeout> | null = null
+type Kind = 'full' | 'summary'
 
-async function flush() {
-  flushTimer = null
-  const batch = waiting
-  const lumioFetch = waitingFetch!
-  waiting = []
-  waitingFetch = null
+/** Asks made in the same moment, per kind of answer, and the fetch they go out with. */
+const batches: Record<Kind, { waiting: Waiting[]; fetch: LumioFetch | null; timer: ReturnType<typeof setTimeout> | null }> = {
+  full: { waiting: [], fetch: null, timer: null },
+  summary: { waiting: [], fetch: null, timer: null },
+}
+
+async function flush(kind: Kind) {
+  const batch = batches[kind]
+  const waiting = batch.waiting
+  const lumioFetch = batch.fetch!
+  batch.waiting = []
+  batch.fetch = null
+  batch.timer = null
   const byId = new Map<string, Waiting[]>()
-  for (const entry of batch) byId.set(entry.id, [...(byId.get(entry.id) ?? []), entry])
+  for (const entry of waiting) byId.set(entry.id, [...(byId.get(entry.id) ?? []), entry])
   const ids = [...byId.keys()]
   await Promise.all(
     Array.from({ length: Math.ceil(ids.length / BATCH) }, async (_, part) => {
       const chunk = ids.slice(part * BATCH, (part + 1) * BATCH)
       try {
-        const response = await lumioFetch(`/music/mix?ids=${chunk.join(',')}`)
+        const response = await lumioFetch(`/music/mix?ids=${chunk.join(',')}${kind === 'summary' ? '&summary=1' : ''}`)
         if (!response.ok) throw new Error(`Lumio server ${response.status}`)
         const found = (await response.json()) as Record<string, unknown>
-        for (const id of chunk) for (const entry of byId.get(id)!) entry.resolve(readMix(found[id]))
+        for (const id of chunk) for (const entry of byId.get(id)!) entry.resolve(found[id])
       } catch (error) {
         for (const id of chunk) for (const entry of byId.get(id)!) entry.reject(error)
       }
@@ -180,12 +232,13 @@ async function flush() {
   )
 }
 
-/** One song's analysis; asks made in the same moment go out together. */
-function loadMix(lumioFetch: LumioFetch, id: string): Promise<TrackMix | null> {
+/** One song's answer from `/music/mix`; asks of the same kind made in the same moment go out together. */
+function load(kind: Kind, lumioFetch: LumioFetch, id: string): Promise<unknown> {
+  const batch = batches[kind]
   return new Promise((resolve, reject) => {
-    waiting.push({ id, resolve, reject })
-    waitingFetch ??= lumioFetch
-    flushTimer ??= setTimeout(() => void flush(), 0)
+    batch.waiting.push({ id, resolve, reject })
+    batch.fetch ??= lumioFetch
+    batch.timer ??= setTimeout(() => void flush(kind), 0)
   })
 }
 
@@ -195,7 +248,7 @@ export const analysable = (id: string | null | undefined): id is string => !!id 
 export function mixOptions(lumioFetch: LumioFetch, id: string) {
   return {
     queryKey: mixKey(id),
-    queryFn: () => loadMix(lumioFetch, id),
+    queryFn: async () => readMix(await load('full', lumioFetch, id)),
     // Found analyses never go stale (a new analysis comes with a new MIX_VERSION, a new key); nulls do, as they fill in.
     staleTime: (query: { state: { data: TrackMix | null | undefined } }) => (query.state.data ? Infinity : NULL_RETRY_MS),
     gcTime: MIX_GC_MS,
@@ -269,23 +322,34 @@ export function useTrackMixes(ids: readonly string[], options: { enabled?: boole
   }
 }
 
+export function mixSummaryOptions(lumioFetch: LumioFetch, id: string) {
+  return {
+    queryKey: mixSummaryKey(id),
+    queryFn: async () => readSummary(await load('summary', lumioFetch, id)),
+    staleTime: (query: { state: { data: MixSummary | null | undefined } }) => (query.state.data ? Infinity : NULL_RETRY_MS),
+    retry: 1,
+  }
+}
+
 /**
  * Tempo and key of a playlist's songs as the mixer sees them ("124 BPM · 8A"), by id, for the rows of a mixer
- * playlist; '' for a song without an analysis yet.
+ * playlist; '' for a song without an analysis yet. Only the small summaries are fetched, not the whole analyses.
  */
 export function useMixInfo(ids: readonly string[], enabled: boolean): Record<string, string> {
-  const { mixes } = useTrackMixes(ids, { enabled })
+  const lumioFetch = useStableLumioFetch()
+  const unique = useMemo(() => (enabled ? [...new Set(ids.filter(analysable))] : []), [ids, enabled])
+  const results = useQueries({ queries: unique.map((id) => mixSummaryOptions(lumioFetch, id)) })
+  const signature = results.map((result) => (result.data ? `${Math.round(result.data.bpm)}:${result.data.key}:${result.data.minor}` : '')).join(',')
   return useMemo(() => {
     const info: Record<string, string> = {}
-    for (const id of ids) {
-      const mix = mixes.get(id)
-      if (!mix) {
-        info[id] = ''
-        continue
-      }
-      const key = camelotLabel(mix.key, mix.minor)
-      info[id] = [mix.bpm > 0 ? `${Math.round(mix.bpm)} BPM` : '', key].filter(Boolean).join(' · ')
-    }
+    unique.forEach((id, index) => {
+      const summary = results[index]?.data
+      if (!summary) return void (info[id] = '')
+      const key = camelotLabel(summary.key, summary.minor)
+      info[id] = [summary.bpm > 0 ? `${Math.round(summary.bpm)} BPM` : '', key].filter(Boolean).join(' · ')
+    })
     return info
-  }, [ids, mixes])
+    // `results` is a new array on every render; the signature says when its answers changed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unique, signature])
 }

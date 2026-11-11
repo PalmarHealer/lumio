@@ -1423,11 +1423,14 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     // this very recording). Lyrics whose repeated lines don't sound alike anywhere belong to another song or version.
     // Lyrics without repeated lines can't be checked that way: they are kept where they are, unless the activity
     // clearly says otherwise.
-    const placed = lyricsPlacements(stretches, activity, duration).map((placement) => {
-      const repetition = repetitionScore(usable, placement.offset, soundAt)
-      return { ...placement, repetition, score: (repetition ?? 0) + 10 * placement.fit + (placement.offset === 0 ? 1.5 : 0) }
-    })
-    placed.sort((a, b) => b.score - a.score)
+    const placedFor = (lines: LyricLine[], sung: Array<{ start: number; end: number }>) =>
+      lyricsPlacements(sung, activity, duration)
+        .map((placement) => {
+          const repetition = repetitionScore(lines, placement.offset, soundAt)
+          return { ...placement, repetition, score: (repetition ?? 0) + 10 * placement.fit + (placement.offset === 0 ? 1.5 : 0) }
+        })
+        .sort((a, b) => b.score - a.score)
+    const placed = placedFor(usable, stretches)
     const stay = placed.find((placement) => placement.offset === 0)
     const best = placed[0]
     // Moving lyrics takes more than keeping them where they are: their repeated lines must sound clearly alike there,
@@ -1448,6 +1451,30 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     if (best && best.repetition === null) offset = stay && placed.every((placement) => placement.fit <= stay.fit + 0.1) ? 0 : null
     else if (best && best.offset === 0) offset = best.repetition! >= 4 || stayFits || stayBest || stayClear ? 0 : null
     else if (best) offset = best.repetition! >= 5 && best.fit >= 0.2 && best.fit >= (stay?.fit ?? -1) + 0.08 ? best.offset : stayFits || stayClear ? 0 : null
+    // Decoys: the same lyrics on timelines they can't belong to (mirrored, rotated by about a third, a half and two
+    // thirds of their span, mirrored and rotated), scored alike: the best of them is what these lyrics score on this
+    // song by chance (one that sounds alike all through, or is sung all through, scores any lyrics high). The chosen
+    // placement must beat it by 0.75. Over 25 songs, each with every song's lyrics: another song's lyrics taken 10
+    // times in 576 instead of 21, own lyrics placed 18 times in 24 instead of 19 (a rap sung all through loses).
+    if (offset !== null) {
+      const first = usable[0]!.time
+      const span = usable[usable.length - 1]!.time - first + 4
+      const moves = [
+        (time: number) => first + span - 4 - (time - first),
+        (time: number) => first + ((time - first + 0.35 * span) % span),
+        (time: number) => first + ((time - first + 0.5 * span) % span),
+        (time: number) => first + ((time - first + 0.65 * span) % span),
+        (time: number) => first + ((span - 4 - (time - first) + 0.5 * span) % span),
+      ]
+      let decoy = -Infinity
+      for (const move of moves) {
+        const lines = usable.map((line) => ({ ...line, time: move(line.time) })).sort((a, b) => a.time - b.time)
+        const sung = lyricStretches(lines)
+        if (sung.length) decoy = Math.max(decoy, placedFor(lines, sung)[0]?.score ?? -Infinity)
+      }
+      const chosen = placed.find((placement) => placement.offset === offset)
+      if (!chosen || chosen.score <= decoy + 0.75) offset = null
+    }
     if (offset !== null) {
       // Padded by how far they may be off (see TrackMix.vocals): a beat for lyrics kept where they were timed, two
       // seconds for lyrics that had to be moved; stretches that then touch are merged.

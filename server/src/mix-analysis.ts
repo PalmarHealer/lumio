@@ -654,6 +654,73 @@ function reanchor(beats: number[], stretches: Array<{ from: number; to: number; 
 }
 
 /**
+ * Evens out stretches where the tracker squeezed or stretched beats while the music kept its tempo: 4 gaps in a row
+ * whose mean is more than 5 % off the steady tempo around them, or 8 more than 3 % (the 16 gaps each side vary under
+ * 3 %, and the tempo before and after agrees within 2 %). Syncopated stabs or a riff ahead of the beat (an intro) can pull the
+ * tracker's beats that way. The stretch is laid out again with as many even beats as the steady tempo fits between
+ * its ends (a beat the tracker added or dropped is undone); the onset refinement then puts them on the attacks.
+ */
+function steadyBeats(beats: number[]): number[] {
+  if (beats.length < 24) return beats
+  const gaps = beats.slice(1).map((time, i) => time - beats[i]!)
+  const bad = new Array(gaps.length).fill(false) as boolean[]
+  const reference = new Array(gaps.length).fill(0) as number[]
+  // Four gaps more than 5 % off, or eight gaps more than 3 % off (a slower smear that adds up just as much).
+  for (const [width, limit] of [[4, 0.05], [8, 0.03]] as const) {
+    for (let i = 0; i + width <= gaps.length; i++) {
+      const before = gaps.slice(Math.max(0, i - 16), i)
+      const after = gaps.slice(i + width, i + width + 16)
+      if (before.length < 6 || after.length < 6) continue
+      const around = [...before, ...after]
+      const ref = median(around)
+      if (median(around.map((gap) => Math.abs(gap - ref))) / ref > 0.03) continue
+      if (Math.abs(median(before) / median(after) - 1) > 0.02) continue
+      if (Math.abs(mean(gaps.slice(i, i + width)) / ref - 1) > limit) {
+        for (let k = i; k < i + width; k++) {
+          bad[k] = true
+          reference[k] = ref
+        }
+      }
+    }
+  }
+  let out = [...beats]
+  for (let i = gaps.length - 1; i >= 0; ) {
+    if (!bad[i]) {
+      i--
+      continue
+    }
+    let j = i
+    while (j > 0 && bad[j - 1]) j--
+    // Gaps j..i are off: beats j..i+1 bound the stretch.
+    const ref = median(reference.slice(j, i + 1))
+    const start = out[j]!
+    const end = out[i + 1]!
+    const span = (end - start) / ref
+    const whole = Math.round(span)
+    if (Math.abs(span - whole) > 0.25 && j <= 16) {
+      // Not a whole number of beats: the tracker changed phase across it (an intro's syncopation pulled it onto the
+      // off-beats). A short stretch at the start (up to 16 beats) takes the steady grid that follows, counted back.
+      const first = out[0]! - ref / 2
+      const before: number[] = []
+      for (let time = end - ref; time >= Math.max(0, first); time -= ref) before.unshift(time)
+      out = [...before, ...out.slice(i + 1)]
+    } else if (Math.abs(span - whole) > 0.25 && out.length - 1 - (i + 1) <= 16) {
+      // The same at the end: the steady grid before it, counted on.
+      const last = out[out.length - 1]! + ref / 2
+      const after: number[] = []
+      for (let time = start + ref; time <= last; time += ref) after.push(time)
+      out = [...out.slice(0, j + 1), ...after]
+    } else {
+      const count = Math.max(1, whole)
+      const even = Array.from({ length: count - 1 }, (_, k) => start + ((end - start) * (k + 1)) / count)
+      out = [...out.slice(0, j + 1), ...even, ...out.slice(i + 1)]
+    }
+    i = j - 1
+  }
+  return out
+}
+
+/**
  * Beats by dynamic programming (Ellis 2007, as librosa does it): every frame's best score is its onset strength plus
  * the best earlier beat's score, less a penalty for a gap unlike the period (log-squared, so the beat may drift a little
  * with the music but not jump). The chain is read back from the last strong frame; weak beats at the ends (silence,
@@ -1112,9 +1179,9 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const lowEnvelope = onsetEnvelope(spectra.lowFlux, frameRate)
   const tempo = estimateTempo(envelope, frameRate)
   const beatFrames = trackBeats(envelope, tempo.period)
-  // Between frames: the onset peak's top by parabolic interpolation (frames are 23 ms apart); then onto the audible
-  // attacks.
-  const trackedBeats = beatFrames.map((frame) => {
+  // Between frames: the onset peak's top by parabolic interpolation (frames are 23 ms apart); squeezed or stretched
+  // stretches evened out (see steadyBeats); then onto the audible attacks.
+  const rawBeats = beatFrames.map((frame) => {
     const left = envelope[frame - 1] ?? 0
     const centre = envelope[frame]!
     const right = envelope[frame + 1] ?? 0
@@ -1122,6 +1189,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     const shift = centre >= left && centre >= right && curvature < 0 ? clamp((left - right) / (2 * curvature), -0.5, 0.5) : 0
     return spectra.time(frame + shift) + BEAT_DELAY
   })
+  const trackedBeats = steadyBeats(rawBeats)
   // Twice: the second pass looks around the corrected beats (a large first correction leaves attacks at the window's
   // edge out of the first look).
   const onsets = fineOnsets(samples, rate)
@@ -1259,7 +1327,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   }
   const harmonyBar = beats.map((_, i) => (i < 4 || i + 4 > beats.length ? 0 : 1 - cosine(window(i - 4, i), window(i, i + 4))))
   const harmonyHalf = beats.map((_, i) => (i < 2 || i + 2 > beats.length ? 0 : 1 - cosine(window(i - 2, i), window(i, i + 2))))
-  const kickAt = beatFrames.map((frame) => Math.max(lowEnvelope[frame - 1] ?? 0, lowEnvelope[frame]!, lowEnvelope[frame + 1] ?? 0, lowEnvelope[frame + 2] ?? 0))
+  const kickAt = beats.map((time) => clamp(Math.round((time - BEAT_DELAY - firstTime) * frameRate), 1, envelope.length - 3)).map((frame) => Math.max(lowEnvelope[frame - 1] ?? 0, lowEnvelope[frame]!, lowEnvelope[frame + 1] ?? 0, lowEnvelope[frame + 2] ?? 0))
   // The kick tells only the half-bar: whether a beat is 1 or 3 rather than 2 or 4, not which of 1 and 3.
   const kick = beats.map((_, i) => (kickAt[i] ?? 0) + (kickAt[i + 2] ?? 0) - (kickAt[i + 1] ?? 0) - (kickAt[i + 3] ?? 0))
   const loudnessChange = beats.map((_, i) => Math.abs(Math.log((mean(beatLevel, i, Math.min(beats.length, i + 4)) + 0.01) / (mean(beatLevel, Math.max(0, i - 4), i) + 0.01))))

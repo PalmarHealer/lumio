@@ -8,6 +8,8 @@ FROM node:24-alpine AS web
 WORKDIR /build
 RUN corepack enable
 COPY package.json pnpm-lock.yaml ./
+# pnpm applies these to dependencies while installing (patchedDependencies in package.json).
+COPY patches ./patches
 # The desktop app's Electron is not needed for the web build.
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 RUN pnpm install --frozen-lockfile

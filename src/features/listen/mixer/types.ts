@@ -53,6 +53,12 @@ export interface TrackMix {
    * melodies and chords have similar profiles (cosine). Empty in analyses made before it.
    */
   phraseChroma: number[][]
+  /**
+   * How far the kick drum's attack lags the beat grid (seconds, the song's median; the grid sits on the accents and
+   * broadband attacks). Aligning two songs by their grids leaves their kicks this much apart, so beatmatching aims at a
+   * compromise between the grids and the kicks. 0 when unknown.
+   */
+  kickOffset: number
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean

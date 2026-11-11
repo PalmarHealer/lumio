@@ -586,6 +586,50 @@ function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: nu
 }
 
 /**
+ * Stretches where the beats still sit consistently off the attacks after the refinement (whose moves are capped at
+ * 50 ms from the tracker): at least 8 beats in a row whose two-bar averaged attack profile, looked at wider (up to
+ * 150 ms or 30 % of a beat each side, so the next 16th isn't reached), has one clear peak (prominence ≥ 0.6, no rival
+ * ≥ 75 %) more than 25 ms from the beat, all within 15 ms of the stretch's median. Returns the stretches with that
+ * median offset.
+ */
+function driftedStretches(beats: number[], onsets: { rise: Float32Array; step: number }) {
+  if (beats.length < 8) return []
+  const gap = median(beats.slice(1).map((time, i) => time - beats[i]!))
+  const profiles = beatProfiles(beats, onsets, Math.min(0.15, 0.3 * gap))
+  const offset = profiles.map((profile) => (profile.prominence >= 0.6 && profile.rival < 0.75 && Math.abs(profile.shift) > 0.025 ? profile.shift : NaN))
+  const stretches: Array<{ from: number; to: number; shift: number }> = []
+  for (let i = 0; i < beats.length; ) {
+    if (Number.isNaN(offset[i]!)) {
+      i++
+      continue
+    }
+    let j = i + 1
+    while (j < beats.length && !Number.isNaN(offset[j]!) && Math.abs(offset[j]! - median(offset.slice(i, j))) <= 0.015) j++
+    const shift = median(offset.slice(i, j))
+    if (j - i >= 8 && offset.slice(i, j).every((value) => Math.abs(value - shift) <= 0.015)) stretches.push({ from: i, to: j, shift })
+    i = j
+  }
+  return stretches
+}
+
+/**
+ * Moves drifted stretches (see driftedStretches) onto their attacks: the stretch's offset, eased in and out at up to
+ * 25 ms a beat (so the bars around it stay within a few percent), on top of the per-beat refinement.
+ */
+function reanchor(beats: number[], stretches: Array<{ from: number; to: number; shift: number }>) {
+  if (!stretches.length) return beats
+  const target = new Array(beats.length).fill(0) as number[]
+  for (const stretch of stretches) for (let i = stretch.from; i < stretch.to; i++) target[i] = stretch.shift
+  const limit = 0.025
+  const forward = [...target]
+  for (let i = 1; i < forward.length; i++) forward[i] = clamp(forward[i]!, forward[i - 1]! - limit, forward[i - 1]! + limit)
+  const backward = [...target]
+  for (let i = backward.length - 2; i >= 0; i--) backward[i] = clamp(backward[i]!, backward[i + 1]! - limit, backward[i + 1]! + limit)
+  // The stretches themselves move fully; around them the two easings meet.
+  return beats.map((time, i) => time + (target[i] ? target[i]! : (forward[i]! + backward[i]!) / 2))
+}
+
+/**
  * Beats by dynamic programming (Ellis 2007, as librosa does it): every frame's best score is its onset strength plus
  * the best earlier beat's score, less a penalty for a gap unlike the period (log-squared, so the beat may drift a little
  * with the music but not jump). The chain is read back from the last strong frame; weak beats at the ends (silence,
@@ -1057,8 +1101,12 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   // Twice: the second pass looks around the corrected beats (a large first correction leaves attacks at the window's
   // edge out of the first look).
   const onsets = fineOnsets(samples, rate)
-  // (Never more than 50 ms from where the tracker put them, in all.)
-  const beats = onAudibleOnsets(onAudibleOnsets(trackedBeats, onsets), onsets).map((time, i) => clamp(time, trackedBeats[i]! - 0.05, trackedBeats[i]! + 0.05))
+  // (Never more than 50 ms from where the tracker put them, in all, except where a whole stretch drifted off its
+  // attacks: there it is re-anchored first, and the refinement works from there.)
+  const refined = onAudibleOnsets(onAudibleOnsets(trackedBeats, onsets), onsets).map((time, i) => clamp(time, trackedBeats[i]! - 0.05, trackedBeats[i]! + 0.05))
+  const drifted = driftedStretches(refined, onsets)
+  const anchored = reanchor(refined, drifted)
+  const beats = drifted.length ? onAudibleOnsets(anchored, onsets).map((time, i) => clamp(time, anchored[i]! - 0.05, anchored[i]! + 0.05)) : refined
   // The tempo the beats keep: a line through beat number and time (robust to a drifting or missed beat in between).
   let bpm = (60 * frameRate) / tempo.period
   if (beats.length >= 8) {

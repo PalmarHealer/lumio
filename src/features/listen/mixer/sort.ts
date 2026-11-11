@@ -1,5 +1,6 @@
 import { harmonicScore } from './camelot.ts'
 import { mixOf, prepareTrack, type MixLookup, type PreparedTrack } from './analysis.ts'
+import { deckPosition } from './timeline.ts'
 import { pairKey, type MixStyle, type TrackMix, type Transition } from './types.ts'
 
 /**
@@ -45,6 +46,24 @@ interface Features {
   outroRoom: number
   hasEntry: boolean
   hasExit: boolean
+  /** The longest run of bars with clear attacks near the end and near the start: where a beatmatched blend can go. */
+  clearOut: number
+  clearIn: number
+}
+
+/** The longest run of bars with clear attacks (beatmatchable) between two moments. */
+function clearRun(track: PreparedTrack, from: number, to: number) {
+  let best = 0
+  let run = 0
+  for (let k = 0; k + 1 < track.downbeats.length; k++) {
+    const start = track.downbeats[k]
+    const end = track.downbeats[k + 1]
+    if (start < from || end > to) continue
+    const clarity = track.clarityBetween(start, end - 0.01)
+    run = Number.isNaN(clarity) || clarity >= 0.6 ? run + 1 : 0
+    best = Math.max(best, run)
+  }
+  return best
 }
 
 const clamp = (x: number, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, x))
@@ -67,6 +86,8 @@ function features(track: PreparedTrack): Features {
     outroRoom: Math.max(0, track.end - lastVoice) * share,
     hasEntry: track.drops.length > 0 || track.cuesIn.length > 0 || track.sections.some((s) => s.kind === 'chorus' || s.kind === 'drop'),
     hasExit: track.cuesOut.length > 0 || track.sections.some((s) => s.kind === 'chorus' || s.kind === 'drop'),
+    clearOut: clearRun(track, track.duration * 0.55, track.end),
+    clearIn: clearRun(track, 0, track.duration * 0.45),
   }
 }
 
@@ -88,10 +109,18 @@ function energyScore(from: number, to: number, style: MixStyle) {
   return step >= 0 ? 1 - clamp(step - 0.35) : 1 - clamp(1.5 * -step)
 }
 
+/**
+ * Room for a long blend: instrumental bars at A's end and B's start (four of them can be looped into a full blend, so
+ * the score is full from 4 bars on each side; more makes loops unnecessary, a small extra), and bars with clear
+ * attacks there, without which the decks can't be beatmatched.
+ */
 function roomScore(a: Features, b: Features, style: MixStyle) {
-  if (style === 'party') return 0.4 + (b.hasEntry ? 0.3 : 0) + (a.hasExit ? 0.3 : 0)
-  const need = 64 * a.track.period
-  return 0.5 * clamp(a.outroRoom / need) + 0.5 * clamp(b.introRoom / need)
+  const loopable = (room: number, period: number) => 0.8 * clamp(room / (16 * period)) + 0.2 * clamp(room / (64 * period))
+  // A blend also needs beats both can be matched on: clear attacks for 4 bars or more at A's end and B's start.
+  const clear = Math.min(clamp(a.clearOut / 4), clamp(b.clearIn / 4))
+  const blend = (0.25 * loopable(a.outroRoom, a.track.period) + 0.25 * loopable(b.introRoom, b.track.period) + 0.5 * clear)
+  if (style === 'party') return 0.2 + (b.hasEntry ? 0.2 : 0) + (a.hasExit ? 0.2 : 0) + 0.4 * blend
+  return blend
 }
 
 function scoreFeatures(a: Features, b: Features, style: MixStyle, useRank: boolean) {
@@ -363,8 +392,8 @@ export interface MixLength {
 }
 
 /**
- * How long the playlist plays with its transitions. Per transition: A plays up to `aOut`, the overlap lasts `length`,
- * then B goes on from `bIn + length × rate` to its own out point. A pair without a transition plays back to back. B's
+ * How long the playlist plays with its transitions. Per transition: A plays up to `aOut`, the overlap lasts `length`
+ * (loops included), then B goes on from where its path has brought it to its own out point. A pair without a transition plays back to back. B's
  * easing back to its own tempo after a beatmatch is left out (a second or two at most).
  */
 export function estimateMixLength(
@@ -398,10 +427,10 @@ export function estimateMixLength(
     const out = usable ? Math.min(duration, Math.max(from, next.aOut)) : duration
     mixed += inOverlap + Math.max(0, out - from)
     if (usable) {
-      const length = Math.max(0, Math.min(next.length, duration - out))
-      const rate = Number.isFinite(next.rate) && next.rate > 0 ? next.rate : 1
-      from = Math.max(0, next.bIn) + length * rate
-      inOverlap = length
+      // The overlap lasts `length` on the clock (loops make it longer than the material it plays); B goes on from where
+      // its path and rate have brought it by then.
+      from = Math.max(0, deckPosition(next, 'b', next.length) ?? next.bIn)
+      inOverlap = Math.max(0, next.length)
     } else {
       from = 0
       inOverlap = 0

@@ -81,6 +81,7 @@ export type MixStyle = 'clean' | 'party'
 
 export type PresetId =
   | 'auto'
+  | 'blend'
   | 'crossfade'
   | 'fadeOut'
   | 'fadeIn'
@@ -102,7 +103,8 @@ export interface Keyframe {
  * How one deck sounds during a transition. Between keyframes values move linearly; before the first and after the last
  * they hold. An empty list means "unchanged" (1 for gain and the bands, 0 for the filter). Gain and band values are
  * amplitude factors moved linearly (0.5 = -6 dB), so a perceptual shape (equal power) needs extra keyframes. B's
- * automation should end neutral: after `length` the player glides B to neutral within 50 ms anyway.
+ * automation should end neutral: after `length` the player glides B to neutral within 50 ms anyway. Keyframe times
+ * are transition time (t), whatever the decks' paths and rates do.
  */
 export interface DeckAutomation {
   /** Volume, 0–1. */
@@ -122,29 +124,49 @@ export type TransitionEffect =
   | { kind: 'brake'; deck: 'a'; at: number; length: number }
 
 /**
- * A transition from track A to track B. At A's `aOut` B starts at its `bIn`; for `length` seconds both play and the
- * automation applies; after that A is gone and B plays on. A party transition skips B's intro (bIn > 0) and cuts A's
- * outro (aOut + length < A's duration). Skipped parts still count as played.
+ * A stretch of a track (seconds) a deck plays from `from` to `to`, `repeat` times in a row (more than once = a loop:
+ * the stretch should be whole bars, so the beat runs on seamlessly).
+ */
+export interface DeckSegment {
+  from: number
+  to: number
+  repeat: number
+}
+
+/**
+ * A transition from track A to track B, on one clock: transition time t, 0 at its start. At t = 0 A is at `aOut`; at
+ * t = `bAt` B starts at `bIn`; at t = `length` A is gone and B plays on. Each deck follows its `path` (loops let a
+ * transition take its time without either song running into singing or a drop) at its `rate` curve, pitch kept.
+ * A party transition may skip B's intro and cut A's outro; skipped parts still count as played.
  */
 export interface Transition {
-  v: 1
+  v: 2
   from: string
   to: string
   style: MixStyle
   preset: PresetId
+  /** A's track position at t = 0. */
   aOut: number
-  /**
-   * Where B starts. Negative (down to -2 s) when B's first downbeat lies too close to the file start for a pre-roll:
-   * B then starts from 0 later, so its downbeat still meets A's. In every case B's position at transition time t is
-   * `bIn + t * rate` (where that is ≥ 0): a negative bIn starts B at t = -bIn / rate.
-   */
+  /** When B starts (transition time, ≥ 0) and where in its track. */
+  bAt: number
   bIn: number
+  /** When A is gone (transition time). */
   length: number
-  /** B's playback rate while the decks overlap (beatmatching, pitch kept); eases back to 1 over the 8 bars after. */
-  rate: number
   /**
-   * Both songs' tempo (BPM) as planned with: echo delays are counted in beats and B's rate eases back over 8 of its
-   * bars. 120 when a song's tempo is unknown.
+   * The stretches each deck plays from its start, in order (A's first one starts at `aOut`, B's at `bIn`); after the
+   * last one the deck plays straight on. Empty = straight through.
+   */
+  pathA: DeckSegment[]
+  pathB: DeckSegment[]
+  /**
+   * Playback rate over transition time per deck (keyframes, linear between, holding outside; pitch kept). Beatmatching
+   * meets in the middle: A glides to the meeting tempo before B comes in, B starts at it and glides back to 1 after A is
+   * gone (its last keyframe is 1 and may lie after `length`). Empty = 1.
+   */
+  rateA: Keyframe[]
+  rateB: Keyframe[]
+  /**
+   * Both songs' tempo (BPM) as planned with: echo delays are counted in beats. 120 when a song's tempo is unknown.
    */
   tempo: { a: number; b: number }
   a: DeckAutomation

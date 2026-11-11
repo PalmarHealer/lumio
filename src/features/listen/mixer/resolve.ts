@@ -1,5 +1,6 @@
 import { mixOf, type MixLookup } from './analysis.ts'
-import { MIN_B_IN, finalizeTransition, planFallback, planTransition } from './planner.ts'
+import { finalizeTransition, planFallback, planTransition } from './planner.ts'
+import { deckPosition } from './timeline.ts'
 import { PRESETS } from './presets.ts'
 import { pairKey, type MixStyle, type PlaylistMixer, type Transition, type TrackMix } from './types.ts'
 
@@ -37,19 +38,26 @@ function durationOf(mix: TrackMix | null, id: string, opts: ResolveOptions) {
 export function storedFits(transition: unknown, fromId: string, toId: string, aDuration: number, bDuration: number): transition is Transition {
   if (!transition || typeof transition !== 'object') return false
   const t = transition as Transition
-  if (t.v !== 1 || t.from !== fromId || t.to !== toId) return false
+  // Older versions (v1 had one rate and a negative bIn) are planned again.
+  if (t.v !== 2 || t.from !== fromId || t.to !== toId) return false
   if (!(PRESETS as readonly string[]).includes(t.preset)) return false
-  if (![t.aOut, t.bIn, t.length, t.rate].every(finite) || t.length < 0 || t.aOut < 0 || t.bIn < MIN_B_IN) return false
-  // The rates the player can play, and automation it can read.
-  if (t.rate < 0.5 || t.rate > 2) return false
+  if (![t.aOut, t.bAt, t.bIn, t.length].every(finite) || t.length < 0 || t.aOut < 0 || t.bIn < 0 || t.bAt < 0 || t.bAt > t.length) return false
+  // Paths of whole segments, rates the player can play (B's ending at its own tempo), automation it can read.
+  const segmentsOk = (path: unknown) =>
+    Array.isArray(path) && path.every((s) => s && finite(s.from) && finite(s.to) && s.to > s.from && Number.isInteger(s.repeat) && s.repeat >= 1)
+  if (!segmentsOk(t.pathA) || !segmentsOk(t.pathB)) return false
+  const ratesOk = (curve: unknown) => Array.isArray(curve) && curve.every((k) => k && finite(k.t) && finite(k.v) && k.v >= 0.5 && k.v <= 2)
+  if (!ratesOk(t.rateA) || !ratesOk(t.rateB)) return false
+  if (t.rateB.length > 0 && t.rateB[t.rateB.length - 1].v !== 1) return false
   const decks = [t.a, t.b]
   if (!decks.every((deck) => deck && typeof deck === 'object' && (['gain', 'low', 'mid', 'high', 'filter'] as const).every((band) => Array.isArray(deck[band])))) return false
   if (!Array.isArray(t.effects)) return false
-  // Stored before the tempo was part of a transition: the echo and the rate easing can't be counted, so plan again.
   if (!t.tempo || !finite(t.tempo.a) || !finite(t.tempo.b) || t.tempo.a <= 0 || t.tempo.b <= 0) return false
-  // The songs may have been analysed again since (another edit of the file): the times must still lie inside them.
-  if (finite(aDuration) && t.aOut + t.length > aDuration + 0.05) return false
-  if (finite(bDuration) && (t.bIn >= bDuration || t.bIn + t.length * t.rate > bDuration + 0.05)) return false
+  // The songs may have been analysed again since (another edit of the file): both decks must stay inside them.
+  const aEnd = deckPosition(t, 'a', t.length) ?? t.aOut
+  const bEnd = deckPosition(t, 'b', t.length) ?? t.bIn
+  if (finite(aDuration) && Math.max(aEnd, ...t.pathA.map((s) => s.to)) > aDuration + 0.05) return false
+  if (finite(bDuration) && (t.bIn >= bDuration || Math.max(bEnd, ...t.pathB.map((s) => s.to)) > bDuration + 0.05)) return false
   return true
 }
 
@@ -75,7 +83,7 @@ export function transitionFor(
   if (stored) {
     const aDuration = durationOf(mixOf(mixes, fromId), fromId, opts)
     const bDuration = durationOf(mixOf(mixes, toId), toId, opts)
-    if (storedFits(stored, fromId, toId, aDuration, bDuration)) return finalizeTransition(stored, finite(aDuration) ? aDuration : stored.aOut + stored.length, bDuration)
+    if (storedFits(stored, fromId, toId, aDuration, bDuration)) return finalizeTransition(stored, finite(aDuration) ? aDuration : (deckPosition(stored, 'a', stored.length) ?? stored.aOut), bDuration)
   }
   return autoTransition(fromId, toId, mixes, style, opts)
 }

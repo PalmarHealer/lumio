@@ -24,6 +24,7 @@ import type { DeckAutomation, Keyframe, PresetId, TransitionEffect } from './typ
 export type ConcretePreset = Exclude<PresetId, 'auto'>
 
 export const PRESETS: readonly ConcretePreset[] = [
+  'blend',
   'crossfade',
   'fadeOut',
   'fadeIn',
@@ -37,7 +38,7 @@ export const PRESETS: readonly ConcretePreset[] = [
 ]
 
 /** Presets that let both decks' beats sound together for bars, so they want B beatmatched. */
-export const NEEDS_BEATMATCH: ReadonlySet<ConcretePreset> = new Set(['crossfade', 'bassSwap', 'filterBuild'])
+export const NEEDS_BEATMATCH: ReadonlySet<ConcretePreset> = new Set(['blend', 'crossfade', 'bassSwap', 'filterBuild'])
 
 export interface PresetContext {
   /** Seconds per beat of A at the transition (transition time; B is played at A's tempo while synced). */
@@ -52,6 +53,13 @@ export interface PresetContext {
   preRollBars?: number
   /** Drop swap without pre-roll: A's last beat goes into an echo that rings on over B's drop instead of a dry cut. */
   echoTail?: boolean
+  /** Blend: sweep the filters (B's high-pass opens over the first half, A's rises over the second). Default on. */
+  filter?: boolean
+  /**
+   * Blend: the mids change deck in the beat around the swap instead of crossing over the whole blend, for keys that
+   * don't go together (the chords never sound over each other; drums and hats still blend long).
+   */
+  midSwap?: boolean
   /** Echo out: delay in beats and feedback (defaults 1 beat, 0.5). */
   echoBeats?: number
   echoFeedback?: number
@@ -306,7 +314,8 @@ function filterBuild(ctx: PresetContext): PresetShape {
 }
 
 /**
- * A fades out (equal power); B only comes in for the last quarter, so the beats barely meet. Works without beatmatch.
+ * A fades out (equal power) under a closing low-pass; B only comes in for the last quarter, so the beats barely meet.
+ * Works without beatmatch.
  */
 function fadeOut(ctx: PresetContext): PresetShape {
   const length = Math.max(1, ctx.bars) * 4 * ctx.beat
@@ -314,7 +323,14 @@ function fadeOut(ctx: PresetContext): PresetShape {
   return {
     preset: 'fadeOut',
     length,
-    a: automation(length, { gain: powerFade(0, length, true) }),
+    // A low-pass closes on A as it fades (its kick and hats go first), so where B comes in only A's body is left.
+    a: automation(length, {
+      gain: powerFade(0, length, true),
+      filter: [
+        [0, 0],
+        [length, -0.7],
+      ],
+    }),
     b: automation(length, { gain: [[0, 0], ...powerFade(enter, length, false, 4)], low: [[enter, 0], [length, 1]] }),
     effects: [],
     anchorA: 0,
@@ -473,11 +489,86 @@ export function matchLevels(shape: PresetShape, beat: number, difference: number
   return { ...shape, b: { ...shape.b, gain: scale(shape.b.gain, level, bar / 4) } }
 }
 
+/**
+ * The long blend, after a DJ's party transition: over the first half B fades in (volume linear) with a high-pass
+ * opening from high to fully open; its mids and highs come in and A's go out equal-power over the whole blend; on the
+ * swap (the middle, a phrase of both songs) the bass changes deck in one step; over the second half a high-pass rises
+ * on A, and at the end A, by then without lows, mids or highs, stops. A keeps its full volume throughout. Needs B
+ * beatmatched; the planner loops instrumental bars of either song so neither runs into singing or a drop meanwhile.
+ */
+function blend(ctx: PresetContext): PresetShape {
+  const length = Math.max(4, ctx.bars) * 4 * ctx.beat
+  const swap = swapTime(ctx, length, ctx.bars / 2)
+  const filter = ctx.filter !== false
+  const steps = 16
+  const aBand: Point[] = []
+  const bBand: Point[] = []
+  for (let i = 0; i <= steps; i++) {
+    const t = (length * i) / steps
+    const angle = ((Math.PI / 2) * t) / length
+    // B's band is what's left of sin θ after its volume ramp, so B's mids and highs add up to sin θ (constant power).
+    const gainB = Math.min(1, t / swap)
+    aBand.push([t, Math.cos(angle)])
+    bBand.push([t, gainB > 0 ? Math.min(1, Math.sin(angle) / gainB) : Math.min(1, ((Math.PI / 2) * swap) / length)])
+  }
+  const beat = Math.min(ctx.beat, swap / 4)
+  return {
+    preset: 'blend',
+    length,
+    a: automation(length, {
+      gain: [[0, 1], ...stepAt(length, 1, 0)],
+      low: [[0, 1], ...stepAt(swap, 1, 0)],
+      mid: ctx.midSwap
+        ? [
+            [swap - beat, 1],
+            [swap, 0.2],
+            [length, 0],
+          ]
+        : aBand,
+      high: aBand,
+      filter: filter
+        ? [
+            [swap, 0],
+            [length, 0.6],
+          ]
+        : [],
+    }),
+    b: automation(length, {
+      gain: [
+        [0, 0],
+        [swap, 1],
+      ],
+      low: [[0, 0], ...stepFrom(swap, 0, 1)],
+      // With the mids swapped, B's stay low (under its rising volume) until the swap and come up in the beat after.
+      mid: ctx.midSwap
+        ? [
+            [0, 0.15],
+            [swap, 0.15],
+            [swap + beat, 1],
+          ]
+        : bBand,
+      high: bBand,
+      filter: filter
+        ? [
+            [0, 0.6],
+            [swap, 0],
+          ]
+        : [],
+    }),
+    effects: [],
+    anchorA: 0,
+    anchorB: 0,
+    swap,
+  }
+}
+
 /** The shape of a preset in the given context. */
 export function presetShape(preset: ConcretePreset, context: PresetContext): PresetShape {
   const beat = Number.isFinite(context.beat) && context.beat > 0.2 && context.beat < 2 ? context.beat : 0.5
   const ctx: PresetContext = { ...context, beat, bars: Number.isFinite(context.bars) ? context.bars : 8 }
   switch (preset) {
+    case 'blend':
+      return blend(ctx)
     case 'crossfade':
       return crossfade(ctx)
     case 'bassSwap':

@@ -21,7 +21,11 @@ let probing = false
 
 const ONLINE_CHECK_MS = 30_000
 const OFFLINE_CHECK_MS = 5_000
-const PING_TIMEOUT_MS = 8_000
+// Mobile data can be slow (a weak signal, a train): a ping that takes long is still an answer, and a single lost one
+// doesn't mean offline. Only two failed in a row (or the browser itself) switch to offline.
+const PING_TIMEOUT_MS = 15_000
+const FAILED_PINGS_FOR_OFFLINE = 2
+let failedPings = 0
 
 function emit() {
   for (const listener of listeners) listener()
@@ -34,7 +38,7 @@ function set(next: { browser?: boolean; server?: boolean }) {
   if (isOffline() !== before) emit()
 }
 
-function schedule(delay = isOffline() ? OFFLINE_CHECK_MS : ONLINE_CHECK_MS) {
+function schedule(delay = isOffline() || failedPings > 0 ? OFFLINE_CHECK_MS : ONLINE_CHECK_MS) {
   if (typeof window === 'undefined') return
   window.clearTimeout(timer)
   if (pingUrl) timer = window.setTimeout(() => void probe(), delay)
@@ -49,9 +53,14 @@ async function probe() {
   try {
     const response = await fetch(pingUrl, { cache: 'no-store', signal: controller.signal })
     // A server error (a proxy without its upstream) isn't the server.
-    set(response.status >= 500 ? { server: false } : { browser: true, server: true })
+    if (response.status >= 500) set({ server: false })
+    else {
+      failedPings = 0
+      set({ browser: true, server: true })
+    }
   } catch {
-    set({ server: false })
+    failedPings++
+    if (failedPings >= FAILED_PINGS_FOR_OFFLINE || !navigator.onLine) set({ server: false })
   } finally {
     window.clearTimeout(timeout)
     probing = false
@@ -88,8 +97,10 @@ export function checkReachability() {
 
 /** Told by the requests to the media server: one got an answer (true), or failed without one (false). */
 export function markServerReachable(reachable: boolean) {
-  if (reachable) set({ server: true })
-  else {
+  if (reachable) {
+    failedPings = 0
+    set({ server: true })
+  } else {
     set({ server: false })
     schedule(OFFLINE_CHECK_MS)
   }

@@ -12,8 +12,8 @@ import { podcastProgress, recordPodcastProgress } from '../podcasts'
 import { reportActivity } from '@/features/social/social'
 import { flushPlayback, rememberPlayback } from '@/lib/playback-outbox'
 import { recordRecent } from '../recent'
-import { adoptIntoCache, audioCacheAvailable, cachedAudioUrl, isCached, prefetchAudio, recordCachedPlay } from './audio-cache'
-import { isOffline } from '@/lib/network'
+import { adoptIntoCache, audioCacheAvailable, cachedAudioUrl, cachedKey, prefetchAudio, recordCachedPlay } from './audio-cache'
+import { isOffline, onCellular } from '@/lib/network'
 import { inJellyfinApp, setAppPlaybackManager, updateAppMediaSession } from '@/lib/native-app'
 import { inCapacitor } from '@/lib/capacitor'
 import { desktop } from '@/lib/desktop'
@@ -465,10 +465,29 @@ if (audio) {
   audio.addEventListener('ended', onEnded)
   audio.addEventListener('error', () => {
     setState({ buffering: false })
+    // A stream that broke off (mobile data, a tunnel) is picked up again where it stopped, a few times, before the
+    // song counts as unplayable: otherwise one bad stretch of network skipped through the whole queue.
+    const item = currentTrack()
+    if (item && connection && !audio.src.startsWith('blob:') && streamRetries < STREAM_RETRIES) {
+      streamRetries++
+      const at = audio.currentTime || time.position
+      setState({ buffering: true })
+      window.setTimeout(() => {
+        if (currentTrack() !== item || !connection) return
+        audio.src = streamUrl(item)
+        if (at) audio.addEventListener('loadedmetadata', () => (audio.currentTime = at), { once: true })
+        void audio.play().catch(() => setState({ playing: false, buffering: false }))
+      }, 2000 * streamRetries)
+      return
+    }
     // A track that can't be played is skipped rather than stopping the whole queue.
     if (state.index < state.queue.length - 1) void go(state.index + 1, undefined, 'trackerror')
   })
 }
+
+/** How often a broken stream of the same song is picked up again before it is skipped. */
+const STREAM_RETRIES = 3
+let streamRetries = 0
 
 /** Transcoded streams don't always know their length; the library does. */
 function durationOf() {
@@ -562,12 +581,15 @@ async function go(index: number, startAt?: number, reason: StartReason = 'clickr
   // Paused: Jellyfin was told already; the play log still learns why it ended.
   else if (previous) logPlay('stopped', previous, false, playSessionId, { reasonEnd: endFor(reason) })
   playSessionId = crypto.randomUUID()
+  streamRetries = 0
   setState({ index, buffering: true })
   setTime({ position: startAt, duration: ticksToSeconds(item.RunTimeTicks ?? 0) })
   // Downloaded songs always play from the download, whatever its quality; then from the cache (instant, and without
   // a connection), else streamed.
   const downloaded = await downloadedAudioUrl(downloadId(item, externalOf(item)?.guid))
-  const key = downloaded ? null : cacheKey(item)
+  const wanted = downloaded ? null : cacheKey(item)
+  // On mobile data (or offline) a copy cached in another quality plays rather than streaming the song again.
+  const key = wanted ? cachedKey(wanted, onCellular() || isOffline()) : null
   const cached = key ? await cachedAudioUrl(key) : null
   // Another track may have been chosen meanwhile.
   if (currentTrack() !== item) return
@@ -657,12 +679,12 @@ function shareActivity(playing: boolean) {
 
 // ---- downloading ahead ----
 
-/** Whether a track can play without a connection: downloaded, or in the cache (in the current quality). */
+/** Whether a track can play without a connection: downloaded, or in the cache (in any quality). */
 export function playableOffline(item: BaseItemDto) {
   const external = externalOf(item)
   if (isDownloaded(downloadId(item, external?.guid))) return true
   const key = cacheKey(item)
-  return !!key && isCached(key)
+  return !!key && !!cachedKey(key, true)
 }
 
 /** The cache key of a library track: its id and the quality it plays in (a different limit is a different file). */
@@ -684,15 +706,32 @@ async function cacheAhead() {
   if (!settings.musicPrefetch) return
   const round = ++aheadRound
   const limits = { maxBytes: settings.musicCacheMb * 1024 * 1024, keepOftenPlayed: settings.musicKeepOften }
-  const upcoming = state.queue.slice(state.index + 1, state.index + 1 + settings.musicPrefetch)
-  const playing = currentTrack()
+  // On mobile data the connection is shared with the song playing: the next one only once this one is fully loaded,
+  // just one ahead, and the playing song isn't fetched a second time (that doubled the data and starved the stream).
+  const cellular = onCellular()
+  if (cellular && !(await fullyBuffered(round))) return
+  const upcoming = state.queue.slice(state.index + 1, state.index + 1 + (cellular ? 1 : settings.musicPrefetch))
+  const playing = cellular ? undefined : currentTrack()
   for (const item of [...upcoming, ...(playing ? [playing] : [])]) {
     if (round !== aheadRound || !connection) return
     const key = cacheKey(item)
-    // Downloaded songs need no copy in the cache.
-    if (!key || isDownloaded(item.Id)) continue
+    // Downloaded songs need no copy in the cache, nor do songs cached already (in any quality on mobile data).
+    if (!key || isDownloaded(item.Id) || (cellular && cachedKey(key, true))) continue
     await prefetchAudio(key, streamUrl(item, crypto.randomUUID()), limits, item === playing ? 1 : 0)
   }
+}
+
+/** Waits until the song playing now is loaded to its end (false when the track changed meanwhile). */
+async function fullyBuffered(round: number) {
+  while (round === aheadRound && audio) {
+    // Converted streams don't always know their length; the library does.
+    const duration = durationOf()
+    const ranges = audio.buffered
+    if (audio.src.startsWith('blob:')) return true
+    if (duration > 0 && ranges.length && ranges.end(ranges.length - 1) >= duration - 1) return true
+    await new Promise((resolve) => setTimeout(resolve, 3000))
+  }
+  return false
 }
 
 function onEnded() {

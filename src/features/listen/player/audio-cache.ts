@@ -66,6 +66,18 @@ export function useAudioCacheStats() {
 
 export const isCached = (key: string) => !!index[key]
 
+/**
+ * A cached copy of a song (keys are `id|quality`): the one in `key`'s quality, else, when `anyQuality`, any other
+ * quality kept (on mobile data or offline a song cached over Wi-Fi beats streaming it again).
+ */
+export function cachedKey(key: string, anyQuality: boolean): string | null {
+  if (index[key]) return key
+  if (!anyQuality) return null
+  const prefix = key.slice(0, key.indexOf('|') + 1)
+  if (!prefix) return null
+  return Object.keys(index).find((other) => other.startsWith(prefix)) ?? null
+}
+
 /** A playable URL for a cached song, or null when it isn't cached (or the cache can't be read). */
 export async function cachedAudioUrl(key: string): Promise<string | null> {
   if (!audioCacheAvailable || !index[key]) return null

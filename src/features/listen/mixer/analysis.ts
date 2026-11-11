@@ -53,6 +53,15 @@ export interface PreparedTrack {
   /** Seconds of singing between two moments (0 when the vocals are only assumed). */
   sungSeconds(from: number, to: number): number
   /**
+   * The song's band energies at a moment, relative to its own loud parts (1 = as in its loud sections, the 90th
+   * percentile of the band over the song; capped at 1.5). Without band curves: 1 for every band.
+   */
+  bandsAt(t: number): { low: number; mid: number; high: number }
+  /** The song's loudness (whole-track RMS) as an amplitude factor (10^(dBFS/20)). */
+  level: number
+  /** The harmonic profile (12 pitch classes, see `phraseChroma`) of the phrase playing at a moment, or null. */
+  chromaAt(t: number): number[] | null
+  /**
    * The least clear attacks (0–1, the share of beats with an audible onset on the grid) over [from, to]: per bar where
    * the analysis measured bars, else per phrase; 0 where it reaches before the song's first phrase or beat; NaN when
    * the analysis has no clarity at all.
@@ -261,9 +270,46 @@ export function prepareTrack(mix: TrackMix | null | undefined): PreparedTrack | 
     cuesOut: Array.isArray(mix.cuesOut) ? mix.cuesOut.filter((t): t is number => finite(t) && t > 0 && t <= duration) : [],
     energyBetween,
     loudSeconds,
+    bandsAt: bandCurves(mix, frameRate),
+    level: 10 ** ((finite(mix.loudness) ? clamp(mix.loudness, -60, 0) : -14) / 20),
+    chromaAt: phraseChromaAt(mix, duration),
     clarityBetween: clarity(mix, duration, beats.length > 0 ? beats[0] : 0),
     sungSeconds: (from: number, to: number) =>
       vocalsKnown ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
+  }
+}
+
+/** Band energies relative to the song's loud level (its 90th percentile per band). */
+function bandCurves(mix: TrackMix, frameRate: number) {
+  const bands = mix.bands && typeof mix.bands === 'object' ? mix.bands : null
+  const curve = (list: unknown) => (Array.isArray(list) ? list.map(unit) : [])
+  const low = curve(bands?.low)
+  const mid = curve(bands?.mid)
+  const high = curve(bands?.high)
+  const loudLevel = (list: number[]) => {
+    if (list.length === 0) return 1
+    const sorted = [...list].sort((p, q) => p - q)
+    return Math.max(0.05, sorted[Math.floor(sorted.length * 0.9)])
+  }
+  const refs = { low: loudLevel(low), mid: loudLevel(mid), high: loudLevel(high) }
+  const at = (list: number[], ref: number, t: number) => {
+    if (list.length === 0) return 1
+    const i = clamp(Math.round(t * frameRate), 0, list.length - 1)
+    return Math.min(1.5, list[i] / ref)
+  }
+  return (t: number) => ({ low: at(low, refs.low, t), mid: at(mid, refs.mid, t), high: at(high, refs.high, t) })
+}
+
+/** The chroma of the phrase playing at a moment (phrase list and chroma list paired one to one), or null. */
+function phraseChromaAt(mix: TrackMix, duration: number) {
+  const starts = Array.isArray(mix.phrases) ? mix.phrases : []
+  const chroma = Array.isArray(mix.phraseChroma) ? mix.phraseChroma : []
+  const usable = chroma.length === starts.length && chroma.length > 0 && chroma.every((c) => Array.isArray(c) && c.length === 12 && c.every(finite))
+  const times = starts.map((t) => (finite(t) ? clamp(t, 0, duration) : NaN))
+  return (t: number): number[] | null => {
+    if (!usable) return null
+    const i = floorIndex(times, t)
+    return i >= 0 ? chroma[i] : null
   }
 }
 

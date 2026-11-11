@@ -47,6 +47,12 @@ export interface TrackMix {
    * alone. Lets a beatmatch use the clear bars of a phrase that is unclear elsewhere. Empty in analyses made before it.
    */
   barClarity: number[]
+  /**
+   * Per phrase (same index as `phrases`): what it plays harmonically, as 12 values (pitch classes from C, 0–1, the
+   * strongest 1). Taken from the melody's range (C3–C6) with short transients (drums) held out, so phrases with similar
+   * melodies and chords have similar profiles (cosine). Empty in analyses made before it.
+   */
+  phraseChroma: number[][]
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean

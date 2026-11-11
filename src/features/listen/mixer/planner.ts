@@ -60,8 +60,8 @@ export interface TempoMatch {
   diff: number
 }
 
-/** Tempo gap the two decks may bridge, each going at most half of it (3 %) towards the other. */
-const MAX_TEMPO_DIFF = 0.06
+/** Tempo gap the two decks may bridge, each going at most half of it (3.5 %) towards the other. */
+const MAX_TEMPO_DIFF = 0.07
 const MIN_BPM_CONFIDENCE = 0.45
 /** A voice (gain × the louder of mid and high band, damped by a closed filter) above this counts as heard. */
 const VOICE_HEARD = 0.3
@@ -74,6 +74,14 @@ const ECHO_HEARD = 0.12
 const MAX_DRIFT = 0.025
 /** How far (seconds) aligning both grids may move B: more means the grids disagree where the songs meet. */
 const MAX_PHASE_SHIFT = 0.04
+/** Below this harmonic score the keys clash: both decks' tonal content may overlap for one beat at most. */
+const KEY_CLASH = 0.5
+/**
+ * How much louder than the louder song's own loud parts the two decks may sound together, per band (dB, 95th
+ * percentile over the overlap), and how far below them the overlap may sink on average before it's a hole.
+ */
+const MAX_OVER_DB = 2
+const HOLE_DB = -6
 /** Room (seconds) a blend's B gets to be moved earlier by the phase fit. */
 const PHASE_SLACK = 0.05
 /** Least attack clarity (share of beats with an audible onset) a beatmatch needs in each song's phrases it covers. */
@@ -89,6 +97,9 @@ const MAX_LOOP_BARS = 16
 const GLIDE_BARS_A = 2
 const GLIDE_BARS_B = 8
 
+/** Each deck may move 3.5 % at most: A at 1/√rate, B at √rate (meeting in the middle). */
+const rateOk = (rate: number) => Math.abs(Math.sqrt(rate) - 1) <= MAX_TEMPO_DIFF / 2 && Math.abs(1 / Math.sqrt(rate) - 1) <= MAX_TEMPO_DIFF / 2
+
 /** How B's tempo relates to A's: the closest of straight, half and double time. */
 export function matchTempo(a: PreparedTrack, b: PreparedTrack): TempoMatch {
   let best = { multiple: 1, rate: 1, score: Infinity }
@@ -100,7 +111,7 @@ export function matchTempo(a: PreparedTrack, b: PreparedTrack): TempoMatch {
   }
   const diff = Math.abs(best.rate - 1)
   const sure = Math.min(a.bpmConfidence, b.bpmConfidence) >= MIN_BPM_CONFIDENCE
-  return { synced: a.grid && b.grid && sure && diff <= MAX_TEMPO_DIFF, rate: best.rate, multiple: best.multiple, diff }
+  return { synced: a.grid && b.grid && sure && rateOk(best.rate), rate: best.rate, multiple: best.multiple, diff }
 }
 
 /** A phrase start a transition can be lined up on: what it is (B's drop, a chorus start) and how good a spot it is. */
@@ -210,6 +221,11 @@ interface Variant {
   /** Blend: sweep the filters; swap the mids on the phrase instead of crossing them (keys that clash). */
   filter: boolean
   midSwap: boolean
+  /** Blend: volume shape, where the bass changes deck, the filters in on B and out on A (see the blend preset). */
+  volume?: 'overlap' | 'fade' | 'scurve'
+  bassAt?: 'start' | 'middle' | 'none'
+  filterIn?: 'hp' | 'lp' | null
+  filterOut?: 'hp' | 'lp' | null
   /**
    * 'swap': the chosen phrase starts of both songs meet at the swap, so the moment the bass changes deck lies on a
    * phrase of each (and B's drop or chorus lands on it); 'shape': at the shape's own anchors.
@@ -223,21 +239,79 @@ const FREE_LENGTH: ReadonlySet<ConcretePreset> = new Set(['crossfade', 'bassSwap
 /** The shapes with a swap moment line up the phrases there; the others at their own anchors. */
 const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwap' || preset === 'crossfade' || preset === 'filterBuild' ? 'swap' : 'shape')
 
+/**
+ * The blend's layouts as a DJ (and the user's favourite Spotify transitions) uses them: mostly 8 bars with both decks
+ * at full volume ("overlap"), also 4 and 16, the long fade over 16 bars, the seamless S-curve over 2. Which EQ and
+ * filter it gets is chosen per placement (`blendFinishes`).
+ */
+const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve'; bars: number; prior: number; party: boolean; clean: boolean }> = [
+  { volume: 'overlap', bars: 8, prior: 0, party: true, clean: true },
+  { volume: 'overlap', bars: 16, prior: -0.04, party: true, clean: true },
+  { volume: 'overlap', bars: 4, prior: -0.04, party: true, clean: false },
+  { volume: 'fade', bars: 16, prior: -0.05, party: true, clean: true },
+  { volume: 'scurve', bars: 2, prior: -0.08, party: true, clean: true },
+]
+
+/**
+ * The EQ and filter finishes a blend can take, the common ones first (bass swap in the middle, high-pass in on B and
+ * out on A). Keys that clash take the tonal swap at the middle instead of an overlap of mids.
+ */
+function blendFinishes(variant: Variant, clash: boolean): Variant[] {
+  // Short blends change the bass at their start, which lies on the phrase grid (their middle doesn't).
+  if (variant.volume === 'scurve') return [{ ...variant, bassAt: 'start', filterIn: null, filterOut: null, midSwap: clash }]
+  if (variant.bars < 8)
+    return [
+      { ...variant, bassAt: 'start', filterIn: null, filterOut: 'hp', midSwap: clash, prior: variant.prior + 0.03 },
+      { ...variant, bassAt: 'start', filterIn: null, filterOut: 'lp', midSwap: clash, prior: variant.prior + 0.02 },
+      { ...variant, bassAt: 'start', filterIn: null, filterOut: null, midSwap: clash, prior: variant.prior + 0.01 },
+    ]
+  const finishes: Array<[NonNullable<Variant['bassAt']>, Variant['filterIn'], Variant['filterOut'], number]> = [
+    ['middle', 'hp', 'hp', 0.03],
+    ['middle', null, 'hp', 0.025],
+    ['middle', 'lp', 'lp', 0.02],
+    ['start', 'hp', 'hp', 0.02],
+    ['start', null, 'hp', 0.015],
+    ['none', null, null, 0],
+  ]
+  return finishes.map(([bassAt, filterIn, filterOut, prior]) => ({ ...variant, bassAt, filterIn, filterOut, midSwap: clash, prior: variant.prior + prior }))
+}
+
+/** The best prior any finish of a blend layout can add (so the bound stays an upper bound). */
+const BEST_FINISH = 0.03
+
 function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?: ConcretePreset): Variant[] {
   const list: Variant[] = []
-  const add = (preset: ConcretePreset, prior: number, bars: number[] = [0], extra: { preRolls?: number[]; filter?: boolean } = {}) => {
-    const allowed = FREE_LENGTH.has(preset) || preset === 'blend' ? bars.filter((n) => n <= maxBars) : bars
+  const add = (preset: ConcretePreset, prior: number, bars: number[] = [0], extra: { preRolls?: number[] } = {}) => {
+    const allowed = FREE_LENGTH.has(preset) ? bars.filter((n) => n <= maxBars) : bars
     const lengths = allowed.length > 0 ? allowed : [Math.min(...bars)]
     for (const n of lengths)
       for (const preRollBars of extra.preRolls ?? [0])
-        for (const midSwap of preset === 'blend' ? [false, true] : [false])
-          list.push({ preset, bars: n, swapFraction: 0.5, preRollBars, filter: extra.filter ?? true, midSwap, meet: meetOf(preset), prior: prior - (midSwap ? 0.03 : 0) })
+        list.push({ preset, bars: n, swapFraction: 0.5, preRollBars, filter: true, midSwap: false, meet: meetOf(preset), prior })
   }
-  // Automatic transitions never cut: a cut has to be perfect to work. The long blend is the transition to have wherever
-  // the tempos can be matched and it passes every rule (its prior outweighs the score terms of a neat echo out); without
-  // a match, an echo out or a filtered fade.
+  const addBlends = (prior: number) => {
+    for (const layout of BLEND_LAYOUTS) {
+      if (!(style === 'party' ? layout.party : layout.clean) || layout.bars > maxBars) continue
+      list.push({
+        preset: 'blend',
+        bars: layout.bars,
+        swapFraction: 0.5,
+        preRollBars: 0,
+        filter: true,
+        midSwap: false,
+        volume: layout.volume,
+        bassAt: 'middle',
+        filterIn: 'hp',
+        filterOut: 'hp',
+        meet: 'shape',
+        prior: prior + layout.prior,
+      })
+    }
+  }
+  // Automatic transitions never cut: a cut has to be perfect to work. The blend is the transition to have wherever the
+  // tempos can be matched and it passes every rule (its prior outweighs the score terms of a neat echo out); without a
+  // match, an echo out or a filtered fade.
   if (style === 'clean' && synced) {
-    add('blend', 0.9, [32, 16], { filter: false })
+    addBlends(0.9)
     add('echoOut', 0)
     add('fadeOut', -0.02, [4])
   } else if (style === 'clean') {
@@ -245,7 +319,7 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
     add('fadeOut', 0.12, [4])
     add('fadeIn', 0, [2])
   } else if (synced) {
-    add('blend', 0.75, [16])
+    addBlends(0.75)
     add('dropSwap', 0.1, [0], { preRolls: [8] })
     add('echoOut', 0.05)
   } else {
@@ -254,9 +328,11 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
   }
   if (!forced) return list
   const chosen = list.filter((v) => v.preset === forced)
-  if (chosen.length > 0) return chosen.map((v) => ({ ...v, prior: 0 }))
+  if (chosen.length > 0) return chosen.map((v) => ({ ...v, prior: v.preset === 'blend' ? v.prior - (style === 'clean' ? 0.9 : 0.75) : 0 }))
   // A technique this style doesn't use on its own (the editor's choice): plain defaults.
-  const bars = forced === 'blend' ? [16] : FREE_LENGTH.has(forced) ? (synced ? [16, 8, 4] : [2]) : [0]
+  const bars = FREE_LENGTH.has(forced) ? (synced ? [16, 8, 4] : [2]) : [0]
+  if (forced === 'blend')
+    return [{ preset: 'blend', bars: 8, swapFraction: 0.5, preRollBars: 0, filter: true, midSwap: false, volume: 'overlap', bassAt: 'middle', filterIn: 'hp', filterOut: 'hp', meet: 'shape', prior: 0 }]
   return bars.map((n) => ({
     preset: forced,
     bars: n,
@@ -304,6 +380,11 @@ interface ShapeStats {
   loudB: Uint8Array
   tonal: number
   basses: number
+  /**
+   * Seconds both decks' tonal content is up together: gain × the louder of the mids and half the highs (the highs carry
+   * melody too), filter applied, above 0.3 on both. Between clashing keys it may last one beat at most.
+   */
+  tonalBoth: number
 }
 
 const filterDamp = (f: number) => (Math.abs(f) <= 0.4 ? 1 : 1 - ((Math.abs(f) - 0.4) / 0.6) * 0.7)
@@ -315,6 +396,19 @@ const bassThrough = (f: number) => (f > 0.5 ? 0.3 : 1)
  */
 const voiceLevel = (automation: DeckAutomation, t: number, gain: number, filter: number) =>
   gain * Math.max(valueAt(automation.mid, t, 1), valueAt(automation.high, t, 1)) * filterDamp(filter)
+
+/** How a filter knob passes each band: a high-pass takes the lows first, then the mids; a low-pass the highs first. */
+function filterBands(f: number) {
+  const clamp01 = (x: number) => Math.min(1, Math.max(0, x))
+  if (f >= 0) return { low: clamp01(1 - f / 0.4), mid: clamp01(1 - Math.max(0, f - 0.4) / 0.4), high: 1 }
+  return { low: 1, mid: clamp01(1 - Math.max(0, -f - 0.4) / 0.4), high: clamp01(1 + f / 0.4) }
+}
+
+/** How much of a deck's tonal content (chords, melody, voice) comes through: gain × max(mid, half the high), filtered. */
+const tonalLevel = (automation: DeckAutomation, t: number, gain: number, filter: number) => {
+  const pass = filterBands(filter)
+  return gain * Math.max(valueAt(automation.mid, t, 1) * pass.mid, 0.5 * valueAt(automation.high, t, 1) * pass.high)
+}
 
 /**
  * A deck's beats are loud: any band that carries them up to half (kick in the lows, snare in the mids, hats in the
@@ -340,6 +434,7 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
   let togetherFrom = -1
   let togetherTo = -1
   let tonal = 0
+  let tonalBoth = 0
   let basses = 0
   for (let i = 0; i <= steps; i++) {
     const t = i * dt
@@ -364,6 +459,7 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
       }
       if (ga * valueAt(a.mid, t, 1) * filterDamp(fa) > VOICE_HEARD && gb * valueAt(b.mid, t, 1) * filterDamp(fb) > VOICE_HEARD) tonal += dt
       if (ga * valueAt(a.low, t, 1) * bassThrough(fa) > 0.5 && gb * valueAt(b.low, t, 1) * bassThrough(fb) > 0.5) basses += dt
+      if (tonalLevel(a, t, ga, fa) > 0.3 && tonalLevel(b, t, gb, fb) > 0.3) tonalBoth += dt
     }
   }
   return {
@@ -382,6 +478,7 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
     togetherTo: Math.max(0, togetherTo),
     tonal,
     basses,
+    tonalBoth,
   }
 }
 
@@ -478,6 +575,70 @@ function vocalCost(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   const lineB = spanAt(b.vocals, bVoiceIn)
   if (lineB && bVoiceIn - lineB.start > 0.3) lostB += Math.min(6, bVoiceIn - lineB.start)
   return { clash, lostA, lostB }
+}
+
+/**
+ * How loud the two decks sound together, from the songs' own band energies along their paths × the automation: per
+ * band, the summed power against the louder song's loud level (its loud parts at its loudness), or against what either
+ * deck plays alone where that's louder. Returns the 95th percentile over the overlap of the worst band (dB above), the
+ * mean of all bands against the loud level (a hole when far below), and the seconds both decks carry a real bassline.
+ */
+function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
+  const { stats } = p
+  const { shape, dt } = stats
+  const length = shape.length
+  const reference = Math.max(a.level, b.level) ** 2
+  const over: number[] = []
+  let total = 0
+  let samples = 0
+  let basses = 0
+  if (length <= 0 || dt <= 0) return { over: -Infinity, mean: 0, basses: 0 }
+  const step = Math.max(1, Math.round(0.1 / dt))
+  for (let i = 0; i < stats.gainA.length; i += step) {
+    const t = i * dt
+    if (t < p.bStart || t > length) continue
+    const atB = positionB(p, t)
+    if (atB === null) continue
+    const eA = a.bandsAt(positionA(p, t))
+    const eB = b.bandsAt(atB)
+    const fA = filterBands(valueAt(shape.a.filter, t, 0))
+    const fB = filterBands(valueAt(shape.b.filter, t, 0))
+    const gA = stats.gainA[i]
+    const gB = stats.gainB[i]
+    let worst = -Infinity
+    let sum = 0
+    for (const band of ['low', 'mid', 'high'] as const) {
+      const pa = gA * valueAt(shape.a[band], t, 1) * fA[band] * eA[band] * a.level
+      const pb = gB * valueAt(shape.b[band], t, 1) * fB[band] * eB[band] * b.level
+      // Against the louder of the songs' loud level and what either deck plays on its own (a song's own peaks are fine).
+      const power = (pa * pa + pb * pb) / Math.max(reference, pa * pa, pb * pb)
+      worst = Math.max(worst, 10 * Math.log10(Math.max(power, 1e-9)))
+      sum += (pa * pa + pb * pb) / reference
+    }
+    over.push(worst)
+    total += sum / 3
+    samples++
+    const bassA = gA * valueAt(shape.a.low, t, 1) * fA.low * eA.low
+    const bassB = gB * valueAt(shape.b.low, t, 1) * fB.low * eB.low
+    if (bassA > 0.5 && bassB > 0.5) basses += dt * step
+  }
+  if (samples === 0) return { over: -Infinity, mean: 0, basses: 0 }
+  over.sort((x, y) => x - y)
+  return { over: over[Math.floor(over.length * 0.95)], mean: 10 * Math.log10(Math.max(total / samples, 1e-9)), basses }
+}
+
+/** Cosine of two harmonic profiles (0 when either is missing). */
+function cosine(x: number[] | null, y: number[] | null) {
+  if (!x || !y) return 0
+  let dot = 0
+  let nx = 0
+  let ny = 0
+  for (let i = 0; i < 12; i++) {
+    dot += x[i] * y[i]
+    nx += x[i] * x[i]
+    ny += y[i] * y[i]
+  }
+  return nx > 0 && ny > 0 ? dot / Math.sqrt(nx * ny) : 0
 }
 
 /** A small, stable per-pair nudge so near-equal choices don't always fall the same way across a playlist. */
@@ -633,6 +794,22 @@ function loopable(track: PreparedTrack, first: number, count: number) {
   return Math.max(...energies) - Math.min(...energies) <= 0.25
 }
 
+/**
+ * The bars [first, last) keep the phrase grid of `anchor` (a downbeat index): every analysed phrase start among them
+ * lies a whole number of 4 bars from it, and none of them lies before the song's first phrase. Otherwise a blend's
+ * middle wouldn't fall on a phrase of the song.
+ */
+function keepsGrid(track: PreparedTrack, anchor: number, first: number, last: number) {
+  const db = track.downbeats
+  if (track.phrases.length > 0 && db[first] < track.phrases[0] - 0.05) return false
+  for (const phrase of track.phrases) {
+    if (phrase <= db[first] + 0.05 || phrase >= db[last] - 0.05) continue
+    const k = floorIndex(db, phrase + 0.05)
+    if (k < 0 || Math.abs(db[k] - phrase) > 0.05 || (k - anchor) % 4 !== 0) return false
+  }
+  return true
+}
+
 /** One deck's material for a blend: its lane, its length in the deck's own seconds, extra plays of looped bars. */
 interface LaneOption {
   lane: Lane
@@ -661,10 +838,11 @@ function lanesFrom(track: PreparedTrack, start: number, bars: number): LaneOptio
   const db = track.downbeats
   if (i0 < 0 || Math.abs(db[i0] - start) > 0.05) return []
   const options: LaneOption[] = []
-  if (i0 + bars < db.length && db[i0 + bars] <= track.end) options.push({ lane: { start, path: [] }, advance: db[i0 + bars] - start, extra: 0 })
+  if (i0 + bars < db.length && db[i0 + bars] <= track.end && keepsGrid(track, i0, i0, i0 + bars))
+    options.push({ lane: { start, path: [] }, advance: db[i0 + bars] - start, extra: 0 })
   for (const { straight, loopBars, plays } of loopSplits(bars)) {
     const first = i0 + straight - loopBars
-    if (i0 + straight >= db.length || !loopable(track, first, loopBars)) continue
+    if (i0 + straight >= db.length || !loopable(track, first, loopBars) || !keepsGrid(track, i0, i0, i0 + straight)) continue
     const loopStart = db[first]
     const loopEnd = db[i0 + straight]
     const path: DeckSegment[] =
@@ -689,10 +867,10 @@ function lanesTo(track: PreparedTrack, end: number, bars: number): LaneOption[] 
   const db = track.downbeats
   if (iE < 0 || Math.abs(db[iE] - end) > 0.05) return []
   const options: LaneOption[] = []
-  if (iE - bars >= 0) options.push({ lane: { start: db[iE - bars], path: [] }, advance: end - db[iE - bars], extra: 0 })
+  if (iE - bars >= 0 && keepsGrid(track, iE, iE - bars, iE)) options.push({ lane: { start: db[iE - bars], path: [] }, advance: end - db[iE - bars], extra: 0 })
   for (const { straight, loopBars, plays } of loopSplits(bars)) {
     const first = iE - straight
-    if (!loopable(track, first, loopBars)) continue
+    if (!loopable(track, first, loopBars) || !keepsGrid(track, iE, first, iE)) continue
     const start = db[first]
     const loopEnd = db[first + loopBars]
     options.push({
@@ -909,7 +1087,7 @@ export function planTransition(
     // Half time: B's bar spans two of A's, so the swap goes on an even bar of A.
     const rawSwap = variant.bars * variant.swapFraction
     const swapBar = tempo.synced && tempo.multiple === 2 ? 2 * Math.round(rawSwap / 2) : Math.round(rawSwap)
-    const key = `${variant.preset}:${variant.bars}:${swapBar}:${variant.preRollBars}:${variant.filter}:${variant.midSwap}:${variant.meet}:${beat.toFixed(5)}`
+    const key = `${variant.preset}:${variant.bars}:${swapBar}:${variant.preRollBars}:${variant.filter}:${variant.midSwap}:${variant.volume}:${variant.bassAt}:${variant.filterIn}:${variant.filterOut}:${variant.meet}:${beat.toFixed(5)}`
     let stats = shapes.get(key)
     if (!stats) {
       const shape = presetShape(variant.preset, {
@@ -920,6 +1098,10 @@ export function planTransition(
         preRollBars: variant.preRollBars,
         filter: variant.filter,
         midSwap: variant.midSwap,
+        volume: variant.volume,
+        bassAt: variant.bassAt,
+        filterIn: variant.filterIn,
+        filterOut: variant.filterOut,
       })
       stats = shapeStats(shape, variant.meet, beat)
       shapes.set(key, stats)
@@ -962,8 +1144,15 @@ export function planTransition(
     } else {
       bound -= 0.5 * Math.abs(energyA - energyB)
     }
-    // Keys clash where both decks' mids (chords, leads, voices) sound together; the bass never overlaps.
-    bound -= (1 - harmony) * 0.6 * Math.min(1, stats.tonal / (16 * stats.beat))
+    // Keys clash where both decks' mids (chords, leads, voices) sound together; the bass never overlaps. A blend gets its
+    // tonal terms per finish (its finishes differ there), plus the best finish's prior.
+    if (variant.preset === 'blend') {
+      bound += BEST_FINISH
+      // Parts whose melodies are alike blend cleanly (the user's favourite): the phrases meeting at the middle.
+      const middle = stats.shape.swap
+      const likeness = cosine(a.chromaAt(positionA(placed, middle)), b.chromaAt(positionB(placed, middle) ?? p.laneB.start))
+      bound += 0.3 * Math.min(1, Math.max(0, (likeness - 0.85) / 0.15))
+    } else bound -= (1 - harmony) * 0.6 * Math.min(1, stats.tonal / (16 * stats.beat))
     // Singing that's skipped: A's lines after it's gone, B's before its voice comes in. Clean keeps every sung line
     // (whatever the sections are called); party may cut some, at a price.
     const sungA = trustA * a.sungSeconds(reachA, a.duration)
@@ -995,7 +1184,7 @@ export function planTransition(
               // B's rate: its material over the blend's length, so B arrives at `pb` as A stops. Counted in bars, it must
               // agree with the songs' beats there (a bar the analysis miscounted would put B off by a beat).
               const rate = toB.advance / length
-              if (Math.abs(rate - 1) > MAX_TEMPO_DIFF) continue
+              if (!rateOk(rate)) continue
               const byBeats = periodOver(b, toB.lane.start, pb.t) / (tempo.multiple * periodOver(a, fromA.lane.start, laneReach(fromA.lane, length)))
               if (Math.abs(rate / byBeats - 1) > 0.01) continue
               const base = { stats, variant, laneA: fromA.lane, laneB: toB.lane, bStart: PHASE_SLACK, rate, beatmatched: true, clarity: NaN, loops: fromA.extra + toB.extra, slack: PHASE_SLACK, pa, pb }
@@ -1036,7 +1225,7 @@ export function planTransition(
           const guess = periodAt(b, pb.t) / (tempo.multiple * periodA)
           const from = pb.t - stats.anchorB * guess
           rate = periodOver(b, from, from + length * guess) / (tempo.multiple * periodA)
-          if (Math.abs(rate - 1) > MAX_TEMPO_DIFF) continue
+          if (!rateOk(rate)) continue
         }
         // B's phrase start meets A's exactly; when it lies too close to B's start, B starts a little later.
         const bIn = pb.t - stats.anchorB * rate
@@ -1056,38 +1245,81 @@ export function planTransition(
   // Best-first with the sampled checks; stop when no remaining placement can beat the best one.
   placements.sort((p, q) => q.bound - p.bound)
   const lostWeight = party ? 0.05 : 0.1
-  let best: { placement: Placement; score: number } | null = null
-  for (let placement of placements) {
-    if (best && placement.bound <= best.score) break
-    // Clean style never skips a sung line: such a placement is out.
-    if (!party && placement.sung > 0.5) continue
+  const clash = harmony < KEY_CLASH
+  /** The sampled checks of one placement: its score, or null when it breaks a rule. */
+  const judge = (start: Placement): { placement: Placement; score: number } | null => {
+    let placement = start
     if (placement.beatmatched) {
       const aligned = alignPhase(placement, a, b, tempo.multiple)
       // Grids that disagree by more than a few tens of milliseconds where they meet aren't to be trusted with a beatmatch
-      // (a drop anchored on one beat, the beats around it elsewhere); nor may the shift carry B into an unclear phrase.
-      // How far B moved from where its phrase meets A's (the slack it started late with doesn't count).
+      // (a drop anchored on one beat, the beats around it elsewhere). How far B moved from where its phrase meets A's
+      // (the slack it started late with doesn't count):
       const moved = aligned
         ? Math.abs(aligned.bStart - (placement.bStart - placement.slack)) + Math.abs(aligned.laneB.start - placement.laneB.start) / aligned.rate
         : Infinity
-      if (!aligned || moved > MAX_PHASE_SHIFT || Math.abs(aligned.rate - 1) > MAX_TEMPO_DIFF) continue
+      if (!aligned || moved > MAX_PHASE_SHIFT || !rateOk(aligned.rate)) return null
       const length = placement.stats.shape.length
       const shifted = { ...placement, ...aligned }
-      if (laneReach(shifted.laneB, (length - shifted.bStart) * shifted.rate) > b.duration - 2) continue
-      // A beatmatch needs clear attacks wherever a deck's beats are loud while both play (both, around the swap). Without
-      // the measure (older analyses) only a short overlap is risked.
+      if (laneReach(shifted.laneB, (length - shifted.bStart) * shifted.rate) > b.duration - 2) return null
+      // A beatmatch needs clear attacks where both decks' beats are loud. Without the measure (older analyses) only a
+      // short overlap is risked.
       const clarity = audibleClarity(shifted, a, b)
-      if (Number.isNaN(clarity) ? placement.stats.together > 16 * placement.stats.beat : clarity < MIN_CLARITY) continue
+      if (Number.isNaN(clarity) ? placement.stats.together > 16 * placement.stats.beat : clarity < MIN_CLARITY) return null
       placement = { ...shifted, clarity }
     }
-    const { clash, lostA, lostB } = vocalCost(placement, a, b)
-    if (clash > 0.1) continue
+    const { stats } = placement
+    // A blend's middle (where the bass changes deck) on a downbeat of both songs as they actually play there: bars of
+    // uneven length can carry one song's downbeat away from the other's over a long blend.
+    if (placement.variant.preset === 'blend' && placement.variant.bassAt === 'middle') {
+      const middle = stats.shape.swap
+      const length = stats.shape.length
+      const downA = laneBeats(placement.laneA, a.downbeats, length)
+      const downB = laneBeats(placement.laneB, b.downbeats, Math.max(0, length - placement.bStart) * placement.rate).map((x) => placement.bStart + x / placement.rate)
+      if (downA.length === 0 || downB.length === 0) return null
+      const atA = nearest(downA, middle)
+      if (Math.abs(atA - middle) > 0.06 || Math.abs(nearest(downB, atA) - atA) > 0.06) return null
+    }
+    // Keys that clash: their tonal content may sound together for a beat at most.
+    if (clash && stats.tonalBoth > stats.beat) return null
+    let tonalTerm = 0
+    if (placement.variant.preset === 'blend') tonalTerm = (1 - harmony) * 0.6 * Math.min(1, stats.tonal / (16 * stats.beat))
+    // Loudness from what plays: the two parts together no more than a little above the louder song's loud parts (no
+    // gain dips needed: thin parts and EQ keep it there), and no hole far below them.
+    let energyTerm = 0
+    if (stats.shape.length > 0) {
+      const energy = overlapEnergy(placement, a, b)
+      if (energy.over > MAX_OVER_DB || energy.basses > 0) return null
+      if (placement.variant.preset === 'blend') energyTerm = 0.05 * Math.max(0, HOLE_DB - energy.mean)
+    }
+    const { clash: voices, lostA, lostB } = vocalCost(placement, a, b)
+    if (voices > 0.1) return null
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
-    // against A's beats (unsure: the safe techniques remain). Judged two bars at a time too.
+    // against A's beats. Judged two bars at a time too.
     const drift = placement.beatmatched ? phaseError(placement, a, b, tempo.multiple) : { median: 0, p90: 0, checked: 1, worstWindow: 0 }
-    if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75 || drift.worstWindow > MAX_WINDOW_DRIFT) continue
-    const score = placement.bound - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
-    if (!best || score > best.score) best = { placement, score }
+    if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75 || drift.worstWindow > MAX_WINDOW_DRIFT) return null
+    const finish = placement.variant.preset === 'blend' ? placement.variant.prior - start.variant.prior - BEST_FINISH : 0
+    const score = placement.bound + finish - tonalTerm - energyTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    return { placement, score }
+  }
+  let best: { placement: Placement; score: number } | null = null
+  for (const placement of placements) {
+    if (best && placement.bound <= best.score) break
+    // Clean style never skips a sung line: such a placement is out.
+    if (!party && placement.sung > 0.5) continue
+    const tries =
+      placement.variant.preset === 'blend'
+        ? blendFinishes(placement.variant, clash).map((variant) => {
+            const stats = shapeFor(variant, placement.stats.beat)
+            return { ...placement, variant, stats }
+          })
+        : [placement]
+    for (const candidate of tries) {
+      if (best && placement.bound + candidate.variant.prior - placement.variant.prior - BEST_FINISH <= best.score) continue
+      if (candidate.stats.basses > 0.001 && candidate.variant.bassAt !== 'none') continue
+      const judged = judge(candidate)
+      if (judged && (!best || judged.score > best.score)) best = judged
+    }
   }
   // Back to back is always clean: when nothing fits (odd phrase data, songs too short for any overlap, or in clean
   // style a song that sings into its last seconds, so every overlap would cut a line).
@@ -1096,7 +1328,8 @@ export function planTransition(
   const { placement } = best
   // The louder song comes down by the loudness difference while both play (both analyses must have measured it).
   const louder = Number.isFinite(a.mix.loudness) && Number.isFinite(b.mix.loudness) ? a.mix.loudness - b.mix.loudness : 0
-  const shape = matchLevels(placement.stats.shape, placement.stats.beat, louder)
+  // Blends keep both decks at their volume (loudness comes from the parts chosen and their EQ, checked above).
+  const shape = placement.variant.preset === 'blend' ? placement.stats.shape : matchLevels(placement.stats.shape, placement.stats.beat, louder)
   let confidence = 0.9
   if (tempo.synced && shape.length > 0) confidence *= 0.55 + 0.45 * minConfidence
   else confidence *= 0.6 + 0.3 * minConfidence
@@ -1182,7 +1415,7 @@ function toTransition(
 
 /**
  * What a transition does against the two songs' analyses: seconds where both voices are heard (A's echo included),
- * where both basslines are up. For the editor's warnings and for tests; 0 and 0 is what the planner promises.
+ * where both basslines are up (in the music, when the songs have band curves). For the editor's warnings and for tests; 0 and 0 is what the planner promises.
  */
 export function transitionIssues(transition: Transition, aMix: TrackMix | null, bMix: TrackMix | null) {
   const a = prepareTrack(aMix)
@@ -1211,5 +1444,19 @@ export function transitionIssues(transition: Transition, aMix: TrackMix | null, 
       if (direct || (echoed !== null && echoed[i] >= ECHO_HEARD)) voices += dt
     }
   }
-  return { voices, basses: sampled.basses }
+  // Two basslines: in the music where the songs have band curves (a blend may leave both lows open over a part
+  // without bass), else in the automation.
+  let basses = sampled.basses
+  if (a && b && transition.length > 0 && a.mix.bands?.low?.length && b.mix.bands?.low?.length) {
+    basses = 0
+    for (let t = transition.bAt; t < transition.length; t += 0.1) {
+      const pa = deckPosition(transition, 'a', t)
+      const pb = deckPosition(transition, 'b', t)
+      if (pa === null || pb === null) continue
+      const lowA = valueAt(transition.a.gain, t, 1) * valueAt(transition.a.low, t, 1) * filterBands(valueAt(transition.a.filter, t, 0)).low * a.bandsAt(pa).low
+      const lowB = valueAt(transition.b.gain, t, 1) * valueAt(transition.b.low, t, 1) * filterBands(valueAt(transition.b.filter, t, 0)).low * b.bandsAt(pb).low
+      if (lowA > 0.5 && lowB > 0.5) basses += 0.1
+    }
+  }
+  return { voices, basses }
 }

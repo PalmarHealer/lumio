@@ -53,13 +53,26 @@ export interface PresetContext {
   preRollBars?: number
   /** Drop swap without pre-roll: A's last beat goes into an echo that rings on over B's drop instead of a dry cut. */
   echoTail?: boolean
-  /** Blend: sweep the filters (B's high-pass opens over the first half, A's rises over the second). Default on. */
+  /** Blend: the old 16-bar layout's filters (B's high-pass opening, A's rising); `filterIn`/`filterOut` take over. */
   filter?: boolean
   /**
-   * Blend: the mids change deck in the beat around the swap instead of crossing over the whole blend, for keys that
-   * don't go together (the chords never sound over each other; drums and hats still blend long).
+   * Blend: the tonal content (mids, and the highs that carry melody too) changes deck in the beat around the middle
+   * instead of overlapping, for keys that clash: B comes in with mids killed and highs halved, A leaves them at the
+   * middle (drums and hats still blend).
    */
   midSwap?: boolean
+  /**
+   * Blend: how the volumes run. 'overlap' (both decks at full volume the whole time, A out at the end of the last bar:
+   * the usual DJ blend, loudness kept by choosing thin parts and by EQ and filters), 'fade' (B fades in over the first
+   * half, the bands cross equal-power: the long party blend), 'scurve' (A out and B in on S-curves across a short
+   * blend: the seamless crossfade).
+   */
+  volume?: 'overlap' | 'fade' | 'scurve'
+  /** Blend: where the bass changes deck (start, middle) or 'none' (one of the two parts has no bass of its own). */
+  bassAt?: 'start' | 'middle' | 'none'
+  /** Blend: a filter on B opening over the first half, and on A closing over the second half (high- or low-pass). */
+  filterIn?: 'hp' | 'lp' | null
+  filterOut?: 'hp' | 'lp' | null
   /** Echo out: delay in beats and feedback (defaults 1 beat, 0.5). */
   echoBeats?: number
   echoFeedback?: number
@@ -490,75 +503,129 @@ export function matchLevels(shape: PresetShape, beat: number, difference: number
 }
 
 /**
- * The long blend, after a DJ's party transition: over the first half B fades in (volume linear) with a high-pass
- * opening from high to fully open; its mids and highs come in and A's go out equal-power over the whole blend; on the
- * swap (the middle, a phrase of both songs) the bass changes deck in one step; over the second half a high-pass rises
- * on A, and at the end A, by then without lows, mids or highs, stops. A keeps its full volume throughout. Needs B
- * beatmatched; the planner loops instrumental bars of either song so neither runs into singing or a drop meanwhile.
+ * The blend, after the transitions a DJ (and Spotify's editor) makes between beatmatched songs, 2–16 bars:
+ * - Volume: 'overlap' keeps both decks at full volume and cuts A at the end of the last bar; 'fade' brings B in over
+ *   the first half with the mids and highs crossing equal-power (the long party blend); 'scurve' crosses both on
+ *   S-curves (the short seamless one).
+ * - Bass: changes deck in one step at the start or the middle (never two basslines), or stays on both when one part
+ *   has no bass to speak of (the planner checks that against the songs' band energies).
+ * - Filters: a high- or low-pass on B opening over the first half ("in"), on A closing over the second ("out").
+ * - Keys that clash: the tonal content changes deck at the middle instead (see `midSwap`).
+ * Needs B beatmatched; the planner loops bars of either song so neither runs into singing or a drop meanwhile.
  */
 function blend(ctx: PresetContext): PresetShape {
-  const length = Math.max(4, ctx.bars) * 4 * ctx.beat
-  const swap = swapTime(ctx, length, ctx.bars / 2)
-  const filter = ctx.filter !== false
+  const bars = Math.max(1, ctx.bars)
+  const length = bars * 4 * ctx.beat
+  const middle = bars >= 2 ? swapTime(ctx, length, bars / 2) : length / 2
+  const volume = ctx.volume ?? 'fade'
+  const bassAt = ctx.bassAt ?? 'middle'
+  // The old 16-bar layout: high-pass in on B, high-pass out on A, unless the filters are given.
+  const filterIn = ctx.filterIn !== undefined ? ctx.filterIn : ctx.filter === false ? null : 'hp'
+  const filterOut = ctx.filterOut !== undefined ? ctx.filterOut : ctx.filter === false ? null : 'hp'
+  const beat = Math.min(ctx.beat, middle / 4)
   const steps = 16
+
+  const aGain: Point[] = []
+  const bGain: Point[] = []
   const aBand: Point[] = []
   const bBand: Point[] = []
   for (let i = 0; i <= steps; i++) {
     const t = (length * i) / steps
-    const angle = ((Math.PI / 2) * t) / length
-    // B's band is what's left of sin θ after its volume ramp, so B's mids and highs add up to sin θ (constant power).
-    const gainB = Math.min(1, t / swap)
-    aBand.push([t, Math.cos(angle)])
-    bBand.push([t, gainB > 0 ? Math.min(1, Math.sin(angle) / gainB) : Math.min(1, ((Math.PI / 2) * swap) / length)])
+    const x = t / length
+    if (volume === 'scurve') {
+      const smooth = x * x * (3 - 2 * x)
+      aGain.push([t, 1 - smooth])
+      bGain.push([t, smooth])
+    }
+    if (volume === 'fade') {
+      // B's band is what's left of sin θ after its volume ramp, so B's mids and highs add up to sin θ (constant power).
+      const angle = (Math.PI / 2) * x
+      const gainB = Math.min(1, t / middle)
+      aBand.push([t, Math.cos(angle)])
+      bBand.push([t, gainB > 0 ? Math.min(1, Math.sin(angle) / gainB) : Math.min(1, ((Math.PI / 2) * middle) / length)])
+    }
   }
-  const beat = Math.min(ctx.beat, swap / 4)
+  const aGainPoints: Point[] = volume === 'scurve' ? aGain : [[0, 1], ...stepAt(length, 1, 0)]
+  const bGainPoints: Point[] =
+    volume === 'scurve'
+      ? bGain
+      : volume === 'fade'
+        ? [
+            [0, 0],
+            [middle, 1],
+          ]
+        : [
+            [0, 0],
+            [RAMP, 1],
+          ]
+  const swapAt = bassAt === 'start' ? RAMP : middle
+  const aLow: Point[] = bassAt === 'none' ? [] : [[0, 1], ...stepAt(swapAt, 1, 0)]
+  const bLow: Point[] = bassAt === 'none' ? [] : [[0, 0], ...stepFrom(swapAt, 0, 1)]
+  // Tonal content: crossing equal-power in the fade, swapped in the beat around the middle for clashing keys.
+  const aMid: Point[] = ctx.midSwap
+    ? [
+        [middle - beat, 1],
+        [middle, 0.1],
+      ]
+    : volume === 'fade'
+      ? aBand
+      : []
+  const bMid: Point[] = ctx.midSwap
+    ? [
+        [middle, 0.1],
+        [middle + beat, 1],
+      ]
+    : volume === 'fade'
+      ? bBand
+      : []
+  const aHigh: Point[] = ctx.midSwap
+    ? [
+        [middle - beat, 1],
+        [middle, 0.4],
+      ]
+    : volume === 'fade'
+      ? aBand
+      : []
+  const bHigh: Point[] = ctx.midSwap
+    ? [
+        [middle, 0.4],
+        [middle + beat, 1],
+      ]
+    : volume === 'fade'
+      ? bBand
+      : []
+  const knob = (kind: 'hp' | 'lp') => (kind === 'hp' ? 0.6 : -0.6)
   return {
     preset: 'blend',
     length,
     a: automation(length, {
-      gain: [[0, 1], ...stepAt(length, 1, 0)],
-      low: [[0, 1], ...stepAt(swap, 1, 0)],
-      mid: ctx.midSwap
+      gain: aGainPoints,
+      low: aLow,
+      mid: aMid,
+      high: aHigh,
+      filter: filterOut
         ? [
-            [swap - beat, 1],
-            [swap, 0.2],
-            [length, 0],
-          ]
-        : aBand,
-      high: aBand,
-      filter: filter
-        ? [
-            [swap, 0],
-            [length, 0.6],
+            [middle, 0],
+            [length, knob(filterOut)],
           ]
         : [],
     }),
     b: automation(length, {
-      gain: [
-        [0, 0],
-        [swap, 1],
-      ],
-      low: [[0, 0], ...stepFrom(swap, 0, 1)],
-      // With the mids swapped, B's stay low (under its rising volume) until the swap and come up in the beat after.
-      mid: ctx.midSwap
+      gain: bGainPoints,
+      low: bLow,
+      mid: bMid,
+      high: bHigh,
+      filter: filterIn
         ? [
-            [0, 0.15],
-            [swap, 0.15],
-            [swap + beat, 1],
-          ]
-        : bBand,
-      high: bBand,
-      filter: filter
-        ? [
-            [0, 0.6],
-            [swap, 0],
+            [0, knob(filterIn)],
+            [middle, 0],
           ]
         : [],
     }),
     effects: [],
     anchorA: 0,
     anchorB: 0,
-    swap,
+    swap: middle,
   }
 }
 

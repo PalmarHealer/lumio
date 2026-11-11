@@ -49,6 +49,30 @@ interface Features {
   /** The longest run of bars with clear attacks near the end and near the start: where a beatmatched blend can go. */
   clearOut: number
   clearIn: number
+  /** The harmonic profile (mean of `phraseChroma`) of the last two phrases and of the first two, or null. */
+  chromaOut: number[] | null
+  chromaIn: number[] | null
+}
+
+/** The mean harmonic profile of the phrases playing at the given moments (null without chroma). */
+function meanChroma(track: PreparedTrack, moments: number[]) {
+  const profiles = moments.map((t) => track.chromaAt(t)).filter((c): c is number[] => c !== null)
+  if (profiles.length === 0) return null
+  return Array.from({ length: 12 }, (_, i) => profiles.reduce((sum, c) => sum + c[i], 0) / profiles.length)
+}
+
+/** Cosine of two harmonic profiles (0 when either is missing). */
+function cosine(x: number[] | null, y: number[] | null) {
+  if (!x || !y) return 0
+  let dot = 0
+  let nx = 0
+  let ny = 0
+  for (let i = 0; i < 12; i++) {
+    dot += x[i] * y[i]
+    nx += x[i] * x[i]
+    ny += y[i] * y[i]
+  }
+  return nx > 0 && ny > 0 ? dot / Math.sqrt(nx * ny) : 0
 }
 
 /** The longest run of bars with clear attacks (beatmatchable) between two moments. */
@@ -88,6 +112,8 @@ function features(track: PreparedTrack): Features {
     hasExit: track.cuesOut.length > 0 || track.sections.some((s) => s.kind === 'chorus' || s.kind === 'drop'),
     clearOut: clearRun(track, track.duration * 0.55, track.end),
     clearIn: clearRun(track, 0, track.duration * 0.45),
+    chromaOut: meanChroma(track, track.phrases.filter((t) => t < track.end).slice(-2)),
+    chromaIn: meanChroma(track, track.phrases.slice(0, 2)),
   }
 }
 
@@ -140,8 +166,12 @@ function scoreFeatures(a: Features, b: Features, style: MixStyle, useRank: boole
   const energy = energyScore(useRank ? a.rank : a.intensity, useRank ? b.rank : b.intensity, style)
   const room = roomScore(a, b, style)
   const rest = style === 'clean' ? 0.35 * harmony + 0.3 * tempo + 0.15 * energy + 0.2 * room : 0.2 * harmony + 0.3 * tempo + 0.2 * energy + 0.3 * room
-  // A pair that can blend outweighs one that only fits on paper (a key-perfect pair that ends in an echo out).
-  return 0.45 * (blendable(a, b) ? 1 : 0) + 0.55 * rest
+  // Melodies alike where A ends and B begins blend cleanest (cosine of their profiles; 0.85–1 is the useful range).
+  const melody = Math.min(1, Math.max(0, (cosine(a.chromaOut, b.chromaIn) - 0.85) / 0.15))
+  // A pair that can blend outweighs one that only fits on paper (a key-perfect pair that ends in an echo out); between
+  // clashing keys a blend has to swap its tonal content quickly, worth half.
+  const blend = blendable(a, b) ? (harmony < 0.5 ? 0.5 : 1) : 0
+  return 0.45 * blend + 0.45 * rest + 0.1 * melody
 }
 
 /**

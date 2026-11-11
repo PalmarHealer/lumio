@@ -80,10 +80,10 @@ export interface TrackMix {
    */
   barKickClarity: number[]
   /**
-   * Per bar (same index as `downbeats`): how much it repeats the bar before it or the one before that (0–1, the larger
-   * cosine similarity of the two bars' chroma and kick/mid/accent attacks in 16 steps each). Near 1 in a looped 1- or
-   * 2-bar figure (a chant, a sampled hook, a DJ-intro groove); lower where the music develops (a build with a riser,
-   * sung verses). Empty in analyses made before it.
+   * Per bar (same index as `downbeats`): how much it repeats the bar 1, 2 or 4 bars before it (0–1, the largest cosine
+   * similarity of the bars' chroma and kick/mid/accent attacks in 16 steps each). Near 1 in a looped 1-, 2- or 4-bar
+   * figure (a chant, a sampled hook, a DJ-intro groove); lower where the music develops (sung verses). A build whose
+   * riser or filter changes every bar reads low although it may sound repetitive. Empty in analyses made before it.
    */
   barRepeat: number[]
   /**
@@ -1713,10 +1713,9 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
     return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
   })
-  // How much each bar repeats the one or two before it (a looped 1- or 2-bar figure, a chant): each bar as 16 steps
-  // (4 per beat) of its chroma and its attacks in three bands (kick 40–150 Hz, 150–1500 Hz, accents 1.5–5 kHz), each
-  // of those 15 values in standard units over the song's bars; the cosine to the bar before and to the one before
-  // that, the larger, 0–1.
+  // How much each bar repeats one of the bars 1, 2 or 4 before it (a looped 1-, 2- or 4-bar figure, a chant): each bar
+  // as 16 steps (4 per beat) of its chroma and its attacks in three bands (kick 40–150 Hz, 150–1500 Hz, accents
+  // 1.5–5 kHz), each of those 15 values in standard units over the song's bars; the largest cosine to those bars, 0–1.
   const mids = fineOnsets(samples, rate, 150, 1500)
   const riseOver = (onsets: { rise: Float32Array; step: number }, from: number, to: number) => {
     const a = clamp(Math.floor(from / onsets.step), 0, onsets.rise.length - 1)
@@ -1754,7 +1753,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const barVectors = barSteps.map((steps) => (steps ? Float64Array.from(steps.flatMap((step) => step.map((value, d) => (value - stepMean[d]!) / stepSd[d]!))) : null))
   const barRepeat = barVectors.map((vector, b) => {
     const back = (k: number) => (vector && b >= k && barVectors[b - k] ? cosine(vector, barVectors[b - k]!) : 0)
-    return round(clamp(Math.max(back(1), back(2))), 2)
+    return round(clamp(Math.max(back(1), back(2), back(4))), 2)
   })
   // What each phrase plays, harmonically: the melody range's chroma (C3–C6, where voices and leads are), each pitch
   // class held to its median over half a second first (drum hits and other short transients drop out, held notes

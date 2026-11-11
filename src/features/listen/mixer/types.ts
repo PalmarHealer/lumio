@@ -155,6 +155,11 @@ export interface DeckAutomation {
   high: Keyframe[]
   /** One-knob filter, -1–1: 0 open, towards -1 a low-pass closes, towards 1 a high-pass rises. */
   filter: Keyframe[]
+  /**
+   * Reverb send, 0–1 (0 = dry): the deck's sound after its gain feeds a hall whose tail rings on after the deck is cut,
+   * e.g. rising over A's last bars so A dissolves into B. Missing or empty = no reverb (transitions made before it).
+   */
+  reverb?: Keyframe[]
 }
 
 export type TransitionEffect =

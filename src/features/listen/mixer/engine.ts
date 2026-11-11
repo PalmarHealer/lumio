@@ -5,7 +5,19 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  * player's <audio> elements) and for rendering a transition offline (an OfflineAudioContext fed by decoded buffers),
  * so what the editor previews is what the player plays.
  *
- *   input → brake → gain → 3-band isolator (low / mid / high) → high-pass → low-pass → (+ echo) → level → destination
+ *   input → brake → gain ┬→ dry ─────────────────────────────────────────────────────┬→ post → (+ echo) → level → master
+ *                         └→ 3-band isolator (low / mid / high) → high-pass → low-pass → coloured ┘
+ *
+ * - The isolator and filters only carry the sound while they colour it. They are flat in magnitude at neutral, but
+ *   their phase turns (an all-pass around 200 Hz and 2 kHz), and on loud, brickwall-limited masters that alone raised
+ *   sample peaks by over 5 dB (the limiter's flattened peaks come back). So a deck plays through `dry` (exactly the
+ *   input) and switches to `coloured` just before its first EQ or filter move, and back once neutral again: hard at a
+ *   moment the deck is silent, else with a 5 ms crossfade. The two paths differ in phase, so while they mix the sum
+ *   dips around the crossovers; a short crossfade keeps that brief (measured: about −10 dB for 2 ms near 200 Hz and
+ *   2 kHz, where 30 ms gave up to −32 dB for 17 ms) and is still a ramp, not a jump.
+ * - All decks meet in the master (`createMaster`): a lookahead limiter (AudioWorklet) with a −1 dBFS ceiling on
+ *   estimated true peaks, transparent until needed. Two loud tracks overlapping, or the coloured path, can exceed full
+ *   scale; the limiter catches that instead of the output clipping.
  *
  * - `brake` is the brake effect's fade, `gain` the transition's volume curve, `level` the player's own volume,
  *   normalization and pause fades (left at 1 when rendering). `level` comes last, so a pause also silences an echo
@@ -51,6 +63,11 @@ const MAX_DELAY_S = 4
 export const DEFAULT_BPM = 120
 /** B's rate eases back to 1 over this many beats after the overlap (8 bars of 4/4). */
 const RATE_EASE_BEATS = 32
+/** The dry ↔ coloured switch when the deck isn't silent at a moment it could switch at (see the top). */
+const CROSSFADE_S = 0.005
+/** A deck this quiet (gain) may switch paths at once. */
+const SILENT = 0.001
+
 /** Short ramps that keep switches click-free (also a hard cut's: A out and B in over this). */
 const DECLICK_S = 0.005
 
@@ -69,6 +86,8 @@ export interface Deck {
   highpass: BiquadFilterNode
   lowpass: BiquadFilterNode
   echo: { send: GainNode; delay: DelayNode; feedback: GainNode; wet: GainNode }
+  /** Which way the sound goes: straight (`dry`, neutral) or through the isolator and filters (`coloured`). */
+  paths: { dry: GainNode; coloured: GainNode }
   /** The player's volume, normalization and fades; 1 when rendering. */
   level: GainNode
   /** The source feeding `input` (set by whoever connects one), disconnected with the deck. */
@@ -121,20 +140,26 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
   const lowpass = biquad(ctx, 'lowpass', nyquist(ctx), FILTER_RESONANCE_DB)
   sum.connect(highpass).connect(lowpass)
 
+  const dry = new GainNode(ctx)
+  const coloured = new GainNode(ctx, { gain: 0 })
+  const post = new GainNode(ctx)
+  gain.connect(dry).connect(post)
+  lowpass.connect(coloured).connect(post)
+
   const level = new GainNode(ctx)
-  lowpass.connect(level)
+  post.connect(level)
   const send = new GainNode(ctx, { gain: 0 })
   const delay = new DelayNode(ctx, { maxDelayTime: MAX_DELAY_S, delayTime: 0.5 })
   const feedback = new GainNode(ctx, { gain: 0 })
   const wet = new GainNode(ctx)
-  lowpass.connect(send).connect(delay)
+  post.connect(send).connect(delay)
   delay.connect(feedback).connect(delay)
   delay.connect(wet).connect(level)
   level.connect(destination)
 
-  const nodes: AudioNode[] = [input, brake, gain, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, highpass, lowpass, send, delay, feedback, wet, level]
+  const nodes: AudioNode[] = [input, brake, gain, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, highpass, lowpass, dry, coloured, post, send, delay, feedback, wet, level]
   // What each automated param starts at (its constructor value), for the engine's own copy of its timeline.
-  for (const param of [brake.gain, gain.gain, low.gain, mid.gain, high.gain, lowpass.frequency, highpass.frequency, send.gain, feedback.gain, delay.delayTime, wet.gain]) {
+  for (const param of [brake.gain, gain.gain, low.gain, mid.gain, high.gain, lowpass.frequency, highpass.frequency, send.gain, feedback.gain, delay.delayTime, wet.gain, dry.gain, coloured.gain]) {
     timelines.set(param, [{ t: 0, v: param.value, ramp: false }])
   }
   const deck: Deck = {
@@ -148,6 +173,7 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
     highpass,
     lowpass,
     echo: { send, delay, feedback, wet },
+    paths: { dry, coloured },
     level,
     source: null,
     dispose() {
@@ -379,6 +405,78 @@ export function scheduleAutomation(deck: Deck, automation: DeckAutomation, start
   scheduleLinear(deck.mid.gain, automation.mid, 1, startTime, scale, from, now)
   scheduleLinear(deck.high.gain, automation.high, 1, startTime, scale, from, now)
   scheduleFilter(deck, automation.filter, startTime, scale, from, now)
+  scheduleRouting(deck, automation, startTime, scale, from, now)
+}
+
+/** Whether a deck's EQ or filter changes its sound at transition time `t`. */
+const colours = (automation: DeckAutomation, t: number) =>
+  valueAt(automation.low, t, 1) !== 1 || valueAt(automation.mid, t, 1) !== 1 || valueAt(automation.high, t, 1) !== 1 || valueAt(automation.filter, t, 0) !== 0
+
+/**
+ * When (transition time, from `from` on) a deck's EQ or filter colours it: from `first` until `last` (Infinity when it
+ * stays coloured), or null when never. Curves are linear between keyframes, so checking each keyframe and the middle of
+ * each stretch between them is exact.
+ */
+export function colouredSpan(automation: DeckAutomation, from = 0) {
+  const keyframes = [automation.low, automation.mid, automation.high, automation.filter].flat()
+  const times = [...new Set([from, ...keyframes.map((keyframe) => keyframe.t).filter((t) => t > from)])].sort((x, y) => x - y)
+  let first: number | null = null
+  let last = from
+  times.forEach((t, i) => {
+    const next = times[i + 1]
+    if (colours(automation, t)) {
+      first ??= t
+      last = Math.max(last, t)
+    }
+    if (colours(automation, next === undefined ? t + 1 : (t + next) / 2)) {
+      first ??= t
+      last = next ?? Infinity
+    }
+  })
+  return first === null ? null : { first, last }
+}
+
+/** A moment in [from, to] (transition time) at which the deck's volume curve is silent, latest (or earliest) first. */
+function silentMoment(gain: DeckAutomation['gain'], from: number, to: number, latest: boolean) {
+  const candidates = [from, to, ...gain.map((keyframe) => keyframe.t).filter((t) => t > from && t < to)].sort((x, y) => (latest ? y - x : x - y))
+  return candidates.find((t) => Number.isFinite(t) && valueAt(gain, t, 1) <= SILENT) ?? null
+}
+
+/** Moves a deck's sound onto the dry or the coloured path at context time `time`: at once, or crossfading over `fade`. */
+function routeTo(deck: Deck, time: number, path: 'dry' | 'coloured', fade: number) {
+  const up = path === 'dry' ? deck.paths.dry.gain : deck.paths.coloured.gain
+  const down = path === 'dry' ? deck.paths.coloured.gain : deck.paths.dry.gain
+  if (valueOn(up, time) === 1 && valueOn(down, time) === 0) return
+  if (fade <= 0) {
+    setAt(up, time, 1)
+    setAt(down, time, 0)
+    return
+  }
+  // Equal gain: the two paths have the same magnitude, so their sum stays level (apart from the phase difference).
+  setAt(up, time, valueOn(up, time))
+  setAt(down, time, valueOn(down, time))
+  rampAt(up, time + fade, 1)
+  rampAt(down, time + fade, 0)
+}
+
+/**
+ * The deck's path over the transition: dry while neutral, coloured from just before its first EQ/filter move until it is
+ * neutral again. Switches happen where the deck is silent when there is such a moment, else as a short crossfade.
+ */
+function scheduleRouting(deck: Deck, automation: DeckAutomation, start: number, scale: number, from: number, now: number) {
+  holdAt(deck.paths.dry.gain, now)
+  holdAt(deck.paths.coloured.gain, now)
+  const at = (t: number) => Math.max(now, start + t * scale)
+  const span = colouredSpan(automation, from)
+  if (!span) return routeTo(deck, now, 'dry', CROSSFADE_S)
+  const silentIn = silentMoment(automation.gain, from, span.first, true)
+  if (silentIn !== null) routeTo(deck, at(silentIn), 'coloured', 0)
+  else routeTo(deck, Math.max(at(from), at(span.first) - CROSSFADE_S), 'coloured', CROSSFADE_S)
+  if (!Number.isFinite(span.last)) return
+  const lastKeyframe = Math.max(span.last, ...automation.gain.map((keyframe) => keyframe.t))
+  const silentOut = silentMoment(automation.gain, span.last, lastKeyframe, false)
+  if (silentOut !== null) routeTo(deck, at(silentOut), 'dry', 0)
+  else routeTo(deck, at(span.last), 'dry', CROSSFADE_S)
 }
 
 /** Opens a deck's echo at transition time `effect.at` (or at once when resuming past it). */
@@ -470,6 +568,8 @@ function automatedParams(deck: Deck) {
     deck.echo.send.gain,
     deck.echo.feedback.gain,
     deck.echo.delay.delayTime,
+    deck.paths.dry.gain,
+    deck.paths.coloured.gain,
   ]
 }
 
@@ -511,6 +611,8 @@ export function resetDeck(deck: Deck, time = deck.ctx.currentTime, ramp = 0) {
   }
   setAt(deck.lowpass.frequency, end, top)
   setAt(deck.highpass.frequency, end, 0)
+  // Back on the dry path once neutral (a glide ends with a crossfade; an instant reset switches at once).
+  routeTo(deck, end, 'dry', ramp > 0 ? CROSSFADE_S : 0)
   // The echo: nothing goes in any more, and its return stays shut until the delay line has emptied itself.
   const { send, feedback, wet } = deck.echo
   holdAt(wet.gain, time)
@@ -528,4 +630,147 @@ export function asPlayed(transition: Transition, aEnd?: number): Transition {
   if (transition.preset !== 'none') return transition
   const still = () => ({ gain: [], low: [], mid: [], high: [], filter: [] })
   return { ...transition, aOut: aEnd && aEnd > 0 ? aEnd : Number.NaN, length: 0, rate: 1, a: still(), b: still(), effects: [] }
+}
+
+// ---- the master: a lookahead limiter after all decks ----
+
+/** The limiter's ceiling (on estimated true peaks) and lookahead. */
+export const LIMITER_CEILING_DB = -1
+const LIMITER_LOOKAHEAD_S = 0.005
+const LIMITER_RELEASE_S = 0.15
+
+/**
+ * The limiter, run as an AudioWorklet. Per sample it estimates the peak (the sample itself and three cubic-interpolated
+ * points between the samples before it: 4x oversampling, a cheap stand-in for true peak), asks for the gain that keeps
+ * it under the ceiling, takes the minimum of that over the lookahead window and smooths it with a moving average as long as the
+ * window: the gain is down by the time a peak comes out of the delay line, never later, and ramps there instead of
+ * jumping (no distortion). It recovers with a 150 ms release. Both channels share one gain (the stereo image stays).
+ * The audio is delayed by the lookahead (`latency` in the node's options).
+ */
+const LIMITER_PROCESSOR = `
+class LumioLimiter extends AudioWorkletProcessor {
+  constructor(options) {
+    super()
+    const o = options.processorOptions || {}
+    this.ceiling = Math.pow(10, o.ceilingDb / 20)
+    this.box = Math.max(1, Math.round(o.lookahead * sampleRate))
+    this.window = this.box + 2
+    this.delay = this.box + 1
+    this.release = 1 - Math.exp(-1 / (o.release * sampleRate))
+    this.report = o.report ? Math.round(sampleRate / 10) : 0
+    this.lines = [new Float32Array(this.delay + 1), new Float32Array(this.delay + 1)]
+    this.history = [new Float32Array(4), new Float32Array(4)]
+    this.write = 0
+    this.minValues = new Float64Array(this.window + 1)
+    this.minIndex = new Float64Array(this.window + 1)
+    this.head = 0
+    this.tail = 0
+    this.boxValues = new Float64Array(this.box).fill(1)
+    this.boxAt = 0
+    this.boxSum = this.box
+    this.gain = 1
+    this.n = 0
+    this.frames = 0
+    this.limited = 0
+    this.minGain = 1
+  }
+  process(inputs, outputs) {
+    const input = inputs[0]
+    const output = outputs[0]
+    const length = output[0].length
+    for (let i = 0; i < length; i++) {
+      let peak = 0
+      for (let c = 0; c < 2; c++) {
+        const source = input[Math.min(c, input.length - 1)]
+        const x = source ? source[i] : 0
+        const h = this.history[c]
+        h[0] = h[1]; h[1] = h[2]; h[2] = h[3]; h[3] = x
+        peak = Math.max(peak, Math.abs(x))
+        // Between the samples before (4x oversampled, cubic): where a reconstructed wave peaks above its samples.
+        for (let f = 0.25; f < 1; f += 0.25) {
+          const v = h[1] + 0.5 * f * (h[2] - h[0] + f * (2 * h[0] - 5 * h[1] + 4 * h[2] - h[3] + f * (3 * (h[1] - h[2]) + h[3] - h[0])))
+          peak = Math.max(peak, Math.abs(v))
+        }
+        this.lines[c][this.write] = x
+      }
+      const wanted = peak > this.ceiling ? this.ceiling / peak : 1
+      const n = this.n++
+      while (this.tail > this.head && this.minValues[(this.tail - 1) % (this.window + 1)] >= wanted) this.tail--
+      this.minValues[this.tail % (this.window + 1)] = wanted
+      this.minIndex[this.tail % (this.window + 1)] = n
+      this.tail++
+      while (this.minIndex[this.head % (this.window + 1)] <= n - this.window) this.head++
+      const held = this.minValues[this.head % (this.window + 1)]
+      this.boxSum += held - this.boxValues[this.boxAt]
+      this.boxValues[this.boxAt] = held
+      this.boxAt = (this.boxAt + 1) % this.box
+      if ((n & 4095) === 0) this.boxSum = this.boxValues.reduce((sum, value) => sum + value, 0)
+      const smooth = Math.min(1, this.boxSum / this.box)
+      this.gain = smooth < this.gain ? smooth : this.gain + (smooth - this.gain) * this.release
+      const read = (this.write + 1) % (this.delay + 1)
+      for (let c = 0; c < output.length; c++) output[c][i] = this.lines[Math.min(c, 1)][read] * this.gain
+      this.write = read
+      if (this.gain < 0.9999) this.limited++
+      if (this.gain < this.minGain) this.minGain = this.gain
+    }
+    this.frames += length
+    if (this.report && this.frames % this.report < length) this.port.postMessage({ frames: this.frames, limited: this.limited, minGain: this.minGain })
+    return true
+  }
+}
+registerProcessor('lumio-limiter', LumioLimiter)
+`
+
+/** What the limiter did so far (when asked to report): frames seen, frames it turned down, its deepest gain. */
+export interface LimiterStats {
+  frames: number
+  limited: number
+  minGain: number
+}
+
+export interface Master {
+  /** Connect the decks here. */
+  input: GainNode
+  /** How much later the sound comes out (the limiter's lookahead), in seconds. */
+  latency: number
+  dispose(): void
+}
+
+const limiterModules = new WeakMap<BaseAudioContext, Promise<void>>()
+
+/** How many frames later the limiter's output comes (its lookahead, plus one). */
+export const limiterLatency = (sampleRate: number) => Math.max(1, Math.round(LIMITER_LOOKAHEAD_S * sampleRate)) + 1
+
+/**
+ * The mixer's master bus into `destination`: everything the decks play goes through the limiter. Loads the limiter's
+ * worklet into the context first (once per context; from a blob, so no separate file has to be served).
+ */
+export async function createMaster(ctx: BaseAudioContext, destination: AudioNode, options: { onStats?: (stats: LimiterStats) => void } = {}): Promise<Master> {
+  let loading = limiterModules.get(ctx)
+  if (!loading) {
+    const url = URL.createObjectURL(new Blob([LIMITER_PROCESSOR], { type: 'text/javascript' }))
+    loading = ctx.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url))
+    limiterModules.set(ctx, loading)
+  }
+  await loading
+  const input = new GainNode(ctx, { channelCount: 2, channelCountMode: 'explicit' })
+  const limiter = new AudioWorkletNode(ctx, 'lumio-limiter', {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [2],
+    channelCount: 2,
+    channelCountMode: 'explicit',
+    processorOptions: { ceilingDb: LIMITER_CEILING_DB, lookahead: LIMITER_LOOKAHEAD_S, release: LIMITER_RELEASE_S, report: !!options.onStats },
+  })
+  if (options.onStats) limiter.port.onmessage = (event: MessageEvent<LimiterStats>) => options.onStats!(event.data)
+  input.connect(limiter).connect(destination)
+  return {
+    input,
+    latency: limiterLatency(ctx.sampleRate) / ctx.sampleRate,
+    dispose() {
+      input.disconnect()
+      limiter.disconnect()
+      limiter.port.onmessage = null
+    },
+  }
 }

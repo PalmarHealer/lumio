@@ -1,4 +1,4 @@
-import { asPlayed, brakeRateAt, createDeck, rateAt, rateEaseSeconds, resetDeck, releaseEcho, scheduleTransition } from './engine'
+import { asPlayed, brakeRateAt, createDeck, createMaster, limiterLatency, rateAt, rateEaseSeconds, resetDeck, releaseEcho, scheduleTransition, type LimiterStats } from './engine'
 import type { Transition } from './types'
 
 /**
@@ -11,7 +11,8 @@ import type { Transition } from './types'
  *
  * The rendered timeline: 0 is `preRoll` seconds before A's `aOut`; the transition starts at `preRoll` (B's `bIn`
  * starts there; with a negative `bIn` B's top starts `-bIn / rate` seconds later), A stops `length` seconds later, and the
- * render ends `postRoll` seconds after that.
+ * render ends `postRoll` seconds after that. Both decks go through the player's master limiter (−1 dBFS); its lookahead
+ * delay is taken out again, so the timeline stays exact to the sample.
  */
 export interface RenderTransitionOptions {
   a: AudioBuffer
@@ -23,6 +24,8 @@ export interface RenderTransitionOptions {
   postRoll?: number
   /** Default: A's sample rate. */
   sampleRate?: number
+  /** The limiter's statistics, as rendering goes on (the last call has the whole render). */
+  onLimiter?: (stats: LimiterStats) => void
 }
 
 /** Sample-rate independent time → frame conversion used for the render's length. */
@@ -40,9 +43,12 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   const sampleRate = options.sampleRate ?? a.sampleRate
   const length = Math.max(0, transition.length)
   const total = preRoll + length + postRoll
-  const ctx = new OfflineAudioContext({ numberOfChannels: 2, length: frames(total, sampleRate), sampleRate })
-  const deckA = createDeck(ctx, ctx.destination)
-  const deckB = createDeck(ctx, ctx.destination)
+  const latency = limiterLatency(sampleRate)
+  const wanted = frames(total, sampleRate)
+  const ctx = new OfflineAudioContext({ numberOfChannels: 2, length: wanted + latency, sampleRate })
+  const master = await createMaster(ctx, ctx.destination, { onStats: options.onLimiter })
+  const deckA = createDeck(ctx, master.input)
+  const deckB = createDeck(ctx, master.input)
   const start = preRoll
   const end = start + length
 
@@ -81,7 +87,11 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   releaseEcho(deckA, end)
   resetDeck(deckB, end, 0.05)
 
-  return ctx.startRendering()
+  // Without the limiter's delay at the front.
+  const rendered = await ctx.startRendering()
+  const out = new AudioBuffer({ numberOfChannels: rendered.numberOfChannels, length: wanted, sampleRate })
+  for (let channel = 0; channel < rendered.numberOfChannels; channel++) out.copyToChannel(rendered.getChannelData(channel).subarray(latency, latency + wanted), channel)
+  return out
 }
 
 /** A rendered buffer as a 16-bit PCM WAV file (interleaved, clipped at full scale). */

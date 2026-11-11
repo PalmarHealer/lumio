@@ -23,7 +23,7 @@ import { downloadedAudioUrl, downloadId, isDownloaded, setDownloadQuality, setDo
 import { DIRECT_FORMATS } from './quality'
 import { setSleepHandler, sleepsAfterTrack, stopsAfterTrack } from './sleep-timer'
 import type { Transition } from '../mixer/types'
-import { asPlayed, brakeRateAt, createDeck, freezeDeck, handoverPoint, rateAt, rateEaseSeconds, rampAt, releaseEcho, resetDeck, scheduleTransition, type Deck } from '../mixer/engine'
+import { asPlayed, brakeRateAt, createDeck, createMaster, freezeDeck, handoverPoint, rateAt, rateEaseSeconds, rampAt, releaseEcho, resetDeck, scheduleTransition, type Deck, type Master } from '../mixer/engine'
 import { currentPlayLead, keepAligned, learnPlayLead, waitForCue, wakeAfter } from './deck-sync'
 
 /**
@@ -1250,6 +1250,12 @@ interface Running {
 
 let transitionProvider: TransitionProvider | null = null
 let context: AudioContext | null = null
+/**
+ * Where the decks meet: the master limiter (no clipping when two loud tracks overlap). Until its worklet has loaded
+ * nothing goes onto the graph; if it can't load, there are no transitions (rather than ones that may clip).
+ */
+let master: Master | null = null
+let masterFailed = false
 /** Elements whose current audio was loaded with CORS: only those may go through the graph (others would be silent). */
 const corsLoads = new WeakSet<HTMLAudioElement>()
 /** The server didn't allow CORS for the audio: no transitions for this visit. */
@@ -1280,8 +1286,16 @@ function wakeContext() {
   if (!transitionProvider || corsBlocked || typeof AudioContext === 'undefined') return
   try {
     if (!context) {
-      context = new AudioContext({ latencyHint: 'playback' })
-      context.addEventListener('statechange', contextChanged)
+      const created = new AudioContext({ latencyHint: 'playback' })
+      context = created
+      created.addEventListener('statechange', contextChanged)
+      createMaster(created, created.destination).then(
+        (ready) => {
+          master = ready
+          planSoon()
+        },
+        () => (masterFailed = true),
+      )
     }
   } catch {
     return
@@ -1372,9 +1386,9 @@ function prepareDeck(element: HTMLAudioElement) {
 function attach(element: HTMLAudioElement): Deck | null {
   const existing = decks.get(element)
   if (existing) return existing
-  if (!context || context.state !== 'running' || !corsLoads.has(element)) return null
+  if (!context || !master || context.state !== 'running' || !corsLoads.has(element)) return null
   try {
-    const deck = createDeck(context, context.destination)
+    const deck = createDeck(context, master.input)
     // At its volume before any sound goes through (the element may be playing already, at full volume on the graph).
     deck.level.gain.value = state.muted ? 0 : volumeOf(element)
     const source = context.createMediaElementSource(element)
@@ -1496,7 +1510,7 @@ function planCheck() {
   if (running && !running.handedOver && (running.plan.fromUid !== fromUid || running.plan.toUid !== toUid)) abortRunning()
   if (plan && plan.fromUid === fromUid && plan.toUid === toUid) return
   dropPlan()
-  if (!transitionProvider || remoteSink || corsBlocked || pendingStart !== null || !connection) return
+  if (!transitionProvider || remoteSink || corsBlocked || masterFailed || pendingStart !== null || !connection) return
   if (!fromUid || !toUid || !mixable(from) || !mixable(to)) return
   // The transition into the next track is already playing.
   if (running && !running.handedOver) return

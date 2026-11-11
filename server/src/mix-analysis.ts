@@ -626,7 +626,7 @@ function beatProfiles(beats: number[], onsets: { rise: Float32Array; step: numbe
 /**
  * Whether a beat's averaged attacks (see beatProfiles) are flam material: an attack lies near the grid (within 50 ms
  * of `centre`, seconds from the beat) but not on it (more than 12 ms off). Taken on the profile smoothed over 5 ms,
- * where it stands out at all (its peak at least 0.6 of itself above its median): an attack is a peak reaching 75 % of
+ * where it stands out at all (its peak at least 0.5 of itself above its median): an attack is a peak reaching 75 % of
  * the strongest that rises at least 30 % of the profile's range (peak over median) above the dips around it, so a
  * busy, jagged texture has none.
  * Attacks on the grid line up; no clear attack (a pad, a wash, silence in that band) and stabs well off the beat
@@ -648,7 +648,7 @@ function flamRisk(beat: { profile: Float64Array; step: number }, centre = 0) {
   let peak = 0
   for (const value of profile) peak = Math.max(peak, value)
   const middle = median(Array.from(profile))
-  if (peak <= 0 || (peak - middle) / peak < 0.6) return false
+  if (peak <= 0 || (peak - middle) / peak < 0.5) return false
   const rise = 0.3 * (peak - middle)
   const reach = (profile.length - 1) / 2
   for (let j = 1; j < profile.length - 1; j++) {

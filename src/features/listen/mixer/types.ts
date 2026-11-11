@@ -129,7 +129,8 @@ export interface Transition {
   aOut: number
   /**
    * Where B starts. Negative (down to -2 s) when B's first downbeat lies too close to the file start for a pre-roll:
-   * B then starts from 0 that many seconds after the transition began, so its downbeat still meets A's.
+   * B then starts from 0 later, so its downbeat still meets A's. In every case B's position at transition time t is
+   * `bIn + t * rate` (where that is ≥ 0): a negative bIn starts B at t = -bIn / rate.
    */
   bIn: number
   length: number

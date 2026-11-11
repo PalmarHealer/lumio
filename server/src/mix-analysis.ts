@@ -80,6 +80,13 @@ export interface TrackMix {
    */
   barKickClarity: number[]
   /**
+   * Per bar (same index as `downbeats`): how much it repeats the bar before it or the one before that (0–1, the larger
+   * cosine similarity of the two bars' chroma and kick/mid/accent attacks in 16 steps each). Near 1 in a looped 1- or
+   * 2-bar figure (a chant, a sampled hook, a DJ-intro groove); lower where the music develops (a build with a riser,
+   * sung verses). Empty in analyses made before it.
+   */
+  barRepeat: number[]
+  /**
    * Per phrase (same index as `phrases`): what it plays harmonically, as 12 values (pitch classes from C, 0–1, the
    * strongest 1). Taken from the melody's range (C3–C6) with short transients (drums) held out, so phrases with similar
    * melodies and chords have similar profiles (cosine). Empty in analyses made before it.
@@ -1681,7 +1688,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   // How late the kick attacks lie behind the grid (the grid follows the broadband and accent attacks; a kick's low
   // rise peaks later by a song-specific amount): per 2 bars, the kick band's averaged attack where it has one clear
   // peak; the median over those, 0 with fewer than 4 of them.
-  const kickBeats = beatProfiles(beats, fineOnsets(samples, rate, 40, 150), 0.08)
+  const kicks = fineOnsets(samples, rate, 40, 150)
+  const kickBeats = beatProfiles(beats, kicks, 0.08)
   const kickProfiles = kickBeats.filter((profile, i) => i % 8 === 4 && profile.prominence >= 0.6 && profile.rival < 0.75)
   const kickOffset = kickProfiles.length >= 4 ? round(median(kickProfiles.map((profile) => profile.shift)), 3) : 0
   // A beat whose kick is flam material (a kick attack within 50 ms of where the song's kicks usually sit but more than
@@ -1704,6 +1712,49 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     const end = downbeats[b + 1] ?? duration
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
     return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
+  })
+  // How much each bar repeats the one or two before it (a looped 1- or 2-bar figure, a chant): each bar as 16 steps
+  // (4 per beat) of its chroma and its attacks in three bands (kick 40–150 Hz, 150–1500 Hz, accents 1.5–5 kHz), each
+  // of those 15 values in standard units over the song's bars; the cosine to the bar before and to the one before
+  // that, the larger, 0–1.
+  const mids = fineOnsets(samples, rate, 150, 1500)
+  const riseOver = (onsets: { rise: Float32Array; step: number }, from: number, to: number) => {
+    const a = clamp(Math.floor(from / onsets.step), 0, onsets.rise.length - 1)
+    const b = clamp(Math.ceil(to / onsets.step), a + 1, onsets.rise.length)
+    let sum = 0
+    for (let i = a; i < b; i++) sum += onsets.rise[i]!
+    return sum / (b - a)
+  }
+  const barSteps = downbeats.map((start) => {
+    const i = beats.findIndex((time) => time >= start - 0.001)
+    if (i < 0 || i + 4 >= beats.length) return null
+    const steps: number[][] = []
+    for (let k = 0; k < 4; k++) {
+      const from = beats[i + k]!
+      const length = beats[i + k + 1]! - from
+      for (let q = 0; q < 4; q++) {
+        const s0 = from + (length * q) / 4
+        const s1 = from + (length * (q + 1)) / 4
+        const c = spanVector(chroma.frames, 12, chromaFrame(s0), Math.max(chromaFrame(s0) + 1, chromaFrame(s1)))
+        steps.push([...c, riseOver(kicks, s0, s1), riseOver(mids, s0, s1), riseOver(accents, s0, s1)])
+      }
+    }
+    return steps
+  })
+  const stepMean = new Float64Array(15)
+  const stepSd = new Float64Array(15)
+  let stepCount = 0
+  for (const steps of barSteps) for (const step of steps ?? []) {
+    for (let d = 0; d < 15; d++) stepMean[d] += step[d]!
+    stepCount++
+  }
+  for (let d = 0; d < 15; d++) stepMean[d] = stepMean[d]! / Math.max(1, stepCount)
+  for (const steps of barSteps) for (const step of steps ?? []) for (let d = 0; d < 15; d++) stepSd[d] += (step[d]! - stepMean[d]!) ** 2
+  for (let d = 0; d < 15; d++) stepSd[d] = Math.sqrt(stepSd[d]! / Math.max(1, stepCount)) || 1
+  const barVectors = barSteps.map((steps) => (steps ? Float64Array.from(steps.flatMap((step) => step.map((value, d) => (value - stepMean[d]!) / stepSd[d]!))) : null))
+  const barRepeat = barVectors.map((vector, b) => {
+    const back = (k: number) => (vector && b >= k && barVectors[b - k] ? cosine(vector, barVectors[b - k]!) : 0)
+    return round(clamp(Math.max(back(1), back(2))), 2)
   })
   // What each phrase plays, harmonically: the melody range's chroma (C3–C6, where voices and leads are), each pitch
   // class held to its median over half a second first (drum hits and other short transients drop out, held notes
@@ -2018,6 +2069,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     phraseClarity,
     barClarity,
     barKickClarity,
+    barRepeat,
     phraseChroma,
     kickOffset,
     accentOffset,

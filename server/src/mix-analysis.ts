@@ -478,7 +478,7 @@ function estimateTempo(envelope: Float64Array, frameRate: number): Tempo {
  * (Butterworth high- and low-pass sections, run forwards and backwards so nothing is delayed), their RMS per
  * millisecond in log, averaged over 10 ms, and how much that rises from one millisecond to the next.
  */
-function fineOnsets(samples: Float32Array, rate: number): { rise: Float32Array; step: number } {
+function fineOnsets(samples: Float32Array, rate: number, low = 40, high = 4000): { rise: Float32Array; step: number } {
   const filtered = Float32Array.from(samples)
   const pass = (kind: 'low' | 'high', frequency: number) => {
     const w = (2 * Math.PI * frequency) / rate
@@ -508,11 +508,11 @@ function fineOnsets(samples: Float32Array, rate: number): { rise: Float32Array; 
     }
   }
   // Each pass twice: fourth-order slopes (eighth with the backward runs), as a broadband onset measure usually has.
-  pass('high', 40)
-  pass('high', 40)
-  if (rate / 2 > 4500) {
-    pass('low', 4000)
-    pass('low', 4000)
+  pass('high', low)
+  pass('high', low)
+  if (rate / 2 > high * 1.1) {
+    pass('low', high)
+    pass('low', high)
   }
   const hop = Math.max(1, Math.round(rate / 1000))
   const count = Math.floor(filtered.length / hop)
@@ -581,16 +581,25 @@ function beatProfiles(beats: number[], onsets: { rise: Float32Array; step: numbe
  * such correction. The correction changes by at most 6 ms from one beat to the next (both ways, averaged): where the
  * attacks change character (a build into a drop) the beats glide over instead of one bar coming out short.
  */
-function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: number }): number[] {
+function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: number }, accents?: { rise: Float32Array; step: number }): number[] {
   const profiles = beatProfiles(beats, onsets)
-  const known = profiles.flatMap((profile, i) => (profile.prominence >= 0.5 ? [i] : []))
-  const overall = known.length ? median(known.map((i) => profiles[i]!.shift)) : 0
+  // Where the broadband attacks compete (two peaks, as under a pumping synth), the snares, claps and hats (`accents`,
+  // 1.5–5 kHz) often still mark the beat unambiguously: then they decide.
+  const accented = accents ? beatProfiles(beats, accents) : null
+  const decided = profiles.map((profile, i) => {
+    if (profile.prominence >= 0.5 && profile.rival < 0.75) return profile.shift
+    const accent = accented?.[i]
+    if (accent && accent.prominence >= 0.5 && accent.rival < 0.75) return accent.shift
+    return profile.prominence >= 0.5 ? profile.shift : NaN
+  })
+  const known = decided.flatMap((shift, i) => (Number.isNaN(shift) ? [] : [i]))
+  const overall = known.length ? median(known.map((i) => decided[i]!)) : 0
   let next = 0
   const corrections = beats.map((_, i) => {
-    if (profiles[i]!.prominence >= 0.5) return profiles[i]!.shift
+    if (!Number.isNaN(decided[i]!)) return decided[i]!
     while (next < known.length - 1 && known[next + 1]! <= i) next++
     const nearest = [known[next], known[next + 1]].filter((k): k is number => k !== undefined).sort((x, y) => Math.abs(x - i) - Math.abs(y - i))[0]
-    return nearest === undefined ? overall : profiles[nearest]!.shift
+    return nearest === undefined ? overall : decided[nearest]!
   })
   const limit = 0.006
   const forward = [...corrections]
@@ -1118,10 +1127,11 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const onsets = fineOnsets(samples, rate)
   // (Never more than 50 ms from where the tracker put them, in all, except where a whole stretch drifted off its
   // attacks: there it is re-anchored first, and the refinement works from there.)
-  const refined = onAudibleOnsets(onAudibleOnsets(trackedBeats, onsets), onsets).map((time, i) => clamp(time, trackedBeats[i]! - 0.05, trackedBeats[i]! + 0.05))
+  const accents = fineOnsets(samples, rate, 1500, 5000)
+  const refined = onAudibleOnsets(onAudibleOnsets(trackedBeats, onsets, accents), onsets, accents).map((time, i) => clamp(time, trackedBeats[i]! - 0.05, trackedBeats[i]! + 0.05))
   const drifted = driftedStretches(refined, onsets)
   const anchored = reanchor(refined, drifted)
-  const beats = drifted.length ? onAudibleOnsets(anchored, onsets).map((time, i) => clamp(time, anchored[i]! - 0.05, anchored[i]! + 0.05)) : refined
+  const beats = drifted.length ? onAudibleOnsets(anchored, onsets, accents).map((time, i) => clamp(time, anchored[i]! - 0.05, anchored[i]! + 0.05)) : refined
   // The tempo the beats keep: a line through beat number and time (robust to a drifting or missed beat in between).
   let bpm = (60 * frameRate) / tempo.period
   if (beats.length >= 8) {
@@ -1325,10 +1335,12 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const phraseEnd = (p: number) => (p + 1 < phraseBars.length ? barStarts[phraseBars[p + 1]!]! : duration)
   // How clearly each phrase's beats are heard as attacks: a beat counts when the attacks averaged over the two bars
   // around it (see beatProfiles, ±80 ms) form one peak that stands out (at least 0.6) within 12 ms of the grid, with no
-  // other peak reaching 75 % of it. A wash, a pad, a riff without a beat, a grid off the attacks, or a pumping
-  // (sidechained) synth whose swells compete with the kick for the attack score low: two such songs can't be lined up
-  // reliably by ear or by their sound's onsets.
-  const beatClear = beatProfiles(beats, onsets, 0.08).map((profile) => profile.prominence >= 0.6 && Math.abs(profile.shift) <= 0.012 && profile.rival < 0.75)
+  // other peak reaching 75 % of it, in the broadband attacks or in the snares, claps and hats (1.5–5 kHz), a rhythm a
+  // DJ can lock onto. A wash, a pad, a riff without a beat, or a grid off the attacks scores low. (The kick band alone
+  // isn't used: a bass line moving in the same band makes it ambiguous in most pop.)
+  const unambiguous = (profile: { prominence: number; shift: number; rival: number }) => profile.prominence >= 0.6 && Math.abs(profile.shift) <= 0.012 && profile.rival < 0.75
+  const accentClear = beatProfiles(beats, accents, 0.08).map(unambiguous)
+  const beatClear = beatProfiles(beats, onsets, 0.08).map((profile, i) => unambiguous(profile) || accentClear[i]!)
   const phraseClarity = phrases.map((start, p) => {
     const end = phraseEnd(p)
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))

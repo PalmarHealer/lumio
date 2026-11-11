@@ -5,7 +5,7 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  * player's <audio> elements) and for rendering a transition offline (an OfflineAudioContext fed by decoded buffers),
  * so what the editor previews is what the player plays.
  *
- *   input → brake → gain ┬→ dry ─────────────────────────────────────────────────────┬→ post → (+ echo) → level → master
+ *   input → brake → gain ┬→ dry ─────────────────────────────────────────────────────┬→ post → (+ echo, + reverb) → level → master
  *                         └→ 3-band isolator (low / mid / high) → high-pass → low-pass → coloured ┘
  *
  * - The isolator and filters only carry the sound while they colour it. They are flat in magnitude at neutral, but
@@ -34,6 +34,9 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  *   high-pass at 0 Hz have the transfer function 1.
  * - The echo is a tempo-synced delay with feedback, fed by a send that opens at the effect's moment; its tail rings on
  *   after the deck's volume is gone ("echo out").
+ * - The reverb is a hall (a convolver with a generated impulse, `hallImpulse`) fed by a send after the deck's volume
+ *   (its `reverb` lane): its tail rings on after the deck is cut. It exists only on decks whose transitions use it (made
+ *   when first needed), so a deck without reverb is exactly what it was before.
  * - Automation uses only `setValueAtTime` and `linearRampToValueAtTime` (non-linear curves are sampled into short
  *   ramps), and the engine keeps its own copy of what it scheduled per param. Holding a param where it is (a pause, a
  *   seek) then needs only `cancelScheduledValues`, which every browser has, and never reads `param.value` (which
@@ -70,6 +73,21 @@ const SILENT = 0.001
 /** Short ramps that keep switches click-free (also a hard cut's: A out and B in over this). */
 const DECLICK_S = 0.005
 
+/**
+ * The hall: reverberation time (to -60 dB), pre-delay, how the highs die faster than the lows (the tail's low-pass
+ * closes from the first to the second frequency over the reverberation time), the lows taken out (a bass tail would
+ * muddy the incoming deck's bass), and its level: at send 1 the tail has about half the dry sound's RMS (-6 dB).
+ */
+export const REVERB_RT60_S = 3
+const REVERB_PREDELAY_S = 0.02
+const REVERB_ONSET_S = 0.008
+const REVERB_DAMP_FROM_HZ = 10000
+const REVERB_DAMP_TO_HZ = 1500
+const REVERB_LOW_CUT_HZ = 150
+const REVERB_WET = 0.5
+/** How long a reverb rings after its send has closed (the impulse's length). */
+export const REVERB_TAIL_S = REVERB_PREDELAY_S + REVERB_RT60_S
+
 export interface Deck {
   ctx: BaseAudioContext
   /** Connect the deck's source here. */
@@ -85,6 +103,10 @@ export interface Deck {
   highpass: BiquadFilterNode
   lowpass: BiquadFilterNode
   echo: { send: GainNode; delay: DelayNode; feedback: GainNode; wet: GainNode }
+  /** The hall, made when a transition first uses it (`reverbOf`); null until then. */
+  reverb: { send: GainNode; convolver: ConvolverNode; wet: GainNode } | null
+  /** The sound after the deck's volume and colouring (where the sends take it from). */
+  post: GainNode
   /** Which way the sound goes: straight (`dry`, neutral) or through the isolator and filters (`coloured`). */
   paths: { dry: GainNode; coloured: GainNode }
   /** The player's volume, normalization and fades; 1 when rendering. */
@@ -172,6 +194,8 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
     highpass,
     lowpass,
     echo: { send, delay, feedback, wet },
+    reverb: null,
+    post,
     paths: { dry, coloured },
     level,
     source: null,
@@ -179,9 +203,114 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
       deck.source?.disconnect()
       deck.source = null
       for (const node of nodes) node.disconnect()
+      if (deck.reverb) for (const node of Object.values(deck.reverb)) node.disconnect()
     },
   }
   return deck
+}
+
+// ---- the reverb ----
+
+/** A small seeded random generator (mulberry32): the same hall in every context, so renders repeat exactly. */
+function seeded(seed: number) {
+  let state = seed >>> 0
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let x = state
+    x = Math.imul(x ^ (x >>> 15), x | 1)
+    x ^= x + Math.imul(x ^ (x >>> 7), x | 61)
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+const impulses = new WeakMap<BaseAudioContext, AudioBuffer>()
+
+/**
+ * The hall's impulse response, made once per context: per channel its own noise (left and right decorrelated, so the
+ * tail is wide even for a mono source), after a short pre-delay, rising over a few ms and decaying exponentially to
+ * -60 dB over `REVERB_RT60_S`, through a low-pass that closes as it decays (the highs die first, as in a real hall)
+ * and a gentle low cut; scaled so its energy gives the tail `REVERB_WET` of the dry sound's level.
+ */
+export function hallImpulse(ctx: BaseAudioContext) {
+  const known = impulses.get(ctx)
+  if (known) return known
+  const rate = ctx.sampleRate
+  const length = Math.ceil(REVERB_TAIL_S * rate)
+  const start = Math.round(REVERB_PREDELAY_S * rate)
+  const buffer = new AudioBuffer({ numberOfChannels: 2, length, sampleRate: rate })
+  const lowCut = 1 - Math.exp((-2 * Math.PI * REVERB_LOW_CUT_HZ) / rate)
+  const fadeOut = Math.round(0.05 * rate)
+  for (let channel = 0; channel < 2; channel++) {
+    const random = seeded(0x5eed + channel * 0x9e3779b9)
+    const data = new Float32Array(length)
+    let damped = 0
+    let low = 0
+    let energy = 0
+    for (let i = start; i < length; i++) {
+      const t = (i - start) / rate
+      const cutoff = REVERB_DAMP_FROM_HZ * (REVERB_DAMP_TO_HZ / REVERB_DAMP_FROM_HZ) ** Math.min(1, t / REVERB_RT60_S)
+      damped += (1 - Math.exp((-2 * Math.PI * cutoff) / rate)) * (random() * 2 - 1 - damped)
+      low += lowCut * (damped - low)
+      const envelope = Math.exp((-Math.LN10 * 3 * t) / REVERB_RT60_S) * (1 - Math.exp(-t / REVERB_ONSET_S)) * Math.min(1, (length - i) / fadeOut)
+      const sample = (damped - low) * envelope
+      data[i] = sample
+      energy += sample * sample
+    }
+    const scale = REVERB_WET / Math.sqrt(energy || 1)
+    for (let i = start; i < length; i++) data[i]! *= scale
+    buffer.copyToChannel(data, channel)
+  }
+  impulses.set(ctx, buffer)
+  return buffer
+}
+
+/** The deck's hall, made (and connected: post -> send -> convolver -> wet -> level) the first time it is needed. */
+export function reverbOf(deck: Deck) {
+  if (deck.reverb) return deck.reverb
+  const { ctx } = deck
+  const send = new GainNode(ctx, { gain: 0 })
+  const convolver = new ConvolverNode(ctx, { buffer: hallImpulse(ctx), disableNormalization: true })
+  const wet = new GainNode(ctx)
+  deck.post.connect(send).connect(convolver).connect(wet).connect(deck.level)
+  for (const param of [send.gain, wet.gain]) timelines.set(param, [{ t: 0, v: param.value, ramp: false }])
+  deck.reverb = { send, convolver, wet }
+  return deck.reverb
+}
+
+/** Whether a deck's automation sends anything to the reverb. */
+export const usesReverb = (automation: DeckAutomation) => (automation.reverb ?? []).some((keyframe) => keyframe.v > 0)
+
+/**
+ * Until when (transition time) a transition's reverb may still ring, or null without one: from where each deck's send
+ * closes for good (A's at the latest at `length`, where A is cut; B's where its lane ends at 0, else just after `length`,
+ * where B glides back to neutral) for the impulse's length.
+ */
+export function reverbTailEnd(transition: Transition): number | null {
+  let end: number | null = null
+  for (const deck of ['a', 'b'] as const) {
+    const lane = transition[deck].reverb ?? []
+    if (!lane.some((keyframe) => keyframe.v > 0)) continue
+    const last = Math.max(...lane.map((keyframe, i) => (keyframe.v > 0 ? i : -1)))
+    const limit = deck === 'a' ? transition.length : transition.length + 0.05
+    const closes = Math.min(limit, lane[last + 1]?.t ?? Infinity)
+    end = Math.max(end ?? -Infinity, closes + REVERB_TAIL_S)
+  }
+  return end
+}
+
+/**
+ * Lets a deck's reverb ring out after the deck has gone: its send closes; the tail rings on (at most `tail` seconds:
+ * shorter, it fades out within them). Returns when it has died away (context time); `time` without a reverb.
+ */
+export function releaseReverb(deck: Deck, time = deck.ctx.currentTime, tail = REVERB_TAIL_S) {
+  if (!deck.reverb) return time
+  const { send, wet } = deck.reverb
+  holdAt(send.gain, time)
+  rampAt(send.gain, time + DECLICK_S, 0)
+  if (tail >= REVERB_TAIL_S) return time + REVERB_TAIL_S
+  holdAt(wet.gain, time)
+  rampAt(wet.gain, time + Math.max(DECLICK_S, tail), 0)
+  return time + Math.max(DECLICK_S, tail)
 }
 
 // ---- pure helpers (also used by the player and the editor) ----
@@ -392,6 +521,13 @@ export function scheduleAutomation(deck: Deck, automation: DeckAutomation, start
   scheduleLinear(deck.high.gain, automation.high, 1, startTime, scale, from, now)
   scheduleFilter(deck, automation.filter, startTime, scale, from, now)
   scheduleRouting(deck, automation, startTime, scale, from, now)
+  // The reverb send (made only for a transition that uses it; a deck that has one closes it when the next doesn't).
+  if (usesReverb(automation) || deck.reverb) {
+    const { send, wet } = reverbOf(deck)
+    scheduleLinear(send.gain, automation.reverb ?? [], 0, startTime, scale, from, now)
+    holdAt(wet.gain, now)
+    setAt(wet.gain, now, 1)
+  }
 }
 
 /** Whether a deck's EQ or filter changes its sound at transition time `t`. */
@@ -557,6 +693,7 @@ function automatedParams(deck: Deck) {
     deck.echo.delay.delayTime,
     deck.paths.dry.gain,
     deck.paths.coloured.gain,
+    ...(deck.reverb ? [deck.reverb.send.gain, deck.reverb.wet.gain] : []),
   ]
 }
 
@@ -607,6 +744,17 @@ export function resetDeck(deck: Deck, time = deck.ctx.currentTime, ramp = 0) {
   setAt(feedback.gain, time, 0)
   setAt(wet.gain, time, 0)
   setAt(wet.gain, time + MAX_DELAY_S + 0.05, 1)
+  // The reverb: nothing goes in any more. Gliding (B after its transition), what is in it rings out; at once (a jump),
+  // its return stays shut until the hall is empty.
+  if (deck.reverb) {
+    const reverb = deck.reverb
+    if (ramp > 0) rampAt(reverb.send.gain, end, 0)
+    else {
+      setAt(reverb.send.gain, time, 0)
+      setAt(reverb.wet.gain, time, 0)
+      setAt(reverb.wet.gain, time + REVERB_TAIL_S + 0.05, 1)
+    }
+  }
 }
 
 /**

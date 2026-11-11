@@ -23,7 +23,7 @@ import { downloadedAudioUrl, downloadId, isDownloaded, setDownloadQuality, setDo
 import { DIRECT_FORMATS } from './quality'
 import { setSleepHandler, sleepsAfterTrack, stopsAfterTrack } from './sleep-timer'
 import type { Transition } from '../mixer/types'
-import { asPlayed, createDeck, createMaster, freezeDeck, handoverPoint, rampAt, releaseEcho, resetDeck, scheduleTransition, type Deck, type Master } from '../mixer/engine'
+import { asPlayed, createDeck, createMaster, freezeDeck, handoverPoint, rampAt, releaseEcho, releaseReverb, resetDeck, reverbTailEnd, scheduleTransition, type Deck, type Master } from '../mixer/engine'
 import { bSettled, deckPlan, positionAt, rateOf, timeOfAdvance, trackSpan, withBrake, type DeckPlan } from '../mixer/deck-schedule'
 import { bufferDeckKind, tempoChangeKind, type BufferDeckKind } from '../mixer/buffer-deck'
 import { mono } from '../mixer/xcorr'
@@ -1266,6 +1266,8 @@ interface Running {
   handoverLead: number
   /** When B plays straight at its own tempo again (transition time). */
   settled: number
+  /** Until when the limiter acts (transition time): B settled, and any reverb tail rung out. */
+  limited: number
   /** A is gone; B is still on its buffer until it hands back. */
   trailing: boolean
 }
@@ -1812,6 +1814,7 @@ function startRunning(p: Plan, a: HTMLAudioElement, b: HTMLAudioElement, zero: n
     sides,
     handoverLead: 0,
     settled: bSettled(transition),
+    limited: Math.max(bSettled(transition), reverbTailEnd(transition) ?? -Infinity),
     trailing: false,
   }
   running = r
@@ -1950,7 +1953,7 @@ function finishRunning(r: Running) {
   }
   running = null
   // B alone and neutral again: the limiter lets go once B is back at its own tempo (its release run out).
-  if (deckB) master?.engage(false, deckB.ctx.currentTime + Math.max(SETTLE_S, r.settled - (context!.currentTime - r.start)))
+  if (deckB) master?.engage(false, deckB.ctx.currentTime + Math.max(SETTLE_S, r.limited - (context!.currentTime - r.start)))
   trail(r)
   mixerTick()
 }
@@ -1997,7 +2000,8 @@ async function handBack(r: Running) {
     if (running !== r) return
     running = null
     closeSides(r)
-    master?.engage(false)
+    // (Still on while a reverb tail rings.)
+    master?.engage(false, Math.max(ctx.currentTime, r.start + r.limited))
     mixerTick()
   })
 }
@@ -2042,7 +2046,7 @@ function abortRunning() {
   elementGain(keep).gain.value = 1
   const deck = decks.get(keep)
   if (deck) safely(() => resetDeck(deck, deck.ctx.currentTime, SETTLE_S))
-  if (deck) master?.engage(false, deck.ctx.currentTime + SETTLE_S)
+  if (deck) master?.engage(false, deck.ctx.currentTime + Math.max(SETTLE_S, decks.get(gone)?.reverb ? ABORT_TAIL_S : 0))
   planSoon()
 }
 
@@ -2067,6 +2071,7 @@ function retire(element: HTMLAudioElement, tail: number) {
     freezeDeck(deck, now)
     rampAt(deck.gain.gain, now + RETIRE_S, 0)
     if (echoing) quiet = releaseEcho(deck, now, tail)
+    quiet = Math.max(quiet, releaseReverb(deck, now, tail))
   })
   wakeAfter(context, fading ? RETIRE_S + 0.02 : 0, () => {
     retiring.delete(element)

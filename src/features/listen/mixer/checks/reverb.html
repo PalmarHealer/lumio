@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Reverb check</title>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      import { checkReverb } from './reverb-check.ts'
+      const out = document.getElementById('out')
+      const results = []
+      window.reverbResults = results
+      for (const rate of [44100, 48000]) for (const kind of ['tone', 'noise']) {
+        results.push(await checkReverb(kind, rate))
+        out.textContent = results.map((r) => JSON.stringify(r)).join('\n')
+      }
+      out.textContent += results.every((r) => r.pass) ? '\nPASS' : '\nFAIL'
+      window.reverbDone = true
+    </script>
+  </body>
+</html>

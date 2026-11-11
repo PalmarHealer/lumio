@@ -31,7 +31,7 @@ import { MAJOR, MINOR, fft, pearson } from './sound-analysis.ts'
 // ---- the contract (an identical copy of src/features/listen/mixer/types.ts: the server can't import from src/) ----
 
 /** Raised when the analysis changes, so songs are analysed again. */
-export const MIX_VERSION = 1
+export const MIX_VERSION = 2
 
 export type SectionKind = 'intro' | 'verse' | 'chorus' | 'drop' | 'build' | 'break' | 'outro' | 'other'
 
@@ -1254,8 +1254,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   }
   for (let p = 0; p < phraseCount; p++) {
     const info = phraseInfo[p]!
-    // A pop chorus that lands with a bass jump stays a chorus (it is sung); a drop is the instrumental payoff.
-    if (dropPhrases.has(p) && !(chorusGroups.has(label[p]!) && info.sung > 0.3)) kinds[p] = 'drop'
+    // A phrase on a drop is a drop, also when the chorus is sung over it: `drops` and the section kinds agree.
+    if (dropPhrases.has(p)) kinds[p] = 'drop'
     // A drop runs on through the next phrases as long as it stays as loud, up to 32 bars.
     else if (p > 0 && kinds[p - 1] === 'drop' && info.level >= 0.85 * loud && info.low >= 0.7 * typicalLow && phraseBars[p]! - phraseBars[lastDrop(p)]! < 32) kinds[p] = 'drop'
     else if (chorusGroups.has(label[p]!)) kinds[p] = 'chorus'
@@ -1289,10 +1289,20 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     for (let p = phraseCount - 1; p >= 0; p--) if (kinds[p] === 'chorus' || kinds[p] === 'drop') return p
     return -1
   })()
-  for (let p = phraseCount - 1; p > Math.max(0, lastMain) && kinds[p] !== 'intro'; p--) {
+  // Outro: the trailing phrases after the last chorus or drop and after the last sung part of the song's body. A phrase
+  // with singing (over 30 % of it sung) belongs to the body, unless it is a fade: the song's last phrase, quieter than
+  // the one before and under 60 % of the loud parts (ad-libs over the fade-out).
+  const isFade = (p: number) => p === phraseCount - 1 && p > 0 && phraseInfo[p]!.level < 0.6 * loud && phraseInfo[p]!.level < phraseInfo[p - 1]!.level
+  let lastBody = lastMain
+  for (let p = phraseCount - 1; p > lastMain; p--) {
+    if (phraseInfo[p]!.sung > 0.3 && !isFade(p)) {
+      lastBody = p
+      break
+    }
+  }
+  for (let p = phraseCount - 1; p > Math.max(0, lastBody) && kinds[p] !== 'intro'; p--) {
     const info = phraseInfo[p]!
-    if (info.sung > 0.2 && info.level >= 0.8 * loud) break
-    if (info.level < 0.85 * loud || info.sung <= 0.2 || p === phraseCount - 1) kinds[p] = 'outro'
+    if (info.level < 0.85 * loud || info.sung <= 0.3 || isFade(p)) kinds[p] = 'outro'
     else break
   }
   // Verses: sung (or, without vocals, middling) phrases that are left.
@@ -1324,8 +1334,16 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   // ---- 7. intro end, outro start, cue points ----
   const introEnd = phraseCount ? phrases[inPhrase]! : beats[0] ?? 0
   const outroPhrase = kinds.findIndex((kind, p) => kind === 'outro' && kinds.slice(p).every((rest) => rest === 'outro'))
+  // Where the song winds down: its outro; without one, the phrase after its body; when the body runs to the last
+  // phrase, the first downbeat after its last sung line (unpadded) ends, else (no singing, or none left) that phrase.
+  const lastSung = sungStretches.length ? sungStretches[sungStretches.length - 1]!.end : 0
+  const afterSinging = sungStretches.length ? downbeats.find((time) => time >= lastSung && time < duration - 2) : undefined
   const outroStart =
-    outroPhrase > 0 ? phrases[outroPhrase]! : lastMain >= 0 && lastMain + 1 < phraseCount ? phrases[lastMain + 1]! : phraseCount ? phrases[phraseCount - 1]! : duration
+    outroPhrase > 0
+      ? phrases[outroPhrase]!
+      : lastBody >= 0 && lastBody + 1 < phraseCount
+        ? phrases[lastBody + 1]!
+        : afterSinging ?? (phraseCount ? phrases[phraseCount - 1]! : duration)
   const beatIn = (start: number, end: number) => clamp(levelAt(lowLevel, start, end) / (0.6 * typicalLow)) * clamp(spanMean(envelope, frameRate, firstTime, start, end) / 0.6)
   // Entries: where B is best brought in during a mix. First where the song is fully in (its intro skipped; when it is
   // in from the start, that is the start), then its first chorus or drop and the next ones, then other section starts;

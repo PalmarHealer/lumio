@@ -27,6 +27,8 @@ export interface RenderTransitionOptions {
   sampleRate?: number
   /** The limiter's statistics, as rendering goes on (the last call has the whole render). */
   onLimiter?: (stats: LimiterStats) => void
+  /** The same for each deck's own limiter (on its stretched sound, see buffer-deck.ts). */
+  onDeckLimiter?: (deck: 'a' | 'b', stats: LimiterStats) => void
 }
 
 /** Sample-rate independent time → frame conversion used for the render's length. */
@@ -70,8 +72,8 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   const bAt = Math.max(0, transition.bAt)
   const bTo = Math.max(bAt, length) + postRoll
   const [playerA, playerB] = await Promise.all([
-    createBufferDeck(ctx, deckA.input, braked.semitones ? 'stretch' : bufferDeckKind(braked.plan, aFrom, length, tempoChangeKind)),
-    createBufferDeck(ctx, deckB.input, bufferDeckKind(planB, bAt, bTo, tempoChangeKind)),
+    createBufferDeck(ctx, deckA.input, bufferDeckKind(braked.plan, aFrom, length, tempoChangeKind), { onLimiter: (stats) => options.onDeckLimiter?.('a', stats) }),
+    createBufferDeck(ctx, deckB.input, bufferDeckKind(planB, bAt, bTo, tempoChangeKind), { onLimiter: (stats) => options.onDeckLimiter?.('b', stats) }),
   ])
   await Promise.all([playerA.load(stereo(a), 0, a.sampleRate), playerB.load(stereo(b), 0, b.sampleRate)])
   playerA.play(braked.plan, aFrom, length, zero, braked.semitones)

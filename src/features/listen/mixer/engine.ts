@@ -648,12 +648,14 @@ const LIMITER_RELEASE_S = 0.15
 const LIMITER_PROCESSOR = `
 class LumioLimiter extends AudioWorkletProcessor {
   static get parameterDescriptors() {
-    return [{ name: 'active', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' }]
+    return [
+      { name: 'active', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
+      { name: 'ceiling', defaultValue: 1, minValue: 0, maxValue: 16, automationRate: 'a-rate' },
+    ]
   }
   constructor(options) {
     super()
     const o = options.processorOptions || {}
-    this.ceiling = Math.pow(10, o.ceilingDb / 20)
     this.box = Math.max(1, Math.round(o.lookahead * sampleRate))
     this.window = this.box + 2
     this.delay = this.box + 1
@@ -683,7 +685,9 @@ class LumioLimiter extends AudioWorkletProcessor {
     const output = outputs[0]
     const length = output[0].length
     const target = parameters.active[0]
+    const ceilings = parameters.ceiling
     for (let i = 0; i < length; i++) {
+      const ceiling = ceilings.length > 1 ? ceilings[i] : ceilings[0]
       let peak = 0
       for (let c = 0; c < 2; c++) {
         const source = input[Math.min(c, input.length - 1)]
@@ -691,7 +695,7 @@ class LumioLimiter extends AudioWorkletProcessor {
         peak = Math.max(peak, Math.abs(x))
         this.lines[c][this.write] = x
       }
-      const wanted = peak > this.ceiling ? this.ceiling / peak : 1
+      const wanted = peak > ceiling ? ceiling / peak : 1
       const n = this.n++
       while (this.tail > this.head && this.minValues[(this.tail - 1) % (this.window + 1)] >= wanted) this.tail--
       this.minValues[this.tail % (this.window + 1)] = wanted
@@ -743,14 +747,10 @@ export interface Master {
 
 const limiterModules = new WeakMap<BaseAudioContext, Promise<void>>()
 
-/** How many frames later the limiter's output comes (its lookahead, plus one). */
-export const limiterLatency = (sampleRate: number) => Math.max(1, Math.round(LIMITER_LOOKAHEAD_S * sampleRate)) + 1
+/** How many frames later a limiter's output comes (its lookahead, plus one). */
+export const limiterLatency = (sampleRate: number, lookahead = LIMITER_LOOKAHEAD_S) => Math.max(1, Math.round(lookahead * sampleRate)) + 1
 
-/**
- * The mixer's master bus into `destination`: everything the decks play goes through the limiter. Loads the limiter's
- * worklet into the context first (once per context; from a blob, so no separate file has to be served).
- */
-export async function createMaster(ctx: BaseAudioContext, destination: AudioNode, options: { onStats?: (stats: LimiterStats) => void } = {}): Promise<Master> {
+async function limiterNode(ctx: BaseAudioContext, lookahead: number, release: number, onStats?: (stats: LimiterStats) => void) {
   let loading = limiterModules.get(ctx)
   if (!loading) {
     const url = URL.createObjectURL(new Blob([LIMITER_PROCESSOR], { type: 'text/javascript' }))
@@ -758,16 +758,63 @@ export async function createMaster(ctx: BaseAudioContext, destination: AudioNode
     limiterModules.set(ctx, loading)
   }
   await loading
-  const input = new GainNode(ctx, { channelCount: 2, channelCountMode: 'explicit' })
-  const limiter = new AudioWorkletNode(ctx, 'lumio-limiter', {
+  const node = new AudioWorkletNode(ctx, 'lumio-limiter', {
     numberOfInputs: 1,
     numberOfOutputs: 1,
     outputChannelCount: [2],
     channelCount: 2,
     channelCountMode: 'explicit',
-    processorOptions: { ceilingDb: LIMITER_CEILING_DB, lookahead: LIMITER_LOOKAHEAD_S, release: LIMITER_RELEASE_S, report: !!options.onStats },
+    processorOptions: { lookahead, release, report: !!onStats },
   })
-  if (options.onStats) limiter.port.onmessage = (event: MessageEvent<LimiterStats>) => options.onStats!(event.data)
+  if (onStats) node.port.onmessage = (event: MessageEvent<LimiterStats>) => onStats(event.data)
+  return node
+}
+
+/** The deck limiter's lookahead and release: short, it only catches single peaks. */
+const DECK_LIMITER_LOOKAHEAD_S = 0.0025
+const DECK_LIMITER_RELEASE_S = 0.04
+
+export interface DeckLimiter {
+  input: GainNode
+  output: AudioNode
+  /** The ceiling (linear amplitude) over time: automate it. */
+  ceiling: AudioParam
+  /** How much later its output comes, in seconds. */
+  latency: number
+  dispose(): void
+}
+
+/**
+ * A limiter for one deck's time-stretched sound (buffer-deck.ts): its ceiling follows the track's own local peaks, so
+ * the peaks the stretcher's phase reconstruction adds (which the track never had) are taken back down, and nothing
+ * else. Always acting; it sits only on the stretched path.
+ */
+export async function createDeckLimiter(ctx: BaseAudioContext, onStats?: (stats: LimiterStats) => void): Promise<DeckLimiter> {
+  const node = await limiterNode(ctx, DECK_LIMITER_LOOKAHEAD_S, DECK_LIMITER_RELEASE_S, onStats)
+  const input = new GainNode(ctx, { channelCount: 2, channelCountMode: 'explicit' })
+  input.connect(node)
+  node.parameters.get('active')!.value = 1
+  return {
+    input,
+    output: node,
+    ceiling: node.parameters.get('ceiling')!,
+    latency: limiterLatency(ctx.sampleRate, DECK_LIMITER_LOOKAHEAD_S) / ctx.sampleRate,
+    dispose() {
+      input.disconnect()
+      node.disconnect()
+      node.port.onmessage = null
+    },
+  }
+}
+
+/**
+ * The mixer's master bus into `destination`: everything the decks play goes through the limiter. Loads the limiter's
+ * worklet into the context first (once per context; from a blob, so no separate file has to be served).
+ */
+export async function createMaster(ctx: BaseAudioContext, destination: AudioNode, options: { onStats?: (stats: LimiterStats) => void } = {}): Promise<Master> {
+  const limiter = await limiterNode(ctx, LIMITER_LOOKAHEAD_S, LIMITER_RELEASE_S, options.onStats)
+  limiter.parameters.get('ceiling')!.value = 10 ** (LIMITER_CEILING_DB / 20)
+  const input = new GainNode(ctx, { channelCount: 2, channelCountMode: 'explicit' })
   input.connect(limiter).connect(destination)
   const active = limiter.parameters.get('active')!
   return {

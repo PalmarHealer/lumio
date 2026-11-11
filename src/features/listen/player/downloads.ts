@@ -262,8 +262,11 @@ export async function clearDownloads() {
 
 export const isDownloaded = (id: string | null | undefined) => !!id && !!index.tracks[id]
 
-/** The object URL handed to the audio element last; released when the next one is made. */
-let lastUrl: string | null = null
+/**
+ * The object URLs handed to the player last: the two newest stay valid (the track playing and, in a mixer transition,
+ * the one coming in on the second element); older ones are released.
+ */
+let recentUrls: string[] = []
 
 /** A playable address for a downloaded song, or null when it isn't downloaded. */
 export async function downloadedAudioUrl(id: string | null | undefined): Promise<string | null> {
@@ -276,9 +279,10 @@ export async function downloadedAudioUrl(id: string | null | undefined): Promise
       void reconcile()
       return null
     }
-    if (lastUrl) URL.revokeObjectURL(lastUrl)
-    lastUrl = URL.createObjectURL(await response.blob())
-    return lastUrl
+    const url = URL.createObjectURL(await response.blob())
+    recentUrls = [...recentUrls, url]
+    while (recentUrls.length > 2) URL.revokeObjectURL(recentUrls.shift()!)
+    return url
   } catch {
     return null
   }

@@ -21,7 +21,10 @@ import { MediaSession as NativeMediaSession } from '@capgo/capacitor-media-sessi
 import { flushPlays, logBuffering, logPlay, type EndReason, type PlayContext, type StartReason } from './play-log'
 import { downloadedAudioUrl, downloadId, isDownloaded, setDownloadQuality, setDownloadSource, setReleaseHandler } from './downloads'
 import { DIRECT_FORMATS } from './quality'
-import { setSleepHandler, stopsAfterTrack } from './sleep-timer'
+import { setSleepHandler, sleepsAfterTrack, stopsAfterTrack } from './sleep-timer'
+import type { Transition } from '../mixer/types'
+import { brakeRateAt, createDeck, freezeDeck, handoverPoint, rateAt, rateEaseSeconds, releaseEcho, resetDeck, scheduleTransition, type Deck } from '../mixer/engine'
+import { currentPlayLead, keepAligned, learnPlayLead, waitForCue, wakeAfter } from './deck-sync'
 
 /**
  * Listen's player: one <audio> element for the whole app, so music keeps playing while the user moves between pages
@@ -151,6 +154,8 @@ function setState(patch: Partial<MusicState>) {
   state = { ...state, ...patch }
   for (const listener of stateListeners) listener()
   if ('queue' in patch || 'index' in patch || 'source' in patch || 'shuffle' in patch || 'repeat' in patch) saveSessionSoon()
+  // What comes next may have changed: the mixer looks again at the transition into it.
+  if ('queue' in patch || 'entries' in patch || 'index' in patch || 'source' in patch || 'shuffle' in patch || 'repeat' in patch) planSoon()
 }
 
 function setTime(next: MusicTime) {
@@ -323,16 +328,15 @@ function libraryAudioUrl(id: string, limit: number | null, sessionId: string) {
   return `${api.basePath}/Audio/${id}/universal?${params}`
 }
 
-// ---- the audio element ----
-
-const audio = typeof Audio !== 'undefined' ? new Audio() : null
+// ---- the audio elements ----
 
 /**
  * Volume normalization (Settings → Music): Jellyfin measures each track's and album's loudness (its "audio
  * normalization" task) and tells the gain in dB that brings it to a common level. Lumio can only turn the element
  * down, not up, so loud tracks are lowered and quiet ones stay as they are. Tracks without a measurement play unchanged.
+ * Kept per element: during a mixer transition both tracks sound, each with its own gain.
  */
-let gainFactor = 1
+const trackGains = new WeakMap<HTMLAudioElement, number>()
 const albumGains = new Map<string, number | null>()
 
 /** Pause and play fade (0 silent – 1 full), instead of cutting the sound off. */
@@ -341,8 +345,43 @@ let fadeTimer = 0
 const FADE_OUT_MS = 300
 const FADE_IN_MS = 400
 
+/** The mixer's Web Audio decks, per element (see "the mixer" below); an element without one plays straight out. */
+const decks = new WeakMap<HTMLAudioElement, Deck>()
+/** Which track each element has loaded (an element's position only means something for its own track). */
+const holds = new WeakMap<HTMLAudioElement, BaseItemDto>()
+
+/**
+ * `audio` plays the current track. A mixer transition plays the next track on a second element (`standby`) while both
+ * sound; then the two swap roles. Without transitions only `audio` ever plays.
+ */
+let audio: HTMLAudioElement | null = typeof Audio !== 'undefined' ? createElement() : null
+let standby: HTMLAudioElement | null = null
+applyVolume()
+
+function createElement() {
+  const element = new Audio()
+  element.preload = 'auto'
+  wire(element)
+  return element
+}
+
+/** Sets each element's volume: the slider, the pause fade and its track's normalization. */
 function applyVolume() {
-  if (audio) audio.volume = Math.min(1, Math.max(0, loudness(state.volume * fadeLevel) * gainFactor))
+  const level = loudness(state.volume * fadeLevel)
+  for (const element of [audio, standby]) {
+    if (!element) continue
+    const volume = Math.min(1, Math.max(0, level * (trackGains.get(element) ?? 1)))
+    const deck = decks.get(element)
+    if (!deck) {
+      element.volume = volume
+      if (element.muted !== state.muted) element.muted = state.muted
+      continue
+    }
+    // On the graph the deck's level does it; the element stays at full volume so nothing is applied twice.
+    element.volume = 1
+    element.muted = false
+    deck.level.gain.setTargetAtTime(state.muted ? 0 : volume, deck.ctx.currentTime, 0.005)
+  }
 }
 
 /**
@@ -377,26 +416,29 @@ function unfade() {
   applyVolume()
 }
 
-/** Fades out, then pauses; the controls show the pause right away. */
+/** Fades out, then pauses; the controls show the pause right away. (A transition under way pauses with it.) */
 function fadeOut() {
-  if (!audio || audio.paused || fadingOut) return
+  const element = audio
+  if (!element || element.paused || fadingOut) return
   fadingOut = true
   setState({ playing: false })
   fade(0, FADE_OUT_MS, () => {
-    audio.pause()
+    element.pause()
     unfade()
   })
 }
 
 /** Plays, fading in (also when a fade out is still under way: it turns back). */
 function fadeIn() {
-  if (!audio) return
+  const element = audio
+  if (!element) return
   fadingOut = false
-  if (audio.paused) {
+  wakeContext()
+  if (element.paused) {
     window.clearInterval(fadeTimer)
     fadeLevel = 0
     applyVolume()
-    void audio.play().catch(() => unfade())
+    void element.play().catch(() => unfade())
   } else setState({ playing: true })
   fade(1, FADE_IN_MS)
 }
@@ -421,50 +463,78 @@ async function gainOf(item: BaseItemDto): Promise<number | null> {
 /** Sets the gain for the track playing (on every track change, and when the setting changes). */
 async function normalize(item = currentTrack()) {
   const gain = item ? await gainOf(item) : null
-  if (item !== currentTrack()) return
-  gainFactor = gain === null ? 1 : Math.min(1, 10 ** (gain / 20))
+  if (item !== currentTrack() || !audio) return
+  trackGains.set(audio, gainFactorOf(gain))
   applyVolume()
 }
 
-if (audio) {
-  audio.preload = 'auto'
-  applyVolume()
-  audio.addEventListener('play', () => {
+const gainFactorOf = (gain: number | null) => (gain === null ? 1 : Math.min(1, 10 ** (gain / 20)))
+
+/**
+ * The element's events. Only those of the element playing the current track count; the other one's are the mixer's
+ * business (it loads and starts the next track) and are left to it.
+ */
+function wire(element: HTMLAudioElement) {
+  const current = () => element === audio
+  element.addEventListener('play', () => {
+    if (!current()) return
     setState({ playing: true })
     updateAppSession()
     shareActivity(true)
     // Listening time counts again from here (it stopped at the pause).
     const item = currentTrack()
     if (item) logPlay('progress', item, true, playSessionId)
+    mixerPlayed()
   })
-  audio.addEventListener('pause', () => {
+  element.addEventListener('pause', () => {
+    if (!current()) return
     setState({ playing: false })
     updateAppSession()
     shareActivity(false)
     report('progress')
     writeSession()
+    mixerPaused()
   })
-  audio.addEventListener('waiting', () => {
+  element.addEventListener('waiting', () => {
+    if (!current()) return
     setState({ buffering: true })
     logBuffering(true)
   })
-  audio.addEventListener('playing', () => {
+  element.addEventListener('playing', () => {
+    if (!current()) return
     setState({ buffering: false })
     logBuffering(false)
+    // Played fine without CORS after failing with it: the server doesn't allow it, so no transitions this visit.
+    if (corsSuspect === element) {
+      corsSuspect = null
+      corsBlocked = true
+    }
   })
-  audio.addEventListener('canplay', () => setState({ buffering: false }))
-  audio.addEventListener('timeupdate', () => {
-    setTime({ position: audio.currentTime, duration: durationOf() })
+  element.addEventListener('canplay', () => current() && setState({ buffering: false }))
+  element.addEventListener('timeupdate', () => {
+    if (!current()) return
+    setTime({ position: element.currentTime, duration: durationOf() })
     if (Date.now() - positionSavedAt > SAVE_POSITION_MS) writeSession()
+    mixerTick()
   })
-  audio.addEventListener('durationchange', () => {
-    setTime({ position: audio.currentTime, duration: durationOf() })
+  element.addEventListener('durationchange', () => {
+    if (!current()) return
+    setTime({ position: element.currentTime, duration: durationOf() })
     updateAppSession()
   })
-  audio.addEventListener('seeked', updateAppSession)
-  audio.addEventListener('ended', onEnded)
-  audio.addEventListener('error', () => {
+  element.addEventListener('seeked', () => current() && updateAppSession())
+  element.addEventListener('ended', () => {
+    // The track ran out while the next one was already coming in: that one is the track now.
+    if (running && running.a === element && !running.handedOver) return finishRunning(running)
+    if (current() && !followsBackToBack(element)) onEnded()
+  })
+  element.addEventListener('error', () => {
+    if (!current()) return mixerElementFailed(element)
     setState({ buffering: false })
+    // A library track that wouldn't load with CORS: once more without (and on an element off the graph).
+    const item = currentTrack()
+    if (corsLoads.has(element) && element.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED && item && !externalOf(item)) return retryWithoutCors(element)
+    if (running && running.a === element && !running.handedOver) return finishRunning(running)
     // A track that can't be played is skipped rather than stopping the whole queue.
     if (state.index < state.queue.length - 1) void go(state.index + 1, undefined, 'trackerror')
   })
@@ -478,7 +548,11 @@ function durationOf() {
 
 // ---- reporting (play counts, "recently played", resume points) ----
 
-function report(kind: 'start' | 'progress' | 'stopped', item = currentTrack(), reasonEnd?: EndReason) {
+/**
+ * `finished`: a track a transition took over from before its end (a cut outro); reported as played to the end, so it
+ * counts as played (Jellyfin's play count, Wrapped), as the user heard it as a whole.
+ */
+function report(kind: 'start' | 'progress' | 'stopped', item = currentTrack(), reasonEnd?: EndReason, finished = false) {
   if (!connection || !item?.Id || !audio) return
   // Lumio's own play log: how long, and (songs) how the play went.
   logPlay(kind, item, !audio.paused, playSessionId, { context: kind === 'start' ? startContext : undefined, reasonEnd })
@@ -490,9 +564,9 @@ function report(kind: 'start' | 'progress' | 'stopped', item = currentTrack(), r
   }
   const info = {
     ItemId: item.Id,
-    PositionTicks: secondsToTicks(audio.currentTime),
+    PositionTicks: finished && item.RunTimeTicks ? item.RunTimeTicks : secondsToTicks(audio.currentTime),
     IsPaused: audio.paused,
-    IsMuted: audio.muted,
+    IsMuted: state.muted,
     VolumeLevel: Math.round(state.volume * 100),
     PlayMethod: PlayMethod.DirectStream,
     PlaySessionId: playSessionId,
@@ -509,10 +583,11 @@ function report(kind: 'start' | 'progress' | 'stopped', item = currentTrack(), r
   }
   // When a play can't be reported (offline, e.g. a cached song), it is kept and handed in later, so it still counts.
   const { userId } = connection
+  // Judged now: by the time a failed report is kept, the element may already play the next track.
+  const duration = durationOf()
+  const played = finished || (!!duration && audio.currentTime >= duration * 0.9)
   const keep = () => {
     if (kind !== 'stopped') return
-    const duration = durationOf()
-    const played = !!duration && audio!.currentTime >= duration * 0.9
     rememberPlayback(userId, { itemId: item.Id!, at: new Date().toISOString(), played, positionTicks: info.PositionTicks })
   }
   if (typeof navigator !== 'undefined' && !navigator.onLine) return keep()
@@ -546,6 +621,11 @@ function sourceOf(index: number) {
 
 async function go(index: number, startAt?: number, reason: StartReason = 'clickrow') {
   if (!audio || !connection) return
+  // A transition under way ends here (the track it kept is the one being left now), and so does any plan.
+  wakeContext()
+  abortRunning()
+  dropPlan()
+  cancelEase()
   // Offline, songs that need the network are skipped: on to the next one that is here (downloaded or cached).
   if (isOffline() && state.queue[index] && !playableOffline(state.queue[index])) {
     const next = state.queue.findIndex((entry, position) => position > index && playableOffline(entry))
@@ -570,27 +650,35 @@ async function go(index: number, startAt?: number, reason: StartReason = 'clickr
   const key = downloaded ? null : cacheKey(item)
   const cached = key ? await cachedAudioUrl(key) : null
   // Another track may have been chosen meanwhile.
-  if (currentTrack() !== item) return
-  audio.src = downloaded ?? cached ?? streamUrl(item)
+  if (currentTrack() !== item || !audio) return
+  corsSuspect = null
+  const element = load(audio, downloaded ?? cached ?? streamUrl(item), wantsCors(item, audio))
+  holds.set(element, item)
+  prepareDeck(element)
   void normalize(item)
   startContext = { reasonStart: reason, source: sourceOf(index), shuffle: state.shuffle, offline: !!(downloaded ?? cached) }
   if (key && cached) recordCachedPlay(key)
   // The position can only be set once the stream's metadata is in.
-  if (startAt) audio.addEventListener('loadedmetadata', () => (audio.currentTime = startAt), { once: true })
+  if (startAt) element.addEventListener('loadedmetadata', () => (element.currentTime = startAt), { once: true })
   unfade()
   try {
-    await audio.play()
+    await element.play()
     report('start')
   } catch {
     // Autoplay blocked or the stream failed; the UI shows a play button again.
-    setState({ playing: false, buffering: false })
+    if (element === audio) setState({ playing: false, buffering: false })
   }
-  window.clearInterval(progressTimer)
-  progressTimer = window.setInterval(() => !audio.paused && report('progress'), PROGRESS_EVERY_MS)
+  restartProgress()
   updateMediaSession()
   // Once the collection is through, autoplay keeps the next songs lined up (and shown), so it simply goes on.
   await extendQueue()
   void cacheAhead()
+}
+
+/** Reports the position now and then while playing. */
+function restartProgress() {
+  window.clearInterval(progressTimer)
+  progressTimer = window.setInterval(() => audio && !audio.paused && report('progress'), PROGRESS_EVERY_MS)
 }
 
 // ---- autoplay: when the queue runs out, more of the same ----
@@ -757,6 +845,11 @@ let remoteSink: RemoteSink | null = null
 
 export function setRemoteSink(next: RemoteSink | null) {
   remoteSink = next
+  // Transitions are played here only: while another device is steered, none is prepared.
+  if (next) {
+    abortRunning()
+    dropPlan()
+  } else planSoon()
 }
 
 /**
@@ -918,6 +1011,7 @@ export const music = {
         setTime({ position: 0, duration: durationOf() })
         return writeSession()
       }
+      mixerSeeking()
       audio.currentTime = 0
       return
     }
@@ -934,6 +1028,7 @@ export const music = {
       setTime({ position: pendingStart, duration: durationOf() })
       return writeSession()
     }
+    mixerSeeking()
     audio.currentTime = Math.max(0, Math.min(seconds, durationOf() || seconds))
     setTime({ position: audio.currentTime, duration: durationOf() })
     report('progress')
@@ -942,7 +1037,6 @@ export const music = {
     if (!audio) return
     const next = Math.min(1, Math.max(0, volume))
     setState({ volume: next, muted: next === 0 })
-    audio.muted = next === 0
     applyVolume()
     try {
       localStorage.setItem(VOLUME_KEY, String(next))
@@ -956,8 +1050,8 @@ export const music = {
   },
   toggleMute() {
     if (!audio) return
-    audio.muted = !audio.muted
-    setState({ muted: audio.muted })
+    setState({ muted: !state.muted })
+    applyVolume()
   },
   /** Sets shuffle for a collection; if it is the one playing, the queue follows right away. */
   setShuffleFor(source: string, on: boolean) {
@@ -1029,15 +1123,743 @@ function stop(reason: EndReason = 'endplay') {
   else if (item) logPlay('stopped', item, false, playSessionId, { reasonEnd: reason })
   pendingStart = null
   reportActivity(null)
+  abortRunning()
+  dropPlan()
+  cancelEase()
   unfade()
   audio.pause()
   audio.removeAttribute('src')
   audio.load()
+  if (standby) unload(standby)
   window.clearInterval(progressTimer)
   setState({ queue: [], entries: [], index: -1, playing: false, buffering: false, unshuffled: null, source: null })
   setTime({ position: 0, duration: 0 })
   updateAppSession()
 }
+
+// ---- the mixer: transitions between tracks (DJ mode) ----
+
+/**
+ * In a mixer playlist a transition can take the place of a plain track change: the next track starts on the second
+ * element before the current one has ended, both sound through the Web Audio decks (../mixer/engine.ts) with the
+ * transition's automation, and then the second element simply goes on as the current track.
+ *
+ * - The graph is attached to an element only when transitions are possible (a provider is set and the audio clock
+ *   runs): from the track's start, so nothing is rerouted mid-song. An element on the graph stays there for good (a
+ *   MediaElementSource can't be undone) and is then only given CORS-loaded audio, the only kind the graph may hear:
+ *   Jellyfin answers with `Access-Control-Allow-Origin: *`, blob: URLs (downloads, cache) are our own. Podcasts come
+ *   from hosts that may not allow CORS: they never take part in a transition and always play on an element off the
+ *   graph (a fresh one when needed). With no provider set, nothing of this happens: one element, as before.
+ * - Steps for the next track ("plan"): ask the provider when the track starts or the queue changes; load the next track
+ *   into the standby element 30 s before the cue and park it at `bIn` ("ready"); time its start on the cue; then
+ *   "running": hand over (UI, reports, media session switch to the new track) once it is louder than the old one;
+ *   stop the old one when the overlap ends.
+ * - The AudioContext needs a user gesture to run (iOS, autoplay rules): it is created and resumed on the first
+ *   pointer or key press while a provider is set. Without a running context there are simply no transitions. If it
+ *   stops later (the system took the audio device), the track moves to a fresh element off the graph.
+ */
+/**
+ * Decides the transition from `from` into `to` (the natural successor in the queue), or null for a plain track change.
+ * A 'none' transition is back to back: A plays to its real end, then B starts at `bIn` at once (preloaded on the
+ * second deck, so with hardly a gap), without automation.
+ */
+export type TransitionProvider = (
+  from: BaseItemDto,
+  to: BaseItemDto,
+  context: { source: string | null },
+) => Transition | null | Promise<Transition | null>
+
+/** The next track is loaded this long before its cue. */
+const PRELOAD_S = 30
+/** From this long before the cue its start is timed precisely. */
+const ARM_S = 2
+/** Reaching the cue later than this (a sleeping tab, a slow load) is too late: the track ends plainly instead. */
+const TOO_LATE_S = 1
+/** A paused audio clock with nothing to do is stopped after this long (it keeps the audio device busy). */
+const IDLE_SUSPEND_MS = 30_000
+/** When the audio clock hasn't come back after this long, the track moves off the graph. */
+const RESCUE_AFTER_S = 1.5
+/** A deck that keeps playing glides back to neutral over this long; one that leaves fades out over this long. */
+const SETTLE_S = 0.05
+const RETIRE_S = 0.03
+/** How long an echo may ring on after its deck has gone (after a transition), or after one was called off. */
+const ECHO_TAIL_S = 6
+const ABORT_TAIL_S = 0.5
+/** The brake on an element: its rate is stepped this often (media elements have no rate ramps). */
+const BRAKE_STEP_S = 0.04
+/** The slowest a media element plays. */
+const MIN_ELEMENT_RATE = 0.0625
+
+interface Plan {
+  fromUid: string
+  toUid: string
+  from: BaseItemDto
+  to: BaseItemDto
+  /** Asking the provider, no transition for this pair, decided, loading B, B parked at `bIn`, start being timed. */
+  status: 'asking' | 'none' | 'planned' | 'loading' | 'ready' | 'armed'
+  transition: Transition | null
+  /** Preset 'none': B follows A's real end (its `aOut` is kept on the element's own duration). */
+  backToBack: boolean
+  /** B's element (once loading), its play session, and whether it came from the device (and the cache key then). */
+  element: HTMLAudioElement | null
+  sessionId: string
+  offline: boolean
+  cacheKey: string | null
+  cancelCue: () => void
+}
+
+interface Running {
+  plan: Plan
+  transition: Transition
+  a: HTMLAudioElement
+  b: HTMLAudioElement
+  /** Context time of the transition's t = 0 (A at `aOut`). */
+  start: number
+  /** Transition time where it was paused; null while playing. */
+  pausedAt: number | null
+  /** When B takes over as the track playing (transition time). */
+  handover: number
+  handedOver: boolean
+  /** Stops what runs over time (timers, B's alignment, the brake); called on pause, abort and end. */
+  stops: Array<() => void>
+  /** B's start error was learned from already (only the first start teaches, not a resume). */
+  learned: boolean
+}
+
+let transitionProvider: TransitionProvider | null = null
+let context: AudioContext | null = null
+/** Elements whose current audio was loaded with CORS: only those may go through the graph (others would be silent). */
+const corsLoads = new WeakSet<HTMLAudioElement>()
+/** The server didn't allow CORS for the audio: no transitions for this visit. */
+let corsBlocked = false
+/** The element retrying a track without CORS (if it plays, CORS was the problem). */
+let corsSuspect: HTMLAudioElement | null = null
+/** Elements fading out of a transition, and until when (context time) an echo rings on one: not loaded until quiet. */
+const retiring = new Set<HTMLAudioElement>()
+const ringing = new WeakMap<HTMLAudioElement, number>()
+let plan: Plan | null = null
+let running: Running | null = null
+let planQueued = false
+let idleTimer = 0
+let cancelEase = () => {}
+
+/**
+ * Set by the mixer layer: decides the transitions. Set it only while a transition may come up (a mixer playlist is
+ * around): with a provider, library tracks load with CORS and play through the (transparent) decks.
+ */
+export function setTransitionProvider(next: TransitionProvider | null) {
+  transitionProvider = next
+  dropPlan()
+  if (!next) abortRunning()
+  else wakeContext()
+  planSoon()
+}
+
+/** Creates or resumes the audio clock (in a user gesture: browsers only let it run after one). */
+function wakeContext() {
+  if (!transitionProvider || corsBlocked || typeof AudioContext === 'undefined') return
+  try {
+    if (!context) {
+      context = new AudioContext({ latencyHint: 'playback' })
+      context.addEventListener('statechange', contextChanged)
+    }
+  } catch {
+    return
+  }
+  if (context.state !== 'running') void context.resume().catch(() => undefined)
+}
+
+if (typeof window !== 'undefined') {
+  for (const type of ['pointerdown', 'keydown', 'touchend']) window.addEventListener(type, wakeContext, { capture: true, passive: true })
+}
+
+/** The audio clock stopped (the system took the device, a call): an element playing through it would fall silent. */
+function contextChanged() {
+  if (!context || context.state === 'running') return
+  const element = audio
+  if (!element || element.paused || !decks.has(element)) return
+  void context.resume().catch(() => undefined)
+  rescueIfSilent()
+}
+
+/** Moves the track off the graph when the audio clock doesn't come back in time. */
+function rescueIfSilent() {
+  wakeAfter(null, RESCUE_AFTER_S, () => {
+    const element = audio
+    if (context?.state !== 'running' && element && !element.paused && decks.has(element)) rescue(element)
+  })
+}
+
+/** The track playing goes on, at the same spot, on a fresh element off the graph. */
+function rescue(element: HTMLAudioElement) {
+  abortRunning()
+  dropPlan()
+  const position = element.currentTime
+  const source = element.currentSrc || element.src
+  const cors = corsLoads.has(element)
+  const fresh = replaceElement(element)
+  if (cors) fresh.crossOrigin = 'anonymous'
+  fresh.src = source
+  if (cors) corsLoads.add(fresh)
+  trackGains.set(fresh, trackGains.get(element) ?? 1)
+  const item = holds.get(element)
+  if (item) holds.set(fresh, item)
+  applyVolume()
+  fresh.addEventListener('loadedmetadata', () => (fresh.currentTime = position), { once: true })
+  void fresh.play().catch(() => setState({ playing: false, buffering: false }))
+}
+
+/** Whether a track loads with CORS on `element`: library tracks while transitions are possible, or on the graph. */
+function wantsCors(item: BaseItemDto, element: HTMLAudioElement) {
+  if (externalOf(item) || corsBlocked) return false
+  return transitionProvider !== null || decks.has(element)
+}
+
+/**
+ * Points an element at a track's audio. An element on the graph can't play audio loaded without CORS (the graph
+ * would hear silence), so that goes to a fresh element instead, which is returned.
+ */
+function load(element: HTMLAudioElement, url: string, cors: boolean) {
+  const target = !cors && decks.has(element) ? replaceElement(element) : element
+  if (cors) target.crossOrigin = 'anonymous'
+  else target.removeAttribute('crossorigin')
+  target.src = url
+  if (cors) corsLoads.add(target)
+  else corsLoads.delete(target)
+  return target
+}
+
+/** A track starts on `element`: its deck (if any) back to neutral, or onto the graph now if transitions are possible. */
+function prepareDeck(element: HTMLAudioElement) {
+  element.preservesPitch = true
+  const deck = decks.get(element)
+  if (deck) resetDeck(deck)
+  else if (transitionProvider) attach(element)
+}
+
+/** Puts an element on the graph (only CORS-loaded audio, and only while the audio clock runs). */
+function attach(element: HTMLAudioElement): Deck | null {
+  const existing = decks.get(element)
+  if (existing) return existing
+  if (!context || context.state !== 'running' || !corsLoads.has(element)) return null
+  try {
+    const source = context.createMediaElementSource(element)
+    const deck = createDeck(context, context.destination)
+    source.connect(deck.input)
+    decks.set(element, deck)
+    applyVolume()
+    return deck
+  } catch {
+    return null
+  }
+}
+
+/** Swaps an element for a fresh one in its role (current or standby); the old one is emptied and dropped. */
+function replaceElement(old: HTMLAudioElement) {
+  const fresh = createElement()
+  fresh.preservesPitch = true
+  if (audio === old) audio = fresh
+  if (standby === old) standby = fresh
+  unload(old)
+  decks.get(old)?.dispose()
+  decks.delete(old)
+  retiring.delete(old)
+  applyVolume()
+  return fresh
+}
+
+function unload(element: HTMLAudioElement) {
+  element.pause()
+  element.removeAttribute('src')
+  element.load()
+  corsLoads.delete(element)
+}
+
+/** A library track failed with CORS: once more without (so it plays), and if that works, no more transitions. */
+function retryWithoutCors(element: HTMLAudioElement) {
+  abortRunning()
+  dropPlan()
+  const position = element.currentTime
+  const fresh = load(element, element.src, false)
+  const item = holds.get(element)
+  if (item) holds.set(fresh, item)
+  trackGains.set(fresh, trackGains.get(element) ?? 1)
+  applyVolume()
+  corsSuspect = fresh
+  if (position) fresh.addEventListener('loadedmetadata', () => (fresh.currentTime = position), { once: true })
+  void fresh.play().catch(() => setState({ playing: false, buffering: false }))
+}
+
+// -- planning --
+
+/** The queue position that plays after the current track on its own, or -1 (none, or repeat one). */
+function successorIndex() {
+  if (state.repeat === 'one' || state.index < 0) return -1
+  if (state.index < state.queue.length - 1) return state.index + 1
+  return state.repeat === 'all' && state.queue.length > 1 ? 0 : -1
+}
+
+const mixable = (item?: BaseItemDto): item is BaseItemDto => !!item?.Id && !externalOf(item)
+
+function planSoon() {
+  if (planQueued) return
+  planQueued = true
+  queueMicrotask(() => {
+    planQueued = false
+    planCheck()
+  })
+}
+
+/** Makes sure the plan (and a transition under way) is about the current track and the one that follows it. */
+function planCheck() {
+  const from = currentTrack()
+  const fromUid = state.entries[state.index]?.uid
+  const next = successorIndex()
+  const to = next >= 0 ? state.queue[next] : undefined
+  const toUid = next >= 0 ? state.entries[next]?.uid : undefined
+  // The track coming in is no longer next (removed, moved, repeat one): the transition is called off.
+  if (running && !running.handedOver && (running.plan.fromUid !== fromUid || running.plan.toUid !== toUid)) abortRunning()
+  if (plan && plan.fromUid === fromUid && plan.toUid === toUid) return
+  dropPlan()
+  if (!transitionProvider || remoteSink || corsBlocked || pendingStart !== null || !connection) return
+  if (!fromUid || !toUid || !mixable(from) || !mixable(to)) return
+  // The transition into the next track is already playing.
+  if (running && !running.handedOver) return
+  const fresh: Plan = {
+    fromUid,
+    toUid,
+    from,
+    to,
+    status: 'asking',
+    transition: null,
+    backToBack: false,
+    element: null,
+    sessionId: crypto.randomUUID(),
+    offline: false,
+    cacheKey: null,
+    cancelCue: () => {},
+  }
+  plan = fresh
+  const provider = transitionProvider
+  void Promise.resolve()
+    .then(() => provider(from, to, { source: state.source }))
+    .then((result) => {
+      if (plan !== fresh) return
+      const transition = result?.preset === 'none' ? backToBack(result, from) : result
+      if (!transition || !usable(transition, from, to)) return void (fresh.status = 'none')
+      fresh.transition = transition
+      fresh.backToBack = result?.preset === 'none'
+      fresh.status = 'planned'
+      mixerTick()
+    })
+    .catch(() => {
+      if (plan === fresh) fresh.status = 'none'
+    })
+}
+
+const still = () => ({ gain: [], low: [], mid: [], high: [], filter: [] })
+
+/**
+ * 'none' as the player plays it: no overlap or automation, A to its end. The cue is A's library length until the
+ * element knows its real duration (see `mixerTick`).
+ */
+function backToBack(transition: Transition, from: BaseItemDto): Transition {
+  const end = ticksToSeconds(from.RunTimeTicks ?? 0)
+  return { ...transition, aOut: end > 0 ? end : Number.NaN, length: 0, rate: 1, a: still(), b: still(), effects: [] }
+}
+
+/** A transition the player can play: for this pair, inside A, at a rate a media element plays well. */
+function usable(transition: Transition, from: BaseItemDto, to: BaseItemDto) {
+  const duration = ticksToSeconds(from.RunTimeTicks ?? 0)
+  const { aOut, bIn, length, rate } = transition
+  if (![bIn, length, rate].every(Number.isFinite) || transition.from !== from.Id || transition.to !== to.Id) return false
+  if (bIn < 0 || length < 0 || rate < 0.5 || rate > 2) return false
+  // Back to back follows A's real end, whatever its cue says now.
+  if (transition.preset === 'none') return true
+  return Number.isFinite(aOut) && aOut > 0 && (!duration || aOut < duration)
+}
+
+/** Forgets the plan; B's element is emptied unless a transition uses it. */
+function dropPlan() {
+  const old = plan
+  plan = null
+  if (!old) return
+  old.cancelCue()
+  const element = old.element
+  if (element && element !== audio && running?.a !== element && running?.b !== element) unload(element)
+}
+
+/** Seeking: a transition under way is called off (the track shown keeps playing) and the plan is made again. */
+function mixerSeeking() {
+  abortRunning()
+  cancelEase()
+  if (audio) audio.playbackRate = 1
+  dropPlan()
+  planSoon()
+}
+
+/** Moves the plan along with the current track's position (its timeupdates, and after each step). */
+function mixerTick() {
+  const current = plan
+  const element = audio
+  const transition = current?.transition
+  if (!current || !transition || !element || pendingStart !== null || holds.get(element) !== current.from) return
+  // Back to back: the cue is the element's real end, once it knows it (a transcoded stream may not; then A's 'ended').
+  if (current.backToBack && Number.isFinite(element.duration) && element.duration > 0 && transition.aOut !== element.duration) {
+    current.transition = { ...transition, aOut: element.duration }
+    return mixerTick()
+  }
+  const position = element.currentTime
+  const waiting = current.status === 'planned' || current.status === 'loading' || current.status === 'ready'
+  // Past the cue before B could start: this track ends plainly (back to back: B still follows at A's end).
+  if (waiting && !current.backToBack && position > transition.aOut + TOO_LATE_S) {
+    current.status = 'none'
+    if (current.element) unload(current.element)
+    return
+  }
+  if (current.status === 'planned' && position >= transition.aOut - PRELOAD_S && !running && standbyFree()) void preload(current)
+  if (current.status === 'ready' && !element.paused && position >= transition.aOut - ARM_S && !sleepsAfterTrack()) arm(current)
+}
+
+/** Whether the standby element may take the next track (no transition's tail is still on it). */
+function standbyFree() {
+  if (!standby) return true
+  return !retiring.has(standby) && (ringing.get(standby) ?? 0) <= (context?.currentTime ?? 0)
+}
+
+/** Loads B into the standby element and parks it at `bIn`, ready to start at once. */
+async function preload(p: Plan) {
+  const transition = p.transition!
+  p.status = 'loading'
+  const fail = () => {
+    if (plan !== p) return
+    p.status = 'none'
+    if (p.element) unload(p.element)
+  }
+  // A goes through the graph as well (from its start when the clock ran then; otherwise from now on).
+  if (!audio || !attach(audio)) return fail()
+  const downloaded = await downloadedAudioUrl(downloadId(p.to))
+  const key = downloaded ? null : cacheKey(p.to)
+  const cached = key ? await cachedAudioUrl(key) : null
+  const gain = await gainOf(p.to)
+  if (plan !== p) return
+  // Another transition still sounds on the standby element: later.
+  if (running) return void (p.status = 'planned')
+  standby ??= createElement()
+  const element = load(standby, downloaded ?? cached ?? streamUrl(p.to, p.sessionId), true)
+  standby = element
+  holds.set(element, p.to)
+  p.element = element
+  p.offline = !!(downloaded ?? cached)
+  p.cacheKey = cached ? key : null
+  trackGains.set(element, gainFactorOf(gain))
+  // (Loading resets the rate; B plays at its own during the overlap, keeping its pitch.)
+  element.preservesPitch = true
+  element.playbackRate = transition.rate
+  const deck = attach(element)
+  if (!deck) return fail()
+  resetDeck(deck)
+  applyVolume()
+  try {
+    await parked(element, transition.bIn)
+  } catch {
+    return fail()
+  }
+  if (plan !== p) return
+  p.status = 'ready'
+  mixerTick()
+}
+
+/** Waits until an element stands at `at`, paused, with enough data to play on at once. */
+function parked(element: HTMLAudioElement, at: number) {
+  return new Promise<void>((resolve, reject) => {
+    const settle = (ok: boolean) => {
+      for (const [type, listener] of listeners) element.removeEventListener(type, listener)
+      window.clearTimeout(timeout)
+      if (ok) resolve()
+      else reject(new Error('Not loaded'))
+    }
+    const check = () => {
+      if (element.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA && !element.seeking && Math.abs(element.currentTime - at) < 0.5) settle(true)
+    }
+    const listeners: Array<[string, () => void]> = [
+      ['loadedmetadata', () => (element.currentTime = at)],
+      ['seeked', check],
+      ['canplay', check],
+      ['error', () => settle(false)],
+      ['emptied', () => settle(false)],
+    ]
+    for (const [type, listener] of listeners) element.addEventListener(type, listener)
+    const timeout = window.setTimeout(() => settle(false), (PRELOAD_S + TOO_LATE_S) * 1000)
+  })
+}
+
+/** Close to the cue: times B's start (a little early, by the time an element takes to start). */
+function arm(p: Plan) {
+  const element = audio
+  if (!element || !p.transition) return
+  p.status = 'armed'
+  p.cancelCue = waitForCue(context, element, p.transition.aOut, currentPlayLead(), (late) => begin(p, late))
+}
+
+/** The cue: B starts and the transition runs. */
+function begin(p: Plan, late: number) {
+  const a = audio
+  const b = p.element
+  const transition = p.transition
+  const deckA = a ? decks.get(a) : undefined
+  const deckB = b ? decks.get(b) : undefined
+  if (plan !== p || p.status !== 'armed') return
+  p.cancelCue = () => {}
+  const ended = p.backToBack && !!a?.ended
+  if (!a || !b || !transition || !deckA || !deckB || !context || context.state !== 'running' || (a.paused && !ended) || (late > TOO_LATE_S && !p.backToBack)) {
+    // No transition after all: the track ends plainly.
+    p.status = 'none'
+    if (b) unload(b)
+    return
+  }
+  plan = null
+  // t = 0 is when A reaches aOut: in `lead` seconds when on time, in the past when late (B then starts further in).
+  const toCue = ended ? 0 : (transition.aOut - a.currentTime) / (a.playbackRate || 1)
+  if (toCue < -0.01 && !p.backToBack) b.currentTime = transition.bIn + transition.rate * (-toCue + currentPlayLead())
+  b.preservesPitch = true
+  b.playbackRate = transition.rate
+  const r: Running = {
+    plan: p,
+    transition,
+    a,
+    b,
+    start: context.currentTime + toCue,
+    pausedAt: null,
+    handover: handoverPoint(transition),
+    handedOver: false,
+    stops: [],
+    learned: false,
+  }
+  running = r
+  scheduleTransition({ a: deckA, b: deckB }, transition, r.start, { from: Math.max(0, context.currentTime - r.start) })
+  void b.play().catch(() => running === r && !r.handedOver && abortRunning())
+  follow(r)
+}
+
+/** Starts what a running transition does over time, from where it is now: B's alignment, the brake, handover, end. */
+function follow(r: Running) {
+  const ctx = context!
+  const { transition } = r
+  const now = () => ctx.currentTime - r.start
+  const brake = transition.effects.find((effect) => effect.kind === 'brake')
+  r.stops.push(
+    keepAligned(ctx, {
+      a: r.a,
+      b: r.b,
+      aOut: transition.aOut,
+      bIn: transition.bIn,
+      rate: transition.rate,
+      // A braking deck's position no longer says where the beat is.
+      active: () => !brake || now() < brake.at,
+      onStart: (error) => {
+        if (r.learned) return
+        r.learned = true
+        learnPlayLead(error)
+      },
+    }),
+  )
+  if (!r.handedOver) r.stops.push(wakeAfter(ctx, r.handover - now(), () => handOver(r)))
+  r.stops.push(wakeAfter(ctx, transition.length - now(), () => finishRunning(r)))
+  if (!brake) return
+  let cancel = () => {}
+  r.stops.push(() => cancel())
+  const step = () => {
+    if (running !== r || r.pausedAt !== null) return
+    const local = now() - brake.at
+    if (local >= 0) {
+      r.a.preservesPitch = false
+      r.a.playbackRate = Math.max(MIN_ELEMENT_RATE, brakeRateAt(local, brake.length))
+    }
+    if (local < brake.length) cancel = wakeAfter(ctx, local < 0 ? -local : BRAKE_STEP_S, step)
+  }
+  step()
+}
+
+/** B is louder now: it becomes the track playing (UI, reports, media session); A plays on until the overlap ends. */
+function handOver(r: Running) {
+  if (running !== r || r.handedOver) return
+  // The sleep timer was set to the end of this track: it ends here, without the next one.
+  if (stopsAfterTrack()) {
+    abortRunning()
+    fadeOut()
+    return
+  }
+  const index = state.entries.findIndex((entry) => entry.uid === r.plan.toUid)
+  if (index < 0) return abortRunning()
+  r.handedOver = true
+  const previous = currentTrack()
+  // Played to the end, as far as counting goes: the outro the transition cut was part of the mix.
+  if (previous) report('stopped', previous, 'trackdone', true)
+  audio = r.b
+  standby = r.a
+  playSessionId = r.plan.sessionId
+  setState({ index, buffering: false, playing: !r.b.paused })
+  setTime({ position: r.b.currentTime, duration: durationOf() })
+  startContext = { reasonStart: 'trackdone', source: sourceOf(index), shuffle: state.shuffle, offline: r.plan.offline }
+  if (r.plan.cacheKey) recordCachedPlay(r.plan.cacheKey)
+  report('start')
+  restartProgress()
+  updateMediaSession()
+  void extendQueue().then(() => cacheAhead())
+}
+
+/** The overlap is over: A is gone (its echo may ring out), B plays on as a plain deck, easing back to its own tempo. */
+function finishRunning(r: Running) {
+  if (running !== r) return
+  if (!r.handedOver) {
+    handOver(r)
+    if (running !== r) return
+  }
+  running = null
+  for (const stop of r.stops) stop()
+  retire(r.a, ECHO_TAIL_S)
+  const deckB = decks.get(r.b)
+  if (deckB) resetDeck(deckB, deckB.ctx.currentTime, SETTLE_S)
+  if (r.transition.rate !== 1) easeRate(r.b, r.transition)
+  else r.b.playbackRate = 1
+  mixerTick()
+}
+
+/**
+ * Calls off a transition under way. The element of the track shown (A before the handover, B after) keeps playing as
+ * a plain deck at its own speed; the other one fades out quickly and stops.
+ */
+function abortRunning() {
+  const r = running
+  if (!r) return
+  running = null
+  for (const stop of r.stops) stop()
+  const keep = r.handedOver ? r.b : r.a
+  retire(r.handedOver ? r.a : r.b, ABORT_TAIL_S)
+  keep.preservesPitch = true
+  keep.playbackRate = 1
+  const deck = decks.get(keep)
+  if (deck) resetDeck(deck, deck.ctx.currentTime, SETTLE_S)
+  planSoon()
+}
+
+/**
+ * A deck leaves: a short fade (no click), then its element stops. An echo on it may ring on for `tail` seconds; the
+ * element isn't loaded with anything new before it has died away.
+ */
+function retire(element: HTMLAudioElement, tail: number) {
+  const deck = decks.get(element)
+  element.preservesPitch = true
+  if (!deck || element.paused) {
+    unload(element)
+    element.playbackRate = 1
+    if (deck) resetDeck(deck)
+    return
+  }
+  retiring.add(element)
+  const now = deck.ctx.currentTime
+  const echoing = deck.echo.send.gain.value > 0.001 || deck.echo.feedback.gain.value > 0.001
+  freezeDeck(deck, now)
+  deck.gain.gain.linearRampToValueAtTime(0, now + RETIRE_S)
+  const quiet = echoing ? releaseEcho(deck, now, tail) : now
+  wakeAfter(context, RETIRE_S + 0.02, () => {
+    retiring.delete(element)
+    if (element === audio) return
+    // Stopped first, then back to neutral (once the echo has died away, on the audio clock): never audible again.
+    unload(element)
+    element.playbackRate = 1
+    resetDeck(deck, Math.max(deck.ctx.currentTime, quiet))
+    if (quiet > deck.ctx.currentTime) ringing.set(element, quiet)
+    mixerTick()
+  })
+}
+
+/** B's rate back to 1 over the 8 bars after its transition (pitch kept), following B's own position. */
+function easeRate(element: HTMLAudioElement, transition: Transition) {
+  cancelEase()
+  const from = element.currentTime
+  const span = rateEaseSeconds(transition.tempo.b)
+  let stopped = false
+  let cancel = () => {}
+  const step = () => {
+    if (stopped || element !== audio) return
+    const progress = Math.min(1, Math.max(0, (element.currentTime - from) / span))
+    element.playbackRate = rateAt(transition, transition.length + progress * span)
+    if (progress < 1) cancel = wakeAfter(context, 0.25, step)
+  }
+  cancelEase = () => {
+    stopped = true
+    cancel()
+  }
+  step()
+}
+
+/** The current track paused (by the user, the sleep timer or the system): a transition under way pauses with it. */
+function mixerPaused() {
+  if (plan?.status === 'armed') {
+    plan.cancelCue()
+    plan.cancelCue = () => {}
+    plan.status = 'ready'
+  }
+  const r = running
+  if (r && r.pausedAt === null && context) {
+    r.pausedAt = context.currentTime - r.start
+    for (const stop of r.stops) stop()
+    r.stops = []
+    ;(r.handedOver ? r.a : r.b).pause()
+    for (const element of [r.a, r.b]) {
+      const deck = decks.get(element)
+      if (deck) freezeDeck(deck)
+    }
+  }
+  // An unused audio clock is stopped after a while; the next play starts it again.
+  window.clearTimeout(idleTimer)
+  idleTimer = window.setTimeout(() => {
+    if (context?.state === 'running' && (!audio || audio.paused) && !running) void context.suspend().catch(() => undefined)
+  }, IDLE_SUSPEND_MS)
+}
+
+/** The current track plays again: the audio clock runs again, and a paused transition goes on where it was. */
+function mixerPlayed() {
+  window.clearTimeout(idleTimer)
+  const element = audio
+  if (context && context.state !== 'running' && element && decks.has(element)) {
+    void context.resume().catch(() => undefined)
+    rescueIfSilent()
+  }
+  const r = running
+  if (!r || r.pausedAt === null || !context) return
+  const at = r.pausedAt
+  r.pausedAt = null
+  // Both elements start again now (the other one a moment after this one): the transition's clock goes on with them.
+  r.start = context.currentTime + currentPlayLead() - at
+  const deckA = decks.get(r.a)
+  const deckB = decks.get(r.b)
+  if (!deckA || !deckB) return abortRunning()
+  scheduleTransition({ a: deckA, b: deckB }, r.transition, r.start, { from: Math.max(0, at) })
+  void (r.handedOver ? r.a : r.b).play().catch(() => running === r && abortRunning())
+  follow(r)
+}
+
+/**
+ * A's end, back to back: B (parked at `bIn`) starts now, if its cue didn't start it already. Not when the sleep timer
+ * ends with this track. Whether B took over.
+ */
+function followsBackToBack(element: HTMLAudioElement) {
+  const p = plan
+  if (!p?.backToBack || holds.get(element) !== p.from || (p.status !== 'ready' && p.status !== 'armed') || sleepsAfterTrack()) return false
+  p.cancelCue()
+  p.status = 'armed'
+  begin(p, 0)
+  return running !== null
+}
+
+/** An element other than the current one failed: B while coming in (the transition is called off). */
+function mixerElementFailed(element: HTMLAudioElement) {
+  if (running && running.b === element && !running.handedOver) abortRunning()
+}
+
 
 // ---- OS integration: media keys, lock screen, notification ----
 

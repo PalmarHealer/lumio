@@ -45,6 +45,9 @@ export function stopsAfterTrack() {
   return true
 }
 
+/** Whether it pauses at the end of the track (without using the timer up, unlike `stopsAfterTrack`). */
+export const sleepsAfterTrack = () => timer.endOfTrack
+
 export function useSleepTimer(): SleepTimer {
   return useSyncExternalStore(
     (listener) => {

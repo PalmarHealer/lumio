@@ -558,10 +558,18 @@ function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: nu
   // moments still follows where the sound's energy rises, which is what another song's beat is heard against.
   const known = shifts.filter((shift) => !Number.isNaN(shift))
   const overall = known.length ? median(known) : 0
-  return beats.map((time, i) => {
+  const corrections = beats.map((_, i) => {
     const near = shifts.slice(Math.max(0, i - 4), i + 4).filter((shift) => !Number.isNaN(shift))
-    return time + (near.length >= 3 ? median(near) : overall)
+    return near.length >= 3 ? median(near) : overall
   })
+  // The correction changes by at most 6 ms from one beat to the next (both ways, averaged): where the attacks change
+  // character (a build into a drop) the beats glide over instead of one bar coming out short.
+  const limit = 0.006
+  const forward = [...corrections]
+  for (let i = 1; i < forward.length; i++) forward[i] = clamp(forward[i]!, forward[i - 1]! - limit, forward[i - 1]! + limit)
+  const backward = [...corrections]
+  for (let i = backward.length - 2; i >= 0; i--) backward[i] = clamp(backward[i]!, backward[i + 1]! - limit, backward[i + 1]! + limit)
+  return beats.map((time, i) => time + (forward[i]! + backward[i]!) / 2)
 }
 
 /**
@@ -573,7 +581,7 @@ function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: nu
 function trackBeats(envelope: Float64Array, period: number): number[] {
   const count = envelope.length
   if (count < period * 4) return []
-  const tightness = 100
+  const tightness = 400
   const score = new Float64Array(count)
   const back = new Int32Array(count).fill(-1)
   const from = Math.round(2 * period)

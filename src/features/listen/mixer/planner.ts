@@ -125,6 +125,19 @@ function outAnchors(a: PreparedTrack, style: MixStyle): Anchor[] {
   if (a.outroStart >= from && a.outroStart < a.end) addAnchor(list, snapToPhrase(a, a.outroStart), party ? 0.15 : 0.05)
   const cues = a.cuesOut.filter((t) => t >= from && t < a.end)
   cues.forEach((t, i) => addAnchor(list, snapToPhrase(a, t), (party ? 0.3 : 0.05) * (1 - i / (cues.length + 1))))
+  if (!party && a.vocalsKnown && a.vocals.length > 0) {
+    // The first 4-bar point (counted from the analysed phrase before it) after A's last sung line: where a clean mix
+    // can leave without cutting a word and still on the phrase grid.
+    const lastLine = a.vocals[a.vocals.length - 1].end
+    const phrase = a.phrases[floorIndex(a.phrases, lastLine)]
+    const first = phrase === undefined ? -1 : floorIndex(a.downbeats, phrase + 0.05)
+    if (first >= 0 && Math.abs(a.downbeats[first] - phrase) < 0.05) {
+      let i = first
+      while (i < a.downbeats.length && a.downbeats[i] < lastLine - 0.05) i += 4
+      const next = a.downbeats[i]
+      if (next !== undefined && next >= from && next < a.duration - 4 * a.period) addAnchor(list, next, 0)
+    }
+  }
   if (party) {
     // Right after a chorus or drop of the second half (the last one best): the hook was heard, the rest is outro.
     const peaks = a.sections.filter((s) => isPeakSection(s.kind) && s.start >= a.duration * 0.3 && s.end < a.end - 4 * a.period)
@@ -167,6 +180,7 @@ interface Variant {
   bars: number
   swapFraction: number
   preRollBars: number
+  echoTail: boolean
   /**
    * 'swap': the chosen phrase starts of both songs meet at the swap, so the moment the bass changes deck lies on a
    * phrase of each (and B's drop or chorus lands on it); 'shape': at the shape's own anchors.
@@ -182,12 +196,19 @@ const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwa
 
 function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?: ConcretePreset): Variant[] {
   const list: Variant[] = []
-  const add = (preset: ConcretePreset, prior: number, bars: number[] = [0], extra: { fractions?: number[]; preRolls?: number[] } = {}) => {
+  const add = (
+    preset: ConcretePreset,
+    prior: number,
+    bars: number[] = [0],
+    extra: { fractions?: number[]; preRolls?: number[]; echoTails?: boolean[] } = {},
+  ) => {
     const allowed = FREE_LENGTH.has(preset) ? bars.filter((n) => n <= maxBars) : bars
     const lengths = allowed.length > 0 ? allowed : [Math.min(...bars)]
     for (const n of lengths)
       for (const swapFraction of extra.fractions ?? [0.5])
-        for (const preRollBars of extra.preRolls ?? [0]) list.push({ preset, bars: n, swapFraction, preRollBars, meet: meetOf(preset), prior })
+        for (const preRollBars of extra.preRolls ?? [0])
+          for (const echoTail of preRollBars === 0 ? (extra.echoTails ?? [false]) : [false])
+            list.push({ preset, bars: n, swapFraction, preRollBars, echoTail, meet: meetOf(preset), prior })
   }
   if (style === 'clean' && synced) {
     add('bassSwap', 0.3, [32, 16, 8, 4], { fractions: [0.5, 0.25, 0.75] })
@@ -199,12 +220,13 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
   } else if (style === 'clean') {
     add('echoOut', 0.15)
     add('fadeOut', 0.15, [2])
-    add('crossfade', 0.05, [2])
+    // Without beatmatch a crossfade lasts one bar: the beats meet for three beats at most.
+    add('crossfade', 0.05, [1])
     add('filterBuild', 0.02, [2])
     add('fadeIn', 0, [2])
     add('hardCut', -0.45)
   } else if (synced) {
-    add('dropSwap', 0.1, [0], { preRolls: [1, 2, 0] })
+    add('dropSwap', 0.1, [0], { preRolls: [1, 2, 0], echoTails: [false, true] })
     add('bassSwap', 0.15, [16, 8, 4])
     add('filterBuild', 0.12, [8, 4])
     add('crossfade', 0, [8])
@@ -212,7 +234,7 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
     add('hardCut', 0)
     add('brake', -0.2)
   } else {
-    add('dropSwap', 0.08, [0], { preRolls: [0] })
+    add('dropSwap', 0.08, [0], { preRolls: [0], echoTails: [false, true] })
     add('echoOut', 0.12)
     add('hardCut', 0.05)
     add('filterBuild', 0.05, [2])
@@ -224,7 +246,7 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
   if (chosen.length > 0) return chosen.map((v) => ({ ...v, prior: 0 }))
   // A technique this style doesn't use on its own: plain defaults.
   const bars = FREE_LENGTH.has(forced) ? (synced ? [16, 8, 4] : [2]) : [0]
-  return bars.map((n) => ({ preset: forced, bars: n, swapFraction: 0.5, preRollBars: forced === 'dropSwap' && synced ? 1 : 0, meet: meetOf(forced), prior: 0 }))
+  return bars.map((n) => ({ preset: forced, bars: n, swapFraction: 0.5, preRollBars: forced === 'dropSwap' && synced ? 1 : 0, echoTail: false, meet: meetOf(forced), prior: 0 }))
 }
 
 /** What a shape sounds like over its length, sampled once and reused for every placement. */
@@ -244,6 +266,8 @@ interface ShapeStats {
   /** A is gone (gain ≤ 0.05) from here on; B is there (gain > 0.05) from here on. */
   aGone: number
   bHere: number
+  /** From here on a voice on B is heard (before it, B's build may play under A with its voice band down). */
+  bVoice: number
   /**
    * Seconds both decks are clearly audible; of those, with both mid bands (chords, leads: the harmony) heard; with both
    * basslines up (must be 0).
@@ -272,6 +296,7 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
   const gainB = new Float32Array(steps + 1)
   let aGone = 0
   let bHere = -1
+  let bVoice = -1
   let together = 0
   let tonal = 0
   let basses = 0
@@ -287,13 +312,14 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
     gainB[i] = gb
     if (ga > 0.05) aGone = t + dt
     if (gb > 0.05 && bHere < 0) bHere = t
+    if (voiceB[i] > VOICE_HEARD && bVoice < 0) bVoice = t
     if (i < steps) {
       if (ga > 0.2 && gb > 0.2) together += dt
       if (ga * valueAt(a.mid, t, 1) * filterDamp(fa) > VOICE_HEARD && gb * valueAt(b.mid, t, 1) * filterDamp(fb) > VOICE_HEARD) tonal += dt
       if (ga * valueAt(a.low, t, 1) * bassThrough(fa) > 0.5 && gb * valueAt(b.low, t, 1) * bassThrough(fb) > 0.5) basses += dt
     }
   }
-  return { dt, voiceA, voiceB, gainA, gainB, aGone: Math.min(aGone, length), bHere: Math.max(0, bHere < 0 ? length : bHere), together, tonal, basses }
+  return { dt, voiceA, voiceB, gainA, gainB, aGone: Math.min(aGone, length), bHere: Math.max(0, bHere < 0 ? length : bHere), bVoice: Math.max(0, bVoice < 0 ? length : bVoice), together, tonal, basses }
 }
 
 function shapeStats(shape: PresetShape, meet: Variant['meet'], beat: number): ShapeStats {
@@ -347,17 +373,28 @@ function vocalCost(stats: ShapeStats, a: PreparedTrack, b: PreparedTrack, aOut: 
       const bHeard = stats.voiceB[i] > VOICE_HEARD
       if (bSings && bHeard && ((aSings && aHeard) || (echoed !== null && echoed[i] >= ECHO_HEARD))) clash += dt
       if (aSings && !aHeard && stats.gainA[i] > 0.05) lostA += dt
-      if (bSings && !bHeard) lostB += dt
+      // B's singing under A before its voice comes in (a pre-roll) is a tease, not a line lost.
+      if (bSings && !bHeard && t >= stats.bVoice) lostB += dt
     }
   }
   // A's line still going when A is gone; B coming in on the middle of a line.
   const aLeaves = aOut + stats.aGone
   const lineA = spanAt(a.vocals, aLeaves)
   if (lineA && lineA.end - aLeaves > 0.3 && aLeaves - lineA.start > 0.3) lostA += Math.min(6, lineA.end - aLeaves)
-  const bEnters = bIn + stats.bHere * rate
-  const lineB = spanAt(b.vocals, bEnters)
-  if (lineB && bEnters - lineB.start > 0.3) lostB += Math.min(6, bEnters - lineB.start)
+  const bVoiceIn = bIn + stats.bVoice * rate
+  const lineB = spanAt(b.vocals, bVoiceIn)
+  if (lineB && bVoiceIn - lineB.start > 0.3) lostB += Math.min(6, bVoiceIn - lineB.start)
   return { clash, lostA, lostB }
+}
+
+/**
+ * Between drop swaps that fit equally well, B's build-up under A (which only a beatmatch allows) gets a small lead; the
+ * dry cut and the echo tail are left to the per-pair nudge below, so a party playlist gets all three.
+ */
+function variety(variant: Variant, synced: boolean) {
+  if (variant.preset !== 'dropSwap') return 0
+  if (variant.preRollBars > 0) return synced ? 0.03 : 0
+  return 0
 }
 
 /** A small, stable per-pair nudge so near-equal choices don't always fall the same way across a playlist. */
@@ -410,6 +447,8 @@ interface Placement {
   bound: number
   /** Beats of both decks sound together, so the placement's beatmatch is checked. */
   beatmatched: boolean
+  /** Seconds of measured singing the placement skips (A's after it's gone, B's before its voice comes in). */
+  sung: number
   pa: Anchor
   pb: Anchor
 }
@@ -601,14 +640,27 @@ export function planTransition(
   const placements: Placement[] = []
   const shapes = new Map<string, ShapeStats>()
 
+  // Vocals estimated from the audio (no synced lyrics) count for less: they also catch leads and synths.
+  // Assumed vocals (nothing measured: one span over the song's body) have no lines to cut, so they don't count here.
+  const vocalTrust = (track: PreparedTrack) => (!track.vocalsKnown ? 0 : track.mix.vocalSource === 'lyrics' ? 1 : 0.6)
+  const trustA = vocalTrust(a)
+  const trustB = vocalTrust(b)
+
   const shapeFor = (variant: Variant, beat: number) => {
     // Half time: B's bar spans two of A's, so the swap goes on an even bar of A.
     const rawSwap = variant.bars * variant.swapFraction
     const swapBar = tempo.synced && tempo.multiple === 2 ? 2 * Math.round(rawSwap / 2) : Math.round(rawSwap)
-    const key = `${variant.preset}:${variant.bars}:${swapBar}:${variant.preRollBars}:${variant.meet}:${beat.toFixed(5)}`
+    const key = `${variant.preset}:${variant.bars}:${swapBar}:${variant.preRollBars}:${variant.echoTail}:${variant.meet}:${beat.toFixed(5)}`
     let stats = shapes.get(key)
     if (!stats) {
-      const shape = presetShape(variant.preset, { beat, bars: variant.bars, synced: tempo.synced, swapBar, preRollBars: variant.preRollBars })
+      const shape = presetShape(variant.preset, {
+        beat,
+        bars: variant.bars,
+        synced: tempo.synced,
+        swapBar,
+        preRollBars: variant.preRollBars,
+        echoTail: variant.echoTail,
+      })
       stats = shapeStats(shape, variant.meet, beat)
       shapes.set(key, stats)
     }
@@ -661,7 +713,7 @@ export function planTransition(
         const aLeaves = aOut + stats.aGone
         const skipA = a.loudSeconds(aLeaves, a.end)
         const skipB = b.loudSeconds(b.start, bEnters)
-        let bound = variant.prior + jitter(`${ids.from}>${ids.to}:${variant.preset}`)
+        let bound = variant.prior + variety(variant, tempo.synced) + jitter(`${ids.from}>${ids.to}:${variant.preset}:${variant.preRollBars}:${variant.echoTail}`)
         bound += pa.bonus + pb.bonus
         if (FREE_LENGTH.has(variant.preset)) bound -= 0.12 * Math.abs(Math.log2(variant.bars / targetBars))
         if (party) {
@@ -688,23 +740,25 @@ export function planTransition(
         }
         // Keys clash where both decks' mids (chords, leads, voices) sound together; the bass never overlaps.
         bound -= (1 - harmony) * 0.6 * Math.min(1, stats.tonal / (16 * stats.beat))
+        // Singing that's skipped: A's lines after it's gone, B's before its voice comes in. Clean keeps every sung line
+        // (whatever the sections are called); party may cut some, at a price.
+        const sungA = trustA * a.sungSeconds(aLeaves, a.duration)
+        const sungB = trustB * b.sungSeconds(0, bIn + stats.bVoice * rate)
+        bound -= party ? 0.02 * sungA + 0.01 * sungB : 0.3 * (sungA + sungB)
         if (!tempo.synced && NEEDS_BEATMATCH.has(variant.preset)) bound -= 0.2 * Math.min(1, stats.together / (4 * stats.beat))
-        placements.push({ stats, variant, aOut, bIn, rate, bound, beatmatched: tempo.synced && beatsTogether, pa, pb })
+        placements.push({ stats, variant, aOut, bIn, rate, bound, beatmatched: tempo.synced && beatsTogether, sung: sungA + sungB, pa, pb })
       }
     }
   }
 
   // Best-first with the vocal checks; stop when no remaining placement can beat the best one.
   placements.sort((p, q) => q.bound - p.bound)
-  // Vocals estimated from the audio (no synced lyrics) count for less: they also catch leads and synths.
-  // Assumed vocals (nothing measured: one span over the song's body) have no lines to cut, so they don't count here.
-  const vocalTrust = (track: PreparedTrack) => (!track.vocalsKnown ? 0 : track.mix.vocalSource === 'lyrics' ? 1 : 0.6)
   const lostWeight = party ? 0.05 : 0.1
-  const trustA = vocalTrust(a)
-  const trustB = vocalTrust(b)
   let best: { placement: Placement; score: number } | null = null
   for (const placement of placements) {
     if (best && placement.bound <= best.score) break
+    // Clean style never skips a sung line: such a placement is out.
+    if (!party && placement.sung > 0.5) continue
     const { clash, lostA, lostB } = vocalCost(placement.stats, a, b, placement.aOut, placement.bIn, placement.rate)
     if (clash > 0.1) continue
     // Beats that drift apart flam audibly from about 30 ms on (and a stretch of the overlap may drift worse than the
@@ -714,11 +768,12 @@ export function planTransition(
       ? phaseError(placement.stats, a, b, placement.aOut, placement.bIn, placement.rate, tempo.multiple)
       : { median: 0, p90: 0, checked: 1 }
     if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75) continue
-    const score = placement.bound - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - 3 * drift.median
+    const score = placement.bound - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     if (!best || score > best.score) best = { placement, score }
   }
+  // Back to back is always clean: when nothing fits (odd phrase data, songs too short for any overlap, or in clean
+  // style a song that sings into its last seconds, so every overlap would cut a line).
   if (!best) {
-    // Nothing fits (odd phrase data, songs too short for any overlap): back to back is always clean.
     return finalizeTransition(backToBack(ids, style, a.duration, 0.5, tempoUsed), a.duration, b.duration)
   }
 

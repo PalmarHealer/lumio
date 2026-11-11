@@ -50,6 +50,8 @@ export interface PresetContext {
   swapBar?: number
   /** Drop swap: bars of B's build-up played under the end of A before B's drop lands (0 = a straight cut). */
   preRollBars?: number
+  /** Drop swap without pre-roll: A's last beat goes into an echo that rings on over B's drop instead of a dry cut. */
+  echoTail?: boolean
   /** Echo out: delay in beats and feedback (defaults 1 beat, 0.5). */
   echoBeats?: number
   echoFeedback?: number
@@ -371,10 +373,32 @@ function echoOut(ctx: PresetContext): PresetShape {
 
 /**
  * Drop swap: A is cut exactly on the downbeat where B's drop lands. With a pre-roll (beatmatched only) B's build-up
- * rises under A first, high-passed, bassless and with its mids down, so the drop arrives as a release.
+ * rises under A first, high-passed, bassless and with its mids down, so the drop arrives as a release; with an echo
+ * tail A's last beat rings on into the drop.
  */
 function dropSwap(ctx: PresetContext): PresetShape {
   const preRoll = ctx.synced ? Math.max(0, Math.round(ctx.preRollBars ?? 1)) * 4 * ctx.beat : 0
+  if (preRoll === 0 && ctx.echoTail) {
+    // A's last beat feeds an echo, A's dry signal stops on the downbeat where B's drop lands; the echo rings on over
+    // the drop (thinned by a high-pass). Needs no beatmatch: only the echo meets B.
+    const meet = ctx.beat
+    return {
+      preset: 'dropSwap',
+      length: meet,
+      a: automation(meet, {
+        gain: [[0, 1], ...stepAt(meet, 1, 0)],
+        filter: [
+          [0, 0],
+          [meet, 0.4],
+        ],
+      }),
+      b: automation(meet, { gain: [...stepAt(meet, 0, 1)] }),
+      effects: [{ kind: 'echo', deck: 'a', at: 0, beats: ctx.echoBeats ?? 0.5, feedback: ctx.echoFeedback ?? 0.45 }],
+      anchorA: meet,
+      anchorB: meet,
+      swap: meet,
+    }
+  }
   if (preRoll === 0) return noOverlap('dropSwap')
   const length = preRoll
   return {
@@ -390,8 +414,8 @@ function dropSwap(ctx: PresetContext): PresetShape {
       ],
       low: [...stepAt(length, 0, 1)],
       mid: [...stepAt(length, 0.25, 1)],
-      // Under A at full, B's build stays below half power in the highs too.
-      high: [...stepAt(length, 0.6, 1)],
+      // Under A at full, B's build stays below half power in the highs too, and a voice in it stays a whisper.
+      high: [...stepAt(length, 0.5, 1)],
     }),
     effects: [],
     anchorA: length,

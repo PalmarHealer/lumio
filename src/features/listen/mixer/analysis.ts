@@ -50,6 +50,8 @@ export interface PreparedTrack {
   energyBetween(from: number, to: number): number
   /** Seconds between two moments where the song plays at more than a third of its loudest. */
   loudSeconds(from: number, to: number): number
+  /** Seconds of singing between two moments (0 when the vocals are only assumed). */
+  sungSeconds(from: number, to: number): number
 }
 
 const finite = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
@@ -253,6 +255,8 @@ export function prepareTrack(mix: TrackMix | null | undefined): PreparedTrack | 
     cuesOut: Array.isArray(mix.cuesOut) ? mix.cuesOut.filter((t): t is number => finite(t) && t > 0 && t <= duration) : [],
     energyBetween,
     loudSeconds,
+    sungSeconds: (from: number, to: number) =>
+      vocalsKnown ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
   }
 }
 

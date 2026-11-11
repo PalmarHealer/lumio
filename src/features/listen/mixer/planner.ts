@@ -644,6 +644,8 @@ interface Placement {
   slack: number
   pa: Anchor
   pb: Anchor
+  /** Seconds where one deck's accents were ducked under a risky bar of its own (see `duckRisky`). */
+  ducked?: number
 }
 
 const positionA = (p: Placement, tau: number) => lanePosition(p.laneA, tau)
@@ -910,6 +912,76 @@ function audibleClarity(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     least = Math.min(least, value)
   }
   return Number.isFinite(least) ? least : 1
+}
+
+/** The level a ducked deck's mids and highs go down to: under the -10 dB from which its accents are heard. */
+const DUCK = 0.15
+/** At most this many bars of a blend may be ducked (more is no longer the blend it was meant to be). */
+const MAX_DUCK_BARS = 4
+
+/**
+ * Ducks the accents (mids and highs) of the deck whose bars are risky (clarity under MIN_VERIFIABLE) wherever both decks'
+ * beats are heard there, so those bars aren't heard on both any more. Kicks are not ducked (a placement whose kicks
+ * would flam is out). Null when there's nothing to duck that way or too much of it.
+ */
+function duckRisky(p: Placement, a: PreparedTrack, b: PreparedTrack): Placement | null {
+  const { stats } = p
+  const { dt } = stats
+  const length = stats.shape.length
+  if (dt <= 0) return null
+  const lastBeatA = a.beats[a.beats.length - 1] ?? Infinity
+  const runs = { a: [] as Array<[number, number]>, b: [] as Array<[number, number]> }
+  let total = 0
+  for (let i = 0; i < stats.loudA.length; i++) {
+    const t = i * dt
+    if (t > length || t < p.bStart || !stats.loudA[i] || !stats.loudB[i]) continue
+    const atA = positionA(p, t)
+    const atB = positionB(p, t) ?? 0
+    if (atA > lastBeatA + 0.05) continue
+    if (stats.passA.low[i] >= KICK_HEARD && stats.passB.low[i] >= KICK_HEARD) {
+      if (Math.min(a.kickClarityBetween(atA, atA + 0.01), b.kickClarityBetween(atB, atB + 0.01)) < MIN_VERIFIABLE) return null
+    }
+    const ca = a.clarityBetween(atA, atA + 0.01)
+    const cb = b.clarityBetween(atB, atB + 0.01)
+    if (!(Math.min(ca, cb) < MIN_VERIFIABLE)) continue
+    const list = ca <= cb ? runs.a : runs.b
+    const last = list[list.length - 1]
+    if (last && t - last[1] <= 2 * dt) last[1] = t + dt
+    else list.push([t, t + dt])
+    total += dt
+  }
+  if (total === 0 || total > MAX_DUCK_BARS * 4 * stats.beat) return null
+  const margin = 0.03
+  const duck = (curve: Keyframe[], spans: Array<[number, number]>) => {
+    if (spans.length === 0) return curve
+    const factor = (t: number) => {
+      let f = 1
+      for (const [from, to] of spans) {
+        const start = from - margin
+        const end = to + margin
+        if (t >= start && t <= end) f = Math.min(f, DUCK)
+        else if (t > start - RAMP && t < start) f = Math.min(f, 1 - ((1 - DUCK) * (t - (start - RAMP))) / RAMP)
+        else if (t > end && t < end + RAMP) f = Math.min(f, DUCK + ((1 - DUCK) * (t - end)) / RAMP)
+      }
+      return f
+    }
+    const times = curve.map((k) => k.t)
+    for (const [from, to] of spans) times.push(Math.max(0, from - margin - RAMP), Math.max(0, from - margin), to + margin, to + margin + RAMP)
+    const points = [
+      ...curve.map((k, n) => ({ t: k.t, v: k.v * factor(k.t), n })),
+      ...times.slice(curve.length).map((t) => ({ t, v: valueAt(curve, t, 1) * factor(t), n: Infinity })),
+    ]
+    points.sort((x, y) => x.t - y.t || x.n - y.n)
+    return points.map(({ t, v }) => ({ t, v }))
+  }
+  const shape = stats.shape
+  const next: PresetShape = {
+    ...shape,
+    a: { ...shape.a, mid: duck(shape.a.mid, runs.a), high: duck(shape.a.high, runs.a) },
+    b: { ...shape.b, mid: duck(shape.b.mid, runs.b), high: duck(shape.b.high, runs.b) },
+  }
+  const meet = p.variant.meet
+  return { ...p, stats: shapeStats(next, meet, stats.beat), ducked: total }
 }
 
 /** A bar that may be looped: no singing, clear attacks, no drop inside, before the song's end. */
@@ -1474,9 +1546,19 @@ export function planTransition(
       // Attack clarity says how well the alignment can be verified, not whether it flams (the grids are steady): a
       // soft preference for clear placements. Only where a song has no grid at all (before its first beat) it rejects.
       // (clarityBetween reads 0 before the first phrase, so the grid itself is what's checked there.)
-      const clarity = audibleClarity(shifted, a, b)
-      if (clarity < 0 || (!Number.isNaN(clarity) && clarity < MIN_VERIFIABLE)) return null
-      placement = { ...shifted, clarity }
+      let clarity = audibleClarity(shifted, a, b)
+      if (clarity < 0) return null
+      let checked: Placement = shifted
+      if (!Number.isNaN(clarity) && clarity < MIN_VERIFIABLE) {
+        // A few risky bars: the deck they belong to has its accents ducked there, as a DJ would, so they aren't heard
+        // over the other's; what's still heard on both must then pass.
+        const ducked = duckRisky(shifted, a, b)
+        if (!ducked) return null
+        checked = ducked
+        clarity = audibleClarity(checked, a, b)
+        if (clarity < 0 || (!Number.isNaN(clarity) && clarity < MIN_VERIFIABLE)) return null
+      }
+      placement = { ...checked, clarity }
       // A tiny tempo correction is left out (both decks play at exactly 1, no stretching) where the drift it leaves
       // stays within a few milliseconds each side of the overlap's middle.
       const overlap = length - placement.bStart
@@ -1521,8 +1603,9 @@ export function planTransition(
       }
     }
     const { clash: voices, lostA, lostB } = vocalCost(placement, a, b)
-    // The short S-curve may let one voice end as the other starts (a beat at most); otherwise never voice over voice.
-    if (voices > (placement.variant.volume === 'scurve' ? stats.beat : 0.1)) return null
+    // The short S-curve may let one voice end as the other starts (a quarter second at most, about where two voices are
+    // heard as two); otherwise never voice over voice.
+    if (voices > (placement.variant.volume === 'scurve' ? Math.min(0.25, stats.beat / 2) : 0.1)) return null
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
     // against A's beats. Judged two bars at a time too.
@@ -1538,7 +1621,8 @@ export function planTransition(
     }
     const finish = placement.variant.preset === 'blend' ? placement.variant.prior - start.variant.prior - BEST_FINISH : 0
     const clarityTerm = Number.isNaN(placement.clarity) ? 0.1 : 0.3 * Math.max(0, 1 - placement.clarity / MIN_CLARITY)
-    const score = placement.bound + finish - tonalTerm - energyTerm - swingTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    const duckTerm = (0.02 * (placement.ducked ?? 0)) / (4 * stats.beat)
+    const score = placement.bound + finish - tonalTerm - energyTerm - swingTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
   let best: { placement: Placement; score: number } | null = null

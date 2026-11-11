@@ -65,6 +65,8 @@ const VOICE_HEARD = 0.3
 const ECHO_HEARD = 0.12
 /** Median distance (seconds) between both decks' beats above which a beatmatch is rejected. */
 const MAX_DRIFT = 0.025
+/** How far (seconds) aligning both grids may move B: more means the grids disagree where the songs meet. */
+const MAX_PHASE_SHIFT = 0.04
 /** Least attack clarity (share of beats with an audible onset) a beatmatch needs in each song's phrases it covers. */
 const MIN_CLARITY = 0.6
 /** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
@@ -845,11 +847,16 @@ export function planTransition(
     // Clean style never skips a sung line: such a placement is out.
     if (!party && placement.sung > 0.5) continue
     if (placement.beatmatched) {
-      const aligned = alignPhase(placement.stats, a, b, placement.aOut, placement.bIn, placement.rate, tempo.multiple)
-      if (aligned.bIn >= MIN_B_IN && Math.abs(aligned.rate - 1) <= MAX_TEMPO_DIFF && aligned.bIn + placement.stats.shape.length * aligned.rate <= b.duration - 2) {
-        placement.bIn = aligned.bIn
-        placement.rate = aligned.rate
-      }
+      const { stats } = placement
+      const aligned = alignPhase(stats, a, b, placement.aOut, placement.bIn, placement.rate, tempo.multiple)
+      // Grids that disagree by more than a few tens of milliseconds where they meet aren't to be trusted with a beatmatch
+      // (a drop anchored on one beat, the beats around it elsewhere); nor may the shift carry B into an unclear phrase.
+      if (Math.abs(aligned.bIn - placement.bIn) > MAX_PHASE_SHIFT * placement.rate) continue
+      if (aligned.bIn < MIN_B_IN || Math.abs(aligned.rate - 1) > MAX_TEMPO_DIFF || aligned.bIn + stats.shape.length * aligned.rate > b.duration - 2) continue
+      const clarity = b.clarityBetween(aligned.bIn + stats.togetherFrom * aligned.rate, aligned.bIn + stats.togetherTo * aligned.rate)
+      if (clarity < MIN_CLARITY) continue
+      placement.bIn = aligned.bIn
+      placement.rate = aligned.rate
     }
     const { clash, lostA, lostB } = vocalCost(placement.stats, a, b, placement.aOut, placement.bIn, placement.rate)
     if (clash > 0.1) continue

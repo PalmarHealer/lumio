@@ -109,6 +109,19 @@ export interface TrackMix {
    * where is unknown); an estimate from the audio; or nothing found (no lyrics: maybe instrumental).
    */
   vocalSource: 'lyrics' | 'unplaced' | 'audio' | 'none'
+  /**
+   * The sung lines when `vocalSource` is 'lyrics', placed like `vocals` but unpadded: `time` where the line starts,
+   * `end` where it is estimated to end (see `vocals`), and `words`, its content words as 32-bit FNV-1a hashes of their
+   * UTF-8 (lowercased, accents folded, apostrophes removed, a plural -s or -ies taken off, English and German stopwords
+   * left out; each word once). Two songs' lines can be matched by word (wordplay: B's line answers A's with the same
+   * word) without their text. Empty otherwise and in analyses made before it.
+   */
+  lines: Array<{ time: number; end: number; words: number[] }>
+  /**
+   * The content words of the track's title, hashed like `lines` (what is in brackets, such as "(feat. …)", left out):
+   * a line with a title word is likely the hook. Empty when the title is unknown and in analyses made before it.
+   */
+  titleWords: number[]
   /** First phrase where the song is fully "in" (beat and bass), and where it starts to wind down after its last chorus/drop. */
   introEnd: number
   outroStart: number

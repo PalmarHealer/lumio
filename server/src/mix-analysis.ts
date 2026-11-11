@@ -70,6 +70,12 @@ export interface TrackMix {
    * alone. Lets a beatmatch use the clear bars of a phrase that is unclear elsewhere. Empty in analyses made before it.
    */
   barClarity: number[]
+  /**
+   * Per phrase (same index as `phrases`): what it plays harmonically, as 12 values (pitch classes from C, 0–1, the
+   * strongest 1). Taken from the melody's range (C3–C6) with short transients (drums) held out, so phrases with similar
+   * melodies and chords have similar profiles (cosine). Empty in analyses made before it.
+   */
+  phraseChroma: number[][]
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean
@@ -332,6 +338,8 @@ interface Chroma {
   frames: Float32Array
   /** Summed over the track, for the key. */
   total: number[]
+  /** The same per frame from the melody's range only (C3–C6), for comparing phrases' melodies. */
+  melody: Float32Array
 }
 
 /** Which notes sound (C2–C7 folded into 12 pitch classes), on long frames for fine pitch, as sound-analysis.ts does. */
@@ -340,6 +348,7 @@ function chromagram(samples: Float32Array, rate: number): Chroma {
   const hop = size / 4
   const count = Math.max(0, Math.floor((samples.length - size) / hop) + 1)
   const frames = new Float32Array(count * 12)
+  const melody = new Float32Array(count * 12)
   const total = new Array(12).fill(0) as number[]
   const binOf = (midi: number) => (440 * 2 ** ((midi - 69) / 12) * size) / rate
   const ranges = Array.from({ length: 61 }, (_, i) => [Math.ceil(binOf(36 + i - 0.5)), binOf(36 + i + 0.5)] as const)
@@ -372,9 +381,10 @@ function chromagram(samples: Float32Array, rate: number): Chroma {
       const value = Math.max(0, notes[n]! - floor) / max
       frames[frame * 12 + ((36 + n) % 12)] += value
       total[(36 + n) % 12] += value
+      if (n >= 12 && n <= 48) melody[frame * 12 + ((36 + n) % 12)] += value
     }
   }
-  return { rate: rate / hop, time: (frame) => (frame * hop + size / 2) / rate, count, frames, total }
+  return { rate: rate / hop, time: (frame) => (frame * hop + size / 2) / rate, count, frames, total, melody }
 }
 
 // ---- 2. tempo and beats ----
@@ -1329,6 +1339,25 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
     return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
   })
+  // What each phrase plays, harmonically: the melody range's chroma (C3–C6, where voices and leads are), each pitch
+  // class held to its median over half a second first (drum hits and other short transients drop out, held notes
+  // stay), averaged over the phrase and scaled to its strongest pitch class.
+  const held = new Float32Array(chroma.melody.length)
+  const holdFrames = Math.max(1, Math.round(chroma.rate * 0.25))
+  for (let c = 0; c < 12; c++) {
+    for (let f = 0; f < chroma.count; f++) {
+      const values: number[] = []
+      for (let g = Math.max(0, f - holdFrames); g <= Math.min(chroma.count - 1, f + holdFrames); g++) values.push(chroma.melody[g * 12 + c]!)
+      held[f * 12 + c] = median(values)
+    }
+  }
+  const phraseChroma = phrases.map((start, p) => {
+    const from = chromaFrame(start)
+    const to = Math.max(from + 1, chromaFrame(phraseEnd(p)))
+    const profile = spanVector(held, 12, from, Math.min(to, chroma.count))
+    const max = Math.max(...profile)
+    return Array.from(profile, (value) => (max > 0 ? round(value / max, 2) : 0))
+  })
   const phraseLength = (p: number) => (p + 1 < phraseBars.length ? phraseBars[p + 1]! : barCount) - phraseBars[p]!
 
   const sungBetween = (start: number, end: number) => sungStretches.reduce((sum, stretch) => sum + Math.max(0, Math.min(end, stretch.end) - Math.max(start, stretch.start)), 0) / Math.max(0.001, end - start)
@@ -1609,6 +1638,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     phrases: phrases.map((time) => round(time)),
     phraseClarity,
     barClarity,
+    phraseChroma,
     key: top.key,
     minor: top.minor,
     keyClarity: round(Math.max(0, top.r)),

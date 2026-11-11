@@ -53,12 +53,18 @@ export interface TrackMix {
   /** Global tempo (60–200 BPM) and how sure the analysis is of it and of the beat grid (0–1). */
   bpm: number
   bpmConfidence: number
-  /** Beat times (seconds, 3 decimals), following the music (not a rigid grid). */
+  /** Beat times (seconds, 3 decimals), following the music (not a rigid grid), on the audible attacks. */
   beats: number[]
   /** The beats that start a bar (a subset of `beats`). */
   downbeats: number[]
   /** Phrase starts: downbeats where an 8-bar (sometimes 4/16) phrase begins, usually where sections change. */
   phrases: number[]
+  /**
+   * Per phrase (same index as `phrases`, each up to the next phrase or the end): how clearly its beats are heard as
+   * attacks (0–1, the share of beats with a clear onset on the grid). Beatmatching over a phrase with unclear attacks
+   * can't be trusted to line up audibly.
+   */
+  phraseClarity: number[]
   /** Key as pitch class 0–11 (0 = C), major/minor, and how clear (0–1). */
   key: number
   minor: boolean
@@ -519,10 +525,11 @@ function fineOnsets(samples: Float32Array, rate: number): { rise: Float32Array; 
  * ±50 ms gives a correction; the corrections are smoothed with a median over two bars (8 beats), so a fill or an
  * off-beat hi-hat can't pull single beats, and beats without a clear attack take their neighbours' correction.
  */
-function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: number }): number[] {
+/** The strongest attack within ±50 ms of each time: how far from it (seconds) and how strong. */
+function attacksNear(times: number[], onsets: { rise: Float32Array; step: number }) {
   const { rise, step } = onsets
   const reach = Math.round(0.05 / step)
-  const found = beats.map((time) => {
+  return times.map((time) => {
     const centre = Math.round(time / step)
     let best = -1
     let at = centre
@@ -534,13 +541,19 @@ function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: nu
     }
     return { shift: (at - centre) * step, strength: best }
   })
-  // A clear attack: at least half the typical one around it (four bars each side: quiet intros and outros count by
-  // their own measure, not the loud parts').
+}
+
+/** Whether each attack is clear: at least half as strong as the typical one around it (four bars each side). */
+function clearAttacks(found: Array<{ strength: number }>) {
   const strengths = found.map((entry) => entry.strength)
-  const shifts = found.map((entry, i) => {
-    const around = median(strengths.slice(Math.max(0, i - 16), i + 17))
-    return entry.strength > 0 && entry.strength >= 0.5 * around ? entry.shift : NaN
-  })
+  return found.map((entry, i) => entry.strength > 0 && entry.strength >= 0.5 * median(strengths.slice(Math.max(0, i - 16), i + 17)))
+}
+
+function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: number }): number[] {
+  const found = attacksNear(beats, onsets)
+  // Only clear attacks (quiet intros and outros count by their own measure, not the loud parts').
+  const clear = clearAttacks(found)
+  const shifts = found.map((entry, i) => (clear[i] ? entry.shift : NaN))
   // Per two bars: the median correction. Where the attacks are diffuse (a pad, a wash) the median of their strongest
   // moments still follows where the sound's energy rises, which is what another song's beat is heard against.
   const known = shifts.filter((shift) => !Number.isNaN(shift))
@@ -1226,6 +1239,15 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const phraseBars = barCount ? findPhrases(boundary, barCount) : []
   const phrases = phraseBars.map((b) => barStarts[b]!)
   const phraseEnd = (p: number) => (p + 1 < phraseBars.length ? barStarts[phraseBars[p + 1]!]! : duration)
+  // How clearly each phrase's beats are heard as attacks: the share of its beats with a clear attack (see
+  // clearAttacks) within 12 ms of the grid.
+  const beatAttacks = attacksNear(beats, onsets)
+  const beatClear = clearAttacks(beatAttacks).map((clear, i) => clear && Math.abs(beatAttacks[i]!.shift) <= 0.012)
+  const phraseClarity = phrases.map((start, p) => {
+    const end = phraseEnd(p)
+    const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))
+    return inside.length ? round(inside.filter(Boolean).length / inside.length, 2) : 0
+  })
   const phraseLength = (p: number) => (p + 1 < phraseBars.length ? phraseBars[p + 1]! : barCount) - phraseBars[p]!
 
   const sungBetween = (start: number, end: number) => sungStretches.reduce((sum, stretch) => sum + Math.max(0, Math.min(end, stretch.end) - Math.max(start, stretch.start)), 0) / Math.max(0.001, end - start)
@@ -1504,6 +1526,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     beats: beats.map((time) => round(time)),
     downbeats: downbeats.map((time) => round(time)),
     phrases: phrases.map((time) => round(time)),
+    phraseClarity,
     key: top.key,
     minor: top.minor,
     keyClarity: round(Math.max(0, top.r)),

@@ -97,6 +97,13 @@ export interface TrackMix {
    */
   accentOffset: number
   /**
+   * Seconds the song's snare/clap/hat attacks wander against its beat grid: the spread (interquartile range) of where
+   * they lie over the 2-bar stretches with one clear accent attack. About 0–0.01 for a steady groove; higher where they
+   * sit in two places (Right Round: on the grid or 15–19 ms late), so a long overlap of both decks' accents flams in
+   * some bars whatever the alignment. 0 when unknown (fewer than 4 such stretches) and in analyses made before it.
+   */
+  accentSpread: number
+  /**
    * Where the off-beat 16ths fall, as a share of the beat between two 8ths (0.5 = straight, about 0.6–0.67 = swung): a
    * swung and a straight groove can't both be loud without flamming. 0.5 when unknown and in analyses made before it.
    */
@@ -1564,6 +1571,15 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   // Where the song's snares, claps and hats usually sit against the grid (as kickOffset below).
   const accentStretches = accentBeats.filter((profile, i) => i % 8 === 4 && profile.prominence >= 0.6 && profile.rival < 0.75)
   const accentOffset = accentStretches.length >= 4 ? round(median(accentStretches.map((profile) => profile.shift)), 3) : 0
+  const accentShifts = accentStretches.map((profile) => profile.shift)
+  const sortedShifts = [...accentShifts].sort((a, b) => a - b)
+  // Quartiles interpolated between the measured values (few stretches: a step either way would weigh too much).
+  const quartile = (q: number) => {
+    const x = q * (sortedShifts.length - 1)
+    const i = Math.floor(x)
+    return sortedShifts[i]! + ((sortedShifts[Math.min(i + 1, sortedShifts.length - 1)]! - sortedShifts[i]!) * (x - i))
+  }
+  const accentSpread = sortedShifts.length >= 4 ? round(quartile(0.75) - quartile(0.25), 3) : 0
   const { swing } = swingOf(beats, accents)
   // How late the kick attacks lie behind the grid (the grid follows the broadband and accent attacks; a kick's low
   // rise peaks later by a song-specific amount): per 2 bars, the kick band's averaged attack where it has one clear
@@ -1908,6 +1924,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     phraseChroma,
     kickOffset,
     accentOffset,
+    accentSpread,
     swing,
     key: top.key,
     minor: top.minor,

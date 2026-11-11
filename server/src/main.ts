@@ -83,8 +83,8 @@ const UPLOAD_DIR = join(DATA_DIR, 'localized-images')
 const TEXT_BODY_LIMIT = 64 * 1024
 /** Largest part of an imported listening history (the app sends it in parts of a few thousand plays). */
 const IMPORT_BODY_LIMIT = 4 * 1024 * 1024
-/** Largest playlist mixer body (its transitions: about a kilobyte or two each). */
-const MIXER_BODY_LIMIT = 2 * 1024 * 1024
+/** Largest playlist mixer body (up to 1000 transitions of about 1 KB, at most 3 KB with long equal-power blends). */
+const MIXER_BODY_LIMIT = 4 * 1024 * 1024
 /** Most plays in one part of an import. */
 const IMPORT_BATCH = 5000
 /** Services whose listening history can be imported. */

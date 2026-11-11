@@ -153,17 +153,20 @@ export async function analyzeTrack(jellyfinUrl: string, token: string, track: Mi
 /** At most this many transitions are kept per playlist (a pair each; far more than a playlist's songs need). */
 export const MIXER_MAX_TRANSITIONS = 1000
 
-const PRESETS = new Set(['auto', 'crossfade', 'fadeOut', 'fadeIn', 'bassSwap', 'filterBuild', 'echoOut', 'dropSwap', 'hardCut', 'brake', 'none'])
+const PRESETS = new Set(['auto', 'blend', 'crossfade', 'fadeOut', 'fadeIn', 'bassSwap', 'filterBuild', 'echoOut', 'dropSwap', 'hardCut', 'brake', 'none'])
 const ID = /^[0-9a-f]{32}$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const AUTOMATION_KEYS = ['gain', 'low', 'mid', 'high', 'filter'] as const
-const MAX_KEYFRAMES = 64
+/** Keyframes per curve (an equal-power gain curve over a long blend takes some 70). */
+const MAX_KEYFRAMES = 256
 const MAX_EFFECTS = 16
-/** Longest overlap of two songs (seconds). */
-const MAX_LENGTH = 120
+/** Longest transition (seconds; loops may draw one out), and how far after it a keyframe may lie (B's rate easing). */
+const MAX_LENGTH = 300
+const MAX_KEYFRAME_TIME = MAX_LENGTH + 120
+/** At most this many stretches per deck's path, each played at most this many times in a row. */
+const MAX_SEGMENTS = 32
+const MAX_REPEAT = 8
 /** Furthest point into a song a transition can name (any track Jellyfin may hold, not only analysed ones). */
 const MAX_TIME = 6 * 3600
-/** How far before its file B may start (see Transition.bIn: a delayed start when its first downbeat is too early). */
-const MIN_B_IN = -2
 
 export interface PlaylistMixer {
   on: boolean
@@ -181,7 +184,7 @@ function keyframes(value: unknown, min: number, max: number): Array<{ t: number;
   const out: Array<{ t: number; v: number }> = []
   for (const frame of value) {
     if (!isRecord(frame)) return null
-    const t = number(frame.t, 0, MAX_LENGTH)
+    const t = number(frame.t, 0, MAX_KEYFRAME_TIME)
     const v = number(frame.v, min, max)
     if (t === null || v === null || (out.length && t < out[out.length - 1]!.t)) return null
     out.push({ t, v })
@@ -196,6 +199,21 @@ function automation(value: unknown) {
     const frames = keyframes(value[key] ?? [], key === 'filter' ? -1 : 0, 1)
     if (!frames) return null
     out[key] = frames
+  }
+  return out
+}
+
+/** A deck's path (see Transition.pathA): stretches with from < to inside a track, each played 1–8 times; null if bad. */
+function path(value: unknown): Array<{ from: number; to: number; repeat: number }> | null {
+  if (!Array.isArray(value) || value.length > MAX_SEGMENTS) return null
+  const out: Array<{ from: number; to: number; repeat: number }> = []
+  for (const segment of value) {
+    if (!isRecord(segment)) return null
+    const from = number(segment.from, 0, MAX_TIME)
+    const to = number(segment.to, 0, MAX_TIME)
+    const repeat = number(segment.repeat, 1, MAX_REPEAT)
+    if (from === null || to === null || to <= from || repeat === null || !Number.isInteger(repeat)) return null
+    out.push({ from, to, repeat })
   }
   return out
 }
@@ -218,28 +236,55 @@ function effect(value: unknown) {
   return null
 }
 
-/** One transition, checked field by field and copied without anything else; null when anything is off. */
+/**
+ * One transition (the contract's v2: one clock, paths with loops, rate curves), checked field by field and copied
+ * without anything else; null when anything is off, and for transitions of the older v1 shape.
+ */
 function transition(key: string, value: unknown): Record<string, unknown> | null {
-  if (!isRecord(value) || value.v !== 1) return null
+  if (!isRecord(value) || value.v !== 2) return null
   const [from, to, ...rest] = key.split('>')
   if (rest.length || !from || !to || !ID.test(from) || !ID.test(to) || value.from !== from || value.to !== to) return null
   if ((value.style !== 'clean' && value.style !== 'party') || typeof value.preset !== 'string' || !PRESETS.has(value.preset)) return null
   const aOut = number(value.aOut, 0, MAX_TIME)
-  const bIn = number(value.bIn, MIN_B_IN, MAX_TIME)
+  const bAt = number(value.bAt, 0, MAX_LENGTH)
+  const bIn = number(value.bIn, 0, MAX_TIME)
   const length = number(value.length, 0, MAX_LENGTH)
-  const rate = number(value.rate, 0.5, 2)
   const confidence = number(value.confidence, 0, 1)
-  // Both songs' tempo as planned with (echo delays and B's rate easing are counted in their beats).
+  // Both songs' tempo as planned with (echo delays are counted in their beats).
   const tempoA = isRecord(value.tempo) ? number(value.tempo.a, 30, 300) : null
   const tempoB = isRecord(value.tempo) ? number(value.tempo.b, 30, 300) : null
+  const pathA = path(value.pathA)
+  const pathB = path(value.pathB)
+  const rateA = keyframes(value.rateA, 0.9, 1.1)
+  const rateB = keyframes(value.rateB, 0.9, 1.1)
   const a = automation(value.a)
   const b = automation(value.b)
-  if (aOut === null || bIn === null || length === null || rate === null || confidence === null || tempoA === null || tempoB === null) return null
-  if (!a || !b || typeof value.custom !== 'boolean') return null
+  if (aOut === null || bAt === null || bIn === null || length === null || confidence === null || tempoA === null || tempoB === null) return null
+  if (!pathA || !pathB || !rateA || !rateB || !a || !b || typeof value.custom !== 'boolean') return null
   if (!Array.isArray(value.effects) || value.effects.length > MAX_EFFECTS) return null
   const effects = value.effects.map(effect)
   if (effects.some((entry) => !entry)) return null
-  return { v: 1, from, to, style: value.style, preset: value.preset, aOut, bIn, length, rate, tempo: { a: tempoA, b: tempoB }, a, b, effects, custom: value.custom, confidence }
+  return {
+    v: 2,
+    from,
+    to,
+    style: value.style,
+    preset: value.preset,
+    aOut,
+    bAt,
+    bIn,
+    length,
+    pathA,
+    pathB,
+    rateA,
+    rateB,
+    tempo: { a: tempoA, b: tempoB },
+    a,
+    b,
+    effects,
+    custom: value.custom,
+    confidence,
+  }
 }
 
 /**

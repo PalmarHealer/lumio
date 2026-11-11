@@ -65,6 +65,8 @@ const VOICE_HEARD = 0.3
 const ECHO_HEARD = 0.12
 /** Median distance (seconds) between both decks' beats above which a beatmatch is rejected. */
 const MAX_DRIFT = 0.025
+/** Least attack clarity (share of beats with an audible onset) a beatmatch needs in each song's phrases it covers. */
+const MIN_CLARITY = 0.6
 /** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
 const MAX_WINDOW_DRIFT = 0.025
 
@@ -275,6 +277,9 @@ interface ShapeStats {
    * basslines up (must be 0).
    */
   together: number
+  /** The stretch (transition time) where both decks are clearly audible: first and last such moment. */
+  togetherFrom: number
+  togetherTo: number
   tonal: number
   basses: number
 }
@@ -300,6 +305,8 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
   let bHere = -1
   let bVoice = -1
   let together = 0
+  let togetherFrom = -1
+  let togetherTo = -1
   let tonal = 0
   let basses = 0
   for (let i = 0; i <= steps; i++) {
@@ -316,12 +323,16 @@ export function sampleShape(a: DeckAutomation, b: DeckAutomation, length: number
     if (gb > 0.05 && bHere < 0) bHere = t
     if (voiceB[i] > VOICE_HEARD && bVoice < 0) bVoice = t
     if (i < steps) {
-      if (ga > 0.2 && gb > 0.2) together += dt
+      if (ga > 0.2 && gb > 0.2) {
+        together += dt
+        if (togetherFrom < 0) togetherFrom = t
+        togetherTo = t + dt
+      }
       if (ga * valueAt(a.mid, t, 1) * filterDamp(fa) > VOICE_HEARD && gb * valueAt(b.mid, t, 1) * filterDamp(fb) > VOICE_HEARD) tonal += dt
       if (ga * valueAt(a.low, t, 1) * bassThrough(fa) > 0.5 && gb * valueAt(b.low, t, 1) * bassThrough(fb) > 0.5) basses += dt
     }
   }
-  return { dt, voiceA, voiceB, gainA, gainB, aGone: Math.min(aGone, length), bHere: Math.max(0, bHere < 0 ? length : bHere), bVoice: Math.max(0, bVoice < 0 ? length : bVoice), together, tonal, basses }
+  return { dt, voiceA, voiceB, gainA, gainB, aGone: Math.min(aGone, length), bHere: Math.max(0, bHere < 0 ? length : bHere), bVoice: Math.max(0, bVoice < 0 ? length : bVoice), together, togetherFrom: Math.max(0, togetherFrom), togetherTo: Math.max(0, togetherTo), tonal, basses }
 }
 
 function shapeStats(shape: PresetShape, meet: Variant['meet'], beat: number): ShapeStats {
@@ -465,6 +476,8 @@ interface Placement {
   beatmatched: boolean
   /** Seconds of measured singing the placement skips (A's after it's gone, B's before its voice comes in). */
   sung: number
+  /** For a beatmatch: the least clear attacks of both songs where the decks sound together (NaN: not measured). */
+  clarity: number
   pa: Anchor
   pb: Anchor
 }
@@ -718,6 +731,17 @@ export function planTransition(
           rate = periodOver(b, from, from + length * guess) / (tempo.multiple * periodA)
           if (Math.abs(rate - 1) > MAX_TEMPO_DIFF) continue
         }
+        // A beatmatch needs clear attacks on both songs wherever their beats sound together: in a soft outro or a pad
+        // intro the beats can't be heard to line up. Without the measure (older analyses) only a short one is risked.
+        let clarity = NaN
+        if (tempo.synced && beatsTogether) {
+          const bStart = pb.t - stats.anchorB * rate
+          clarity = Math.min(
+            a.clarityBetween(aOut + stats.togetherFrom, aOut + stats.togetherTo),
+            b.clarityBetween(bStart + stats.togetherFrom * rate, bStart + stats.togetherTo * rate),
+          )
+          if (Number.isNaN(clarity) ? stats.together > 16 * stats.beat : clarity < MIN_CLARITY) continue
+        }
         // B's phrase start meets A's exactly; B may start up to two seconds late when it lies too close to its start.
         const bIn = pb.t - stats.anchorB * rate
         if (bIn < -2) continue
@@ -762,7 +786,7 @@ export function planTransition(
         const sungB = trustB * b.sungSeconds(0, bIn + stats.bVoice * rate)
         bound -= party ? 0.02 * sungA + 0.01 * sungB : 0.3 * (sungA + sungB)
         if (!tempo.synced && NEEDS_BEATMATCH.has(variant.preset)) bound -= 0.2 * Math.min(1, stats.together / (4 * stats.beat))
-        placements.push({ stats, variant, aOut, bIn, rate, bound, beatmatched: tempo.synced && beatsTogether, sung: sungA + sungB, pa, pb })
+        placements.push({ stats, variant, aOut, bIn, rate, bound, beatmatched: tempo.synced && beatsTogether, sung: sungA + sungB, clarity, pa, pb })
       }
     }
   }
@@ -806,6 +830,7 @@ export function planTransition(
   if (placement.stats.tonal > 4 * placement.stats.beat) confidence *= 0.7 + 0.3 * harmony
   if (!a.vocalsKnown || !b.vocalsKnown) confidence *= 0.85
   if (!tempo.synced && NEEDS_BEATMATCH.has(shape.preset)) confidence *= 0.6
+  if (placement.beatmatched) confidence *= Number.isNaN(placement.clarity) ? 0.8 : 0.7 + 0.3 * placement.clarity
 
   return finalizeTransition(
     {

@@ -52,6 +52,11 @@ export interface PreparedTrack {
   loudSeconds(from: number, to: number): number
   /** Seconds of singing between two moments (0 when the vocals are only assumed). */
   sungSeconds(from: number, to: number): number
+  /**
+   * The least clear attacks (0–1, the share of beats with an audible onset on the grid) over the phrases touching
+   * [from, to]; NaN when the analysis has no clarity per phrase.
+   */
+  clarityBetween(from: number, to: number): number
 }
 
 const finite = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
@@ -255,8 +260,28 @@ export function prepareTrack(mix: TrackMix | null | undefined): PreparedTrack | 
     cuesOut: Array.isArray(mix.cuesOut) ? mix.cuesOut.filter((t): t is number => finite(t) && t > 0 && t <= duration) : [],
     energyBetween,
     loudSeconds,
+    clarityBetween: phraseClarity(mix, duration),
     sungSeconds: (from: number, to: number) =>
       vocalsKnown ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
+  }
+}
+
+/** Clarity per analysed phrase, kept only when it pairs up with the phrase list one to one. */
+function phraseClarity(mix: TrackMix, duration: number) {
+  const starts = Array.isArray(mix.phrases) ? mix.phrases : []
+  const values = Array.isArray(mix.phraseClarity) ? mix.phraseClarity : []
+  const pairs = starts
+    .map((t, i) => ({ t, clarity: values[i] }))
+    .filter((p) => finite(p.t) && p.t >= 0 && p.t <= duration && finite(p.clarity))
+    .sort((p, q) => p.t - q.t)
+  const usable = values.length === starts.length && pairs.length > 0
+  const times = pairs.map((p) => p.t)
+  return (from: number, to: number) => {
+    if (!usable) return NaN
+    let least = Infinity
+    const first = Math.max(0, floorIndex(times, from))
+    for (let i = first; i < pairs.length && pairs[i].t < to; i++) least = Math.min(least, clamp(pairs[i].clarity, 0, 1))
+    return Number.isFinite(least) ? least : NaN
   }
 }
 

@@ -525,45 +525,58 @@ function fineOnsets(samples: Float32Array, rate: number): { rise: Float32Array; 
  * ±50 ms gives a correction; the corrections are smoothed with a median over two bars (8 beats), so a fill or an
  * off-beat hi-hat can't pull single beats, and beats without a clear attack take their neighbours' correction.
  */
-/** The strongest attack within ±50 ms of each time: how far from it (seconds) and how strong. */
-function attacksNear(times: number[], onsets: { rise: Float32Array; step: number }) {
+/**
+ * Where the beats' attack lies, as the ear and a beatmatch hear it over a stretch rather than beat by beat: for each
+ * beat, the onset rise averaged over the 8 beats around it (two bars), from `around` seconds before to after each.
+ * Single attacks scatter where a sidechained synth or a pad fills the spectrum; their average still peaks where the
+ * beat's attack is. Returns per beat where that peak lies (seconds from the beat), how much it stands out (0–1: the
+ * peak over the average's median, relative to the peak), and the strongest other peak more than 15 ms from it
+ * (relative to the peak: high when two moments compete for the attack).
+ */
+function beatProfiles(beats: number[], onsets: { rise: Float32Array; step: number }, around = 0.05) {
   const { rise, step } = onsets
-  const reach = Math.round(0.05 / step)
-  return times.map((time) => {
-    const centre = Math.round(time / step)
-    let best = -1
-    let at = centre
-    for (let k = Math.max(0, centre - reach); k <= Math.min(rise.length - 1, centre + reach); k++) {
-      if (rise[k]! > best) {
-        best = rise[k]!
-        at = k
-      }
+  const reach = Math.round(around / step)
+  const width = 2 * reach + 1
+  return beats.map((_, i) => {
+    const profile = new Float64Array(width)
+    let count = 0
+    for (let k = Math.max(0, i - 4); k < Math.min(beats.length, i + 4); k++) {
+      const centre = Math.round(beats[k]! / step)
+      if (centre - reach < 0 || centre + reach >= rise.length) continue
+      for (let j = 0; j < width; j++) profile[j] += rise[centre - reach + j]!
+      count++
     }
-    return { shift: (at - centre) * step, strength: best }
+    if (!count) return { shift: 0, prominence: 0, rival: 1 }
+    let at = 0
+    for (let j = 1; j < width; j++) if (profile[j]! > profile[at]!) at = j
+    const peak = profile[at]!
+    let rival = 0
+    const apart = Math.round(0.015 / step)
+    for (let j = 1; j < width - 1; j++) {
+      if (Math.abs(j - at) > apart && profile[j]! >= profile[j - 1]! && profile[j]! >= profile[j + 1]!) rival = Math.max(rival, profile[j]!)
+    }
+    return { shift: (at - reach) * step, prominence: peak > 0 ? (peak - median(Array.from(profile))) / peak : 0, rival: peak > 0 ? rival / peak : 1 }
   })
 }
 
-/** Whether each attack is clear: at least half as strong as the typical one around it (four bars each side). */
-function clearAttacks(found: Array<{ strength: number }>) {
-  const strengths = found.map((entry) => entry.strength)
-  return found.map((entry, i) => entry.strength > 0 && entry.strength >= 0.5 * median(strengths.slice(Math.max(0, i - 16), i + 17)))
-}
-
+/**
+ * Puts the beats on the audible onsets. The beat tracker's frames are 23 ms apart and its flux reacts to the whole
+ * spectrum; what a listener (and a beatmatch) hears is the broadband attack. Each beat moves to the peak of the attacks
+ * averaged over the two bars around it (see beatProfiles) where that peak stands out; elsewhere it takes the nearest
+ * such correction. The correction changes by at most 6 ms from one beat to the next (both ways, averaged): where the
+ * attacks change character (a build into a drop) the beats glide over instead of one bar coming out short.
+ */
 function onAudibleOnsets(beats: number[], onsets: { rise: Float32Array; step: number }): number[] {
-  const found = attacksNear(beats, onsets)
-  // Only clear attacks (quiet intros and outros count by their own measure, not the loud parts').
-  const clear = clearAttacks(found)
-  const shifts = found.map((entry, i) => (clear[i] ? entry.shift : NaN))
-  // Per two bars: the median correction. Where the attacks are diffuse (a pad, a wash) the median of their strongest
-  // moments still follows where the sound's energy rises, which is what another song's beat is heard against.
-  const known = shifts.filter((shift) => !Number.isNaN(shift))
-  const overall = known.length ? median(known) : 0
+  const profiles = beatProfiles(beats, onsets)
+  const known = profiles.flatMap((profile, i) => (profile.prominence >= 0.5 ? [i] : []))
+  const overall = known.length ? median(known.map((i) => profiles[i]!.shift)) : 0
+  let next = 0
   const corrections = beats.map((_, i) => {
-    const near = shifts.slice(Math.max(0, i - 4), i + 4).filter((shift) => !Number.isNaN(shift))
-    return near.length >= 3 ? median(near) : overall
+    if (profiles[i]!.prominence >= 0.5) return profiles[i]!.shift
+    while (next < known.length - 1 && known[next + 1]! <= i) next++
+    const nearest = [known[next], known[next + 1]].filter((k): k is number => k !== undefined).sort((x, y) => Math.abs(x - i) - Math.abs(y - i))[0]
+    return nearest === undefined ? overall : profiles[nearest]!.shift
   })
-  // The correction changes by at most 6 ms from one beat to the next (both ways, averaged): where the attacks change
-  // character (a build into a drop) the beats glide over instead of one bar coming out short.
   const limit = 0.006
   const forward = [...corrections]
   for (let i = 1; i < forward.length; i++) forward[i] = clamp(forward[i]!, forward[i - 1]! - limit, forward[i - 1]! + limit)
@@ -1247,17 +1260,12 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   const phraseBars = barCount ? findPhrases(boundary, barCount) : []
   const phrases = phraseBars.map((b) => barStarts[b]!)
   const phraseEnd = (p: number) => (p + 1 < phraseBars.length ? barStarts[phraseBars[p + 1]!]! : duration)
-  // How clearly each phrase's beats are heard as attacks that agree: a beat counts when its attack is clear (see
-  // clearAttacks) and lies within 12 ms of the median offset of the clear attacks around it (two bars). Where the
-  // strongest moments scatter from beat to beat (a wash, a pad, a riff without a beat) the phrase scores low even
-  // though attacks exist.
-  const beatAttacks = attacksNear(beats, onsets)
-  const attackClear = clearAttacks(beatAttacks)
-  const beatClear = beatAttacks.map((attack, i) => {
-    if (!attackClear[i]) return false
-    const around = beatAttacks.slice(Math.max(0, i - 4), i + 4).filter((_, k) => attackClear[Math.max(0, i - 4) + k])
-    return around.length >= 3 && Math.abs(attack.shift - median(around.map((entry) => entry.shift))) <= 0.012
-  })
+  // How clearly each phrase's beats are heard as attacks: a beat counts when the attacks averaged over the two bars
+  // around it (see beatProfiles, ±80 ms) form one peak that stands out (at least 0.6) within 12 ms of the grid, with no
+  // other peak reaching 75 % of it. A wash, a pad, a riff without a beat, a grid off the attacks, or a pumping
+  // (sidechained) synth whose swells compete with the kick for the attack score low: two such songs can't be lined up
+  // reliably by ear or by their sound's onsets.
+  const beatClear = beatProfiles(beats, onsets, 0.08).map((profile) => profile.prominence >= 0.6 && Math.abs(profile.shift) <= 0.012 && profile.rival < 0.75)
   const phraseClarity = phrases.map((start, p) => {
     const end = phraseEnd(p)
     const inside = beats.flatMap((time, i) => (time >= start - 0.001 && time < end - 0.001 ? [beatClear[i]!] : []))

@@ -99,6 +99,8 @@ const PHASE_SLACK = 0.05
  * with lag3 on the 25 songs, such beatmatches are where the flams are (9 at no floor, 1 at 0.4, for 13 fewer blends).
  */
 const MIN_VERIFIABLE = 0.4
+/** A deck's low band coming through at least this much (gain × EQ × filter): its kick is heard. */
+const KICK_HEARD = 0.5
 /** Clarity at which a beatmatch counts as fully verifiable (below it, a soft cost). */
 const MIN_CLARITY = 0.6
 /** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
@@ -108,6 +110,11 @@ const MAX_WINDOW_DRIFT = 0.025
  * material is where a listener stops hearing a held groove and starts hearing a song that's stuck.
  */
 const MAX_LOOP_BARS = 16
+/** Tempo corrections up to this are dropped (both decks at exactly 1) while the drift they leave stays under SNAP_DRIFT. */
+const SNAP_RATE = 0.001
+const SNAP_DRIFT = 0.005
+/** Tempo corrections up to this go to B alone: the player resamples them (no stretcher), A plays bit-exact. */
+const RESAMPLE_RATE = 0.003
 /** Bars A glides to the meeting tempo before B comes in, and bars B glides back to its own after A is gone. */
 const GLIDE_BARS_A = 2
 const GLIDE_BARS_B = 8
@@ -876,7 +883,11 @@ function audibleClarity(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     // audible end): no beats of A there to flam with.
     if (atB < (b.beats[0] ?? 0) - 0.05) return -1
     if (atA > (a.beats[a.beats.length - 1] ?? Infinity) + 0.05) continue
-    const value = Math.min(a.clarityBetween(atA, atA + 0.01), b.clarityBetween(atB, atB + 0.01))
+    // The accents/broadband attacks of both decks always; their kicks too where both lows come through (a killed or
+    // filtered low hides a kick: it can't flam).
+    let value = Math.min(a.clarityBetween(atA, atA + 0.01), b.clarityBetween(atB, atB + 0.01))
+    if (stats.passA.low[i] >= KICK_HEARD && stats.passB.low[i] >= KICK_HEARD)
+      value = Math.min(value, a.kickClarityBetween(atA, atA + 0.01), b.kickClarityBetween(atB, atB + 0.01))
     if (Number.isNaN(value)) return NaN
     least = Math.min(least, value)
   }
@@ -1446,6 +1457,15 @@ export function planTransition(
       const clarity = audibleClarity(shifted, a, b)
       if (clarity < 0 || (!Number.isNaN(clarity) && clarity < MIN_VERIFIABLE)) return null
       placement = { ...shifted, clarity }
+      // A tiny tempo correction is left out (both decks play at exactly 1, no stretching) where the drift it leaves
+      // stays within a few milliseconds each side of the overlap's middle.
+      const overlap = length - placement.bStart
+      const off = Math.abs(placement.rate - 1)
+      if (off > 0 && off <= SNAP_RATE && (off * overlap) / 2 <= SNAP_DRIFT) {
+        const middle = (placement.bStart + length) / 2
+        const bStart = middle - (middle - placement.bStart) * placement.rate
+        if (bStart >= 0) placement = { ...placement, rate: 1, bStart }
+      }
     }
     const { stats } = placement
     // A blend's middle (where the bass changes deck) on a downbeat of both songs as they actually play there: bars of
@@ -1552,8 +1572,10 @@ function toTransition(
   confidence: number,
   tempo: { a: number; b: number },
 ): Transition {
-  const matched = p.beatmatched && shape.length > 0
-  const rateA = matched ? 1 / Math.sqrt(p.rate) : 1
+  const matched = p.beatmatched && shape.length > 0 && p.rate !== 1
+  // A small correction goes to B alone (played resampled, without the stretcher; A stays bit-exact); a larger one
+  // meets in the middle.
+  const rateA = matched && Math.abs(p.rate - 1) > RESAMPLE_RATE ? 1 / Math.sqrt(p.rate) : 1
   const rateB = matched ? p.rate * rateA : 1
   let glide = 0
   let aOut = p.laneA.start

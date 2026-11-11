@@ -67,6 +67,11 @@ export interface PreparedTrack {
    * the analysis has no clarity at all.
    */
   clarityBetween(from: number, to: number): number
+  /**
+   * The same for the kick alone (its low-band attacks on the grid), where the analysis measured it per bar; else the
+   * combined measure above. A kick only flams where both decks' lows are heard.
+   */
+  kickClarityBetween(from: number, to: number): number
 }
 
 const finite = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
@@ -284,6 +289,7 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
     level: 10 ** ((finite(mix.loudness) ? clamp(mix.loudness, -60, 0) : -14) / 20),
     chromaAt: phraseChromaAt(mix, duration),
     clarityBetween: clarity(mix, duration, beats.length > 0 ? beats[0] : 0),
+    kickClarityBetween: kickClarity(mix, duration, beats.length > 0 ? beats[0] : 0),
     sungSeconds: (from: number, to: number) =>
       vocalsKnown ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
   }
@@ -330,6 +336,12 @@ function phraseChromaAt(mix: TrackMix, duration: number) {
 function clarity(mix: TrackMix, duration: number, beatsStart: number) {
   const bars = Array.isArray(mix.barClarity) && Array.isArray(mix.downbeats) && mix.barClarity.length === mix.downbeats.length && mix.barClarity.length > 0
   return bars ? stretchClarity(mix.downbeats, mix.barClarity, duration, beatsStart) : stretchClarity(mix.phrases, mix.phraseClarity, duration, beatsStart)
+}
+
+function kickClarity(mix: TrackMix, duration: number, beatsStart: number) {
+  const kicks: unknown = (mix as { barKickClarity?: unknown }).barKickClarity
+  const bars = Array.isArray(kicks) && Array.isArray(mix.downbeats) && kicks.length === mix.downbeats.length && kicks.length > 0
+  return bars ? stretchClarity(mix.downbeats, kicks, duration, beatsStart) : clarity(mix, duration, beatsStart)
 }
 
 /** Clarity per stretch (bar or phrase), kept only when the values pair up with the stretch starts one to one. */

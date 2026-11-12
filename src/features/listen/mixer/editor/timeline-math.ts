@@ -226,3 +226,31 @@ export function moveBStart(transition: Transition, bAt: number): Transition {
 
 /** A leaves at another moment. Keyframes after the new end are kept (finalize clamps what it must). */
 export const setLength = (transition: Transition, length: number): Transition => ({ ...transition, length: Math.max(transition.bAt, length) })
+
+/** A stretch of a deck's track that loops well (the planner's suggestions), in track seconds. */
+export interface LoopSpot {
+  deck: Deck
+  from: number
+  to: number
+}
+
+/** Whether the deck's path plays this stretch as a loop now. */
+export function hasLoop(transition: Transition, loop: LoopSpot): boolean {
+  const path = loop.deck === 'a' ? transition.pathA : transition.pathB
+  return (path ?? []).some((segment) => segment.repeat > 1 && Math.abs(segment.from - loop.from) < 0.01 && Math.abs(segment.to - loop.to) < 0.01)
+}
+
+/** Whether the deck reaches the stretch at all (a loop can only come after where the deck starts). */
+export const loopReachable = (transition: Transition, loop: LoopSpot) => loop.from >= (loop.deck === 'a' ? transition.aOut : transition.bIn) - 0.01
+
+/**
+ * The deck plays the stretch twice (once more than straight through), or, when it already loops it, straight through
+ * again. The deck plays straight to the stretch first; its other loops go (one loop at a time keeps it readable).
+ */
+export function toggleLoop(transition: Transition, loop: LoopSpot): Transition {
+  const start = loop.deck === 'a' ? transition.aOut : transition.bIn
+  const path = hasLoop(transition, loop) || !loopReachable(transition, loop)
+    ? []
+    : [...(loop.from - start > 0.01 ? [{ from: start, to: loop.from, repeat: 1 }] : []), { from: loop.from, to: loop.to, repeat: 2 }]
+  return loop.deck === 'a' ? { ...transition, pathA: path } : { ...transition, pathB: path }
+}

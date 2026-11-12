@@ -4,8 +4,10 @@ import { test } from 'node:test'
 import {
   addKey,
   deckTrack,
+  hasLoop,
   laneKeys,
   laneValue,
+  loopReachable,
   marksInTime,
   moveBStart,
   moveKey,
@@ -14,6 +16,7 @@ import {
   setLength,
   slipDeck,
   tOf,
+  toggleLoop,
   withLaneKeys,
   xOf,
   type Axis,
@@ -110,4 +113,17 @@ test('timing edits: slip, B entry, length, bars in the overlap', () => {
   assert.equal(moveBStart(t, 40).bAt, 16)
   assert.equal(setLength(t, 2).length, 4) // never before B comes in
   assert.equal(overlapBars(t, [], [4, 6, 8, 10, 12, 14, 16, 18]), 6)
+})
+
+test('loops: a stretch is played twice and taken out again', () => {
+  const t = transition()
+  const loop = { deck: 'b' as const, from: 14, to: 18 }
+  const looped = toggleLoop(t, loop)
+  assert.deepEqual(looped.pathB, [
+    { from: 10, to: 14, repeat: 1 },
+    { from: 14, to: 18, repeat: 2 },
+  ])
+  assert.equal(hasLoop(looped, loop), true)
+  assert.deepEqual(toggleLoop(looped, loop).pathB, [])
+  assert.equal(loopReachable(t, { deck: 'a', from: 90, to: 94 }), false)
 })

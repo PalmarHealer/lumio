@@ -30,8 +30,10 @@ import {
   axisWidth,
   deckColumns,
   deckTrack,
+  hasLoop,
   laneKeys,
   laneValue,
+  loopReachable,
   marksInTime,
   moveBStart,
   moveKey,
@@ -43,6 +45,7 @@ import {
   slipDeck,
   snap,
   tOf,
+  toggleLoop,
   withLaneKeys,
   xOf,
   type Axis,
@@ -124,6 +127,7 @@ const messages = defineMessages({
     startsLoading: 'Vorschläge werden berechnet …',
     startsNone: 'Ohne Analyse keine Vorschläge',
     hints: 'Hinweise',
+    loops: 'Loops:',
     check: (kind: CheckKind) => CHECK_NAMES.de[kind],
     undo: 'Rückgängig',
     redo: 'Wiederholen',
@@ -150,6 +154,7 @@ const messages = defineMessages({
     startsLoading: 'Working out suggestions …',
     startsNone: 'No suggestions without an analysis',
     hints: 'Hints',
+    loops: 'Loops:',
     check: (kind: CheckKind) => CHECK_NAMES.en[kind],
     undo: 'Undo',
     redo: 'Redo',
@@ -531,6 +536,13 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     return () => window.removeEventListener('keydown', onKey)
   })
 
+  // The planner's loops each deck plays during the transition (the others would need it moved first), a few per deck.
+  const loops = (suggestions?.loops ?? []).filter((loop) => {
+    const start = loop.deck === 'a' ? transition.aOut : transition.bIn
+    const span = loop.deck === 'a' ? transition.length : transition.length - transition.bAt + POST_ROLL
+    return hasLoop(transition, loop) || (loopReachable(transition, loop) && loop.from <= start + span)
+  }).filter((loop, i, list) => list.slice(0, i).filter((other) => other.deck === loop.deck).length < 4)
+
   /** Starts over from another transition (a suggestion, blank, the original): one undoable step. */
   const startFrom = (start: Transition) => {
     const next = finalize({ ...start, custom: true })
@@ -625,6 +637,33 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
           {clock(shownPlayhead)}
         </span>
       </div>
+
+      {/* The planner's loops: a click lets the deck play the stretch twice (and back). */}
+      {loops.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm text-muted-foreground">{t.loops}</span>
+          {loops.map((loop) => {
+            const on = hasLoop(transition, loop)
+            return (
+              <button
+                key={`${loop.deck}-${loop.from}-${loop.to}`}
+                type="button"
+                aria-pressed={on}
+                onClick={() => commit(transition, toggleLoop(transition, loop))}
+                className={cn(
+                  'flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40',
+                  on ? 'border-listen bg-listen/15 text-listen' : 'border-border hover:bg-muted',
+                )}
+              >
+                <span className="grid size-4 place-items-center rounded text-[10px] font-bold text-white" style={{ background: loop.deck === 'a' ? STUDIO.mid : STUDIO.low }}>
+                  {loop.deck.toUpperCase()}
+                </span>
+                {loop.label}
+              </button>
+            )
+          })}
+        </div>
+      )}
 
       <div ref={scroller} className="relative overflow-x-auto overflow-y-hidden rounded-xl" style={{ background: STUDIO.surface }}>
         <div className="relative" style={{ width: contentWidth }}>

@@ -194,7 +194,7 @@ function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{
     if (ta === undefined || ta - la.end > 2 * a.period) continue
     for (const lb of linesB) {
       if (!(lb.time <= b.duration * 0.6)) continue
-      const shared = la.words.filter((w) => lb.words.includes(w))
+      const shared = [...new Set(la.words.filter((w) => lb.words.includes(w)))]
       if (shared.length === 0) continue
       const tb = b.downbeats[floorIndex(b.downbeats, lb.time - 0.1)]
       if (tb === undefined || lb.time - tb > 4 * b.period) continue
@@ -207,11 +207,13 @@ function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{
       const word = shared.find((w) => titles.has(w)) ?? shared[0]
       const atA = wordStart(la, word)
       const atB = wordStart(lb, word)
-      if (atA !== null && atB !== null) {
-        const ba = a.beats[nearestIndex(a.beats, atA)]
-        const bb = b.beats[nearestIndex(b.beats, atB)]
-        if (ba !== undefined && bb !== undefined && Math.abs(atA - ba) <= 0.12 && Math.abs(atA - ba - (atB - bb)) <= 0.06 && atA >= a.duration * (style === 'party' ? 0.45 : 0.6)) {
-          pairs.push({ pa: { t: ba, bonus: weight + WORDPLAY_ON_WORD, drop: false, chorus: false }, pb: { t: bb, bonus: 0, drop: false, chorus: false }, weight: weight + WORDPLAY_ON_WORD, title, onWord: true })
+      if (atA !== null && atB !== null && atA >= a.duration * (style === 'party' ? 0.45 : 0.6)) {
+        // The 8th at or just before each word's reported start (the times lock to the 8th grid within ~30–60 ms); the
+        // two must both be on a beat or both between beats, so the beats line up as the words do.
+        const ea = eighthBefore(a, atA)
+        const eb = eighthBefore(b, atB)
+        if (ea && eb && ea.half === eb.half) {
+          pairs.push({ pa: { t: ea.t, bonus: weight + WORDPLAY_ON_WORD, drop: false, chorus: false }, pb: { t: eb.t, bonus: 0, drop: false, chorus: false }, weight: weight + WORDPLAY_ON_WORD, title, onWord: true })
           continue
         }
       }
@@ -227,19 +229,24 @@ function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{
 const DROP_SWAP_BONUS = 0.5
 
 /** When a line's words are timed (`wordTimes`, in the order of `words`): where `word` starts in it, else null. */
-function wordStart(line: { time: number; words: number[] }, word: number): number | null {
-  const times: unknown = (line as { wordTimes?: unknown }).wordTimes
+function wordStart(line: { time: number; words: number[]; wordTimes?: number[] }, word: number): number | null {
+  const times = line.wordTimes
   if (!Array.isArray(times) || times.length !== line.words.length) return null
   const k = line.words.indexOf(word)
   const t = k >= 0 ? times[k] : undefined
   return typeof t === 'number' && Number.isFinite(t) ? t : null
 }
 
-/** Index of the time in a sorted list nearest to t (-1 for an empty list). */
-function nearestIndex(list: number[], t: number) {
-  const i = floorIndex(list, t)
-  if (i < 0) return list.length > 0 ? 0 : -1
-  return i + 1 < list.length && list[i + 1] - t < t - list[i] ? i + 1 : i
+/** The 8th note nearest t (a word's reported start locks to the 8th grid), and whether it's off the beat. */
+function eighthBefore(track: PreparedTrack, t: number): { t: number; half: boolean } | null {
+  const i = floorIndex(track.beats, t)
+  if (i < 0 || i + 1 >= track.beats.length) return null
+  const points = [
+    { t: track.beats[i], half: false },
+    { t: (track.beats[i] + track.beats[i + 1]) / 2, half: true },
+    { t: track.beats[i + 1], half: false },
+  ]
+  return points.reduce((best, p) => (Math.abs(p.t - t) < Math.abs(best.t - t) ? p : best))
 }
 
 /** Extra for a wordplay that replaces A's word with B's (timed words), over one that answers after A's line. */
@@ -1990,12 +1997,19 @@ function planSeveral(
           // On a timed word the swap is the beat the words start on (any beat, counted in beats); else the bars.
           const grid = (track: PreparedTrack) => (onWord ? track.beats : track.downbeats)
           const unit = onWord ? 4 : 1
-          const iA = floorIndex(grid(a), pa.t + 0.05)
-          const iB = floorIndex(grid(b), pb.t + 0.05)
-          const startA = grid(a)[iA - pre * unit]
-          const endA = grid(a)[iA + post * unit]
-          const startB = grid(b)[iB - preB * unit]
-          const endB = grid(b)[iB + postB * unit]
+          // (an 8th between beats keeps its offset from the beat before it)
+          const span = (track: PreparedTrack, t: number, before: number, after: number) => {
+            const list = grid(track)
+            const i = floorIndex(list, t + 0.01)
+            const from = list[i - before]
+            const to = list[i + after]
+            return i < 0 || from === undefined || to === undefined ? null : { start: from + (t - list[i]), end: to + (t - list[i]) }
+          }
+          const sa = span(a, pa.t, pre * unit, post * unit)
+          const sb = span(b, pb.t, preB * unit, postB * unit)
+          if (!sa || !sb) continue
+          const { start: startA, end: endA } = sa
+          const { start: startB, end: endB } = sb
           if (startA === undefined || endA === undefined || startB === undefined || endB === undefined) continue
           const stats = shapeFor(variant, (endA - startA) / (4 * variant.bars))
           const length = stats.shape.length
@@ -2190,7 +2204,8 @@ function planSeveral(
     const { stats } = placement
     // A blend's middle (where the bass changes deck) on a downbeat of both songs as they actually play there: bars of
     // uneven length can carry one song's downbeat away from the other's over a long blend.
-    if (placement.variant.preset === 'blend' && placement.variant.bassAt === 'middle') {
+    // (Not on the wordplay cuts: their swap is the word, on whichever beat or 8th it starts.)
+    if (placement.variant.preset === 'blend' && placement.variant.bassAt === 'middle' && placement.variant.volume !== 'jumpcut' && placement.variant.volume !== 'answer') {
       const middle = stats.shape.swap
       const length = stats.shape.length
       const downA = laneBeats(placement.laneA, a.downbeats, length)

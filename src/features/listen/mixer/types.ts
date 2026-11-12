@@ -140,12 +140,14 @@ export interface TrackMix {
   vocalSource: 'lyrics' | 'unplaced' | 'audio' | 'none'
   /**
    * The sung lines when `vocalSource` is 'lyrics', placed like `vocals` but unpadded: `time` where the line starts,
-   * `end` where it is estimated to end (see `vocals`), and `words`, its content words as 32-bit FNV-1a hashes of their
-   * UTF-8 (lowercased, accents folded, apostrophes removed, a plural -s or -ies taken off, English and German stopwords
-   * left out; each word once). Two songs' lines can be matched by word (wordplay: B's line answers A's with the same
-   * word) without their text. Empty otherwise and in analyses made before it.
+   * `end` where it is estimated to end (see `vocals`), `words`, its content words in order (repeats kept) as 32-bit
+   * FNV-1a hashes of their UTF-8 (lowercased, accents folded, apostrophes removed, a plural -s or -ies taken off,
+   * English and German stopwords left out), and `wordTimes`, when each of those words starts (same index): the line
+   * shared out by syllables, each start moved to a clear voice onset within 150 ms. Two songs' lines can be matched by
+   * word (wordplay: B's line answers A's with the same word) without their text. Empty otherwise and in analyses made
+   * before it (and `wordTimes` missing in analyses made before it).
    */
-  lines: Array<{ time: number; end: number; words: number[] }>
+  lines: Array<{ time: number; end: number; words: number[]; wordTimes?: number[] }>
   /**
    * The content words of the track's title, hashed like `lines` (what is in brackets, such as "(feat. …)", left out):
    * a line with a title word is likely the hook. Empty when the title is unknown and in analyses made before it.

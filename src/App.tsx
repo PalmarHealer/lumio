@@ -28,6 +28,7 @@ import { FollowListPage, ProfilePage as ListenProfilePage } from '@/features/lis
 import { ListenShell } from '@/features/listen/listen-shell'
 import { MusicPlayerHost } from '@/features/listen/player/music-host'
 import { MixerHost } from '@/features/listen/mixer/mixer-host'
+import { TransitionEditorPage } from '@/features/listen/mixer/editor/editor-page'
 import { VideoDownloadsHost } from '@/features/player/video-download-ui'
 import { PlayEntry } from '@/features/listen/player/play-entry'
 import { DetailPage } from '@/features/items/detail-page'
@@ -160,6 +161,7 @@ const router = createBrowserRouter(
         <Route path="browse/:category" element={<CategoryPage />} />
         <Route path="library" element={<ListenLibraryPage />} />
         <Route path="playlist/:id" element={<PlaylistPage />} />
+        <Route path="playlist/:id/mix/:from/:to" element={<TransitionEditorPage />} />
         <Route path="official/:slug" element={<OfficialPlaylistPage />} />
         <Route path="liked" element={<LikedSongsPage />} />
         <Route path="user/:id" element={<ListenProfilePage />} />

@@ -11,6 +11,7 @@ import {
   IconPlaylistAdd,
   IconTrash,
   IconUsersPlus,
+  IconVinyl,
   IconWorld,
 } from '@tabler/icons-react'
 import { useMemo, useState, type ReactNode } from 'react'
@@ -81,6 +82,7 @@ const messages = defineMessages({
     madeFor: (name: string) => `Von ${name}`,
     madeForPrefix: 'Für',
     tempoKey: 'Tempo · Tonart',
+    editTransition: 'Übergang zum nächsten Song bearbeiten',
   },
   en: {
     playlist: 'Playlist',
@@ -116,6 +118,7 @@ const messages = defineMessages({
     madeFor: (name: string) => `By ${name}`,
     madeForPrefix: 'For',
     tempoKey: 'Tempo · key',
+    editTransition: 'Edit the transition into the next song',
   },
 })
 
@@ -146,10 +149,12 @@ interface CollectionProps {
   /** A column beside the songs (plays, listeners), by track id, with its heading. */
   extras?: Record<string, ReactNode>
   extraLabel?: string
+  /** Items on top of a row's menu (in the list's order as shown). */
+  rowMenu?: (track: BaseItemDto, index: number, tracks: BaseItemDto[]) => ReactNode
 }
 
 /** The layout shared by playlists, official playlists and liked songs: header, actions, track table with albums. */
-export function Collection({ kind, badge, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel }: CollectionProps) {
+export function Collection({ kind, badge, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel, rowMenu }: CollectionProps) {
   const t = useMessages(messages)
   // Dragging reorders right away; the server's order replaces it once it has saved the move.
   const [reordered, setReordered] = useState<{ from: BaseItemDto[]; order: BaseItemDto[] } | null>(null)
@@ -277,6 +282,7 @@ export function Collection({ kind, badge, title, cover, byline, description, tra
                 extra={extras ? (extras[track.Id ?? ''] ?? '') : undefined}
                 onPlay={() => music.play(tracks, index, { source })}
                 onRemove={onRemove ? () => onRemove(track) : undefined}
+                menuExtra={rowMenu?.(track, index, tracks)}
               />
             </div>
           ))}
@@ -396,6 +402,18 @@ export function PlaylistPage() {
         empty={canEdit ? t.empty : undefined}
         extras={addedBy ?? (mixing ? mixInfo : undefined)}
         extraLabel={addedBy ? t.addedBy : t.tempoKey}
+        rowMenu={
+          mixing && canEdit
+            ? (track, index, shown) => {
+                const next = shown[index + 1]
+                return next?.Id && track.Id ? (
+                  <DropdownMenuItem onClick={() => void navigate(`/listen/playlist/${id}/mix/${track.Id}/${next.Id}`)}>
+                    <IconVinyl /> {t.editTransition}
+                  </DropdownMenuItem>
+                ) : null
+              }
+            : undefined
+        }
         onRemove={canEdit ? (track) => track.PlaylistItemId && actions.remove.mutate({ playlistId: id, entryIds: [track.PlaylistItemId] }) : undefined}
         onMove={canEdit ? (track, index) => track.PlaylistItemId && actions.move.mutate({ playlistId: id, entryId: track.PlaylistItemId, index }) : undefined}
         onEdit={mine && item ? setEditing : undefined}

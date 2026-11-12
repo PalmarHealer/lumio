@@ -1,0 +1,134 @@
+import { IconArrowLeft, IconArrowRight, IconDeviceFloppy, IconLoader2 } from '@tabler/icons-react'
+import { useMemo, useState } from 'react'
+import { useParams } from 'react-router'
+import { toast } from 'sonner'
+import { Link } from '@/components/link'
+import { Button, buttonVariants } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
+import { useItem } from '@/features/items/queries'
+import { ticksToSeconds } from '@/lib/format'
+import { defineMessages, useMessages } from '@/lib/i18n'
+import { MixerSaveError, usePlaylistMixer, useSaveMixer, useTrackMixes } from '../queries'
+import { transitionFor } from '../resolve'
+import { pairKey, type Transition } from '../types'
+import { TransitionEditor } from './transition-editor'
+
+const messages = defineMessages({
+  de: {
+    title: 'Übergang bearbeiten',
+    back: 'Zurück zur Playlist',
+    save: 'Speichern',
+    saved: 'Übergang gespeichert',
+    unsaved: 'Nicht gespeichert',
+    loading: 'Analysen werden geladen …',
+    noAnalysis: 'Für diese Songs gibt es noch keine Analyse. Lumio analysiert sie gerade; bis dahin zeigt der Editor eine einfache Überblendung ohne Wellenform.',
+    forbidden: 'Nur wer die Playlist bearbeiten darf, kann Übergänge speichern.',
+    conflict: 'Jemand anderes hat die Übergänge gerade geändert. Lade die Seite neu und versuch es noch einmal.',
+    failed: 'Der Übergang konnte nicht gespeichert werden.',
+  },
+  en: {
+    title: 'Edit transition',
+    back: 'Back to the playlist',
+    save: 'Save',
+    saved: 'Transition saved',
+    unsaved: 'Not saved',
+    loading: 'Loading the analyses …',
+    noAnalysis: 'These songs have no analysis yet. Lumio is analysing them now; until then the editor shows a plain crossfade without a waveform.',
+    forbidden: 'Only those who may edit the playlist can save transitions.',
+    conflict: 'Someone else just changed the transitions. Reload the page and try again.',
+    failed: 'The transition could not be saved.',
+  },
+})
+
+/**
+ * `/listen/playlist/:id/mix/:from/:to`: the transition from one song of a mixer playlist into the next, in the editor.
+ * It starts from the stored transition for the pair (or the automatic one) and saves it as the pair's hand-made one.
+ */
+export function TransitionEditorPage() {
+  const t = useMessages(messages)
+  const { id = '', from = '', to = '' } = useParams()
+  const a = useItem(from)
+  const b = useItem(to)
+  const mixer = usePlaylistMixer(id)
+  const save = useSaveMixer(id)
+  const ids = useMemo(() => [from, to], [from, to])
+  const analyses = useTrackMixes(ids)
+  const [edited, setEdited] = useState<Transition | null>(null)
+
+  const aMix = analyses.mixes.get(from) ?? null
+  const bMix = analyses.mixes.get(to) ?? null
+  const aDuration = aMix?.duration ?? ticksToSeconds(a.data?.RunTimeTicks ?? 0)
+  const bDuration = bMix?.duration ?? ticksToSeconds(b.data?.RunTimeTicks ?? 0)
+  const ready = analyses.loaded && (mixer.isSuccess || mixer.isError) && !!a.data && !!b.data
+  const initial = useMemo(
+    () =>
+      ready
+        ? transitionFor(mixer.data ?? null, from, to, analyses.mixes, mixer.data?.style ?? 'clean', { durations: { [from]: aDuration, [to]: bDuration } })
+        : null,
+    // Worked out once, when everything has loaded: later refetches mustn't replace what is being edited.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ready],
+  )
+
+  const onSave = () => {
+    if (!edited) return
+    const transition: Transition = { ...edited, custom: true }
+    save.mutate(
+      { transitions: { ...(mixer.data?.transitions ?? {}), [pairKey(from, to)]: transition } },
+      {
+        onSuccess: () => {
+          setEdited(null)
+          toast.success(t.saved)
+        },
+        onError: (error) =>
+          void toast.error(error instanceof MixerSaveError && error.status === 403 ? t.forbidden : error instanceof MixerSaveError && error.status === 409 ? t.conflict : t.failed),
+      },
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-4 px-4 pt-16 pb-12 sm:px-8">
+      <div className="flex flex-wrap items-center gap-3">
+        <Link to={`/listen/playlist/${id}`} aria-label={t.back} title={t.back} className={buttonVariants({ variant: 'ghost', size: 'icon' })}>
+          <IconArrowLeft />
+        </Link>
+        <div className="min-w-0">
+          <h1 className="text-2xl font-bold">{t.title}</h1>
+          <p className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground">
+            <span className="truncate">{a.data?.Name ?? '…'}</span>
+            <IconArrowRight className="size-4 shrink-0" />
+            <span className="truncate">{b.data?.Name ?? '…'}</span>
+          </p>
+        </div>
+        <div className="ml-auto flex items-center gap-3">
+          {edited && <span className="text-sm text-muted-foreground">{t.unsaved}</span>}
+          <Button disabled={!edited || save.isPending} onClick={onSave}>
+            {save.isPending ? <IconLoader2 className="animate-spin" /> : <IconDeviceFloppy />}
+            {t.save}
+          </Button>
+        </div>
+      </div>
+
+      {!initial ? (
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">{t.loading}</p>
+          <Skeleton className="h-[300px] rounded-xl" />
+        </div>
+      ) : (
+        <>
+          {(!aMix || !bMix) && <p className="text-sm text-muted-foreground">{t.noAnalysis}</p>}
+          <TransitionEditor
+            initial={initial}
+            aMix={aMix}
+            bMix={bMix}
+            aTitle={a.data?.Name ?? ''}
+            bTitle={b.data?.Name ?? ''}
+            aDuration={aDuration}
+            bDuration={bDuration}
+            onChange={setEdited}
+          />
+        </>
+      )}
+    </div>
+  )
+}

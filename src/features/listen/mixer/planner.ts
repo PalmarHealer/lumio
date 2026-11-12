@@ -1025,6 +1025,19 @@ function handoverDrop(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   return drop
 }
 
+/** Most a transition may rise from A's level just before B comes in to B's just after A is gone (dB). */
+const MAX_RISE_DB = 6
+
+/** dB from A's level over the 3 s before B is heard to B's over the 3 s after A is gone (positive: louder after). */
+function continuityRise(p: Placement, a: PreparedTrack, b: PreparedTrack) {
+  const { stats } = p
+  const atA = positionA(p, stats.bHere)
+  const atB = positionB(p, stats.aGone) ?? p.laneB.start
+  const before = levelOver(a, atA - 3, atA)
+  const after = levelOver(b, atB, atB + 3)
+  return before > 0 && after > 0 ? 20 * Math.log10(after / before) : 0
+}
+
 /** A track's absolute band levels (dB FS) over a stretch, from bandLoudness and its band curves; null when unknown. */
 function bandLevels(track: PreparedTrack, from: number, to: number) {
   const loud = track.mix.bandLoudness
@@ -2528,6 +2541,10 @@ function planWith(
     // Any transition that falls off a cliff after A is gone (an EDM drop into a piano ballad) is out, the fallbacks too:
     // B is entered elsewhere, or another kind takes it (or none).
     if (stats.shape.length > 0 && handoverDrop(placement, a, b) > (party ? 1.5 : 3) + 6) return null
+    // Nor may the music jump up: B, 3 s after A is gone, far louder than A in the 3 s before B came in (round 3, God's
+    // Plan → Hello: -19 dB into -11 dB). A drop swap rises on its drop by design (5 dB at most, checked above).
+    const rise = stats.shape.length > 0 && !dropSwap ? continuityRise(placement, a, b) : 0
+    if (rise > MAX_RISE_DB) return null
     if (placement.variant.preset === 'blend') {
       // A only ever goes out and B only ever comes in (the user: "why is A brought back?"); B is in full before A's last
       // band goes ("B isn't ready to take over"), except on the wordplay cut, where B's answer masks A's end.

@@ -134,6 +134,14 @@ export interface TrackMix {
    * before it.
    */
   bandLoudness?: { low: number; mid: number; high: number }
+  /**
+   * What kind of music it is, so a sort can keep like with like (a piano ballad after rap is a jump):
+   * `percussive`, the share of the sound in short attacks rather than sustained tones (0–1, harmonic/percussive split
+   * of the spectrum); `onsetRate`, clear attacks a second; `brightness`, the spectral centroid (Hz, of the audio as
+   * analysed, 11 kHz sampling); `timbre`, the song's mean of 12 cepstral coefficients of its log band energies (the
+   * spectrum's shape, compare by distance). Missing in analyses made before it.
+   */
+  character?: { percussive: number; onsetRate: number; brightness: number; timbre: number[] }
   /** The song's structure, in order, covering the whole track. */
   sections: MixSection[]
   /** Drop moments (a phrase start where bass and energy jump after a build-up). */
@@ -297,6 +305,11 @@ interface ShortSpectra {
   side: Float64Array | null
   /** Turns a band's summed bin powers into the mean square of the samples in that band (Parseval, Hann window). */
   powerScale: number
+  /** Power in the timbre's log-spaced bands per frame (TIMBRE_BANDS each), for telling sustained from percussive sound. */
+  bandPowers: Float32Array
+  /** Spectral centroid per frame (Hz, magnitude-weighted) and the frame's summed magnitude (its weight). */
+  centroid: Float32Array
+  magnitude: Float32Array
 }
 
 const TIMBRE_BANDS = 20
@@ -332,6 +345,9 @@ function shortSpectra(samples: Float32Array, rate: number, sides: Float32Array |
     side: sides ? new Float64Array(count) : null,
     // The positive bins hold half of the windowed frame's energy, N·Σx²w²; Σw² is 3N/8 for a Hann window.
     powerScale: 16 / (3 * size * size),
+    bandPowers: new Float32Array(count * TIMBRE_BANDS),
+    centroid: new Float32Array(count),
+    magnitude: new Float32Array(count),
   }
   const window = Float64Array.from({ length: size }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / size))
   const re = new Float64Array(size)
@@ -350,12 +366,16 @@ function shortSpectra(samples: Float32Array, rate: number, sides: Float32Array |
     fft(re, im)
     let rise = 0
     let lowRise = 0
+    let weighted = 0
+    let total = 0
     let low = 0
     let mid = 0
     let high = 0
     for (let k = 1; k < bins; k++) {
       const power = re[k]! * re[k]! + im[k]! * im[k]!
       const magnitude = Math.sqrt(power)
+      weighted += k * binHz * magnitude
+      total += magnitude
       logs[k] = Math.log1p(100 * magnitude)
       if (frame) {
         const up = Math.max(0, logs[k]! - previous[k]!)
@@ -379,6 +399,8 @@ function shortSpectra(samples: Float32Array, rate: number, sides: Float32Array |
       result.side[frame] = side
     }
     result.flux[frame] = rise
+    result.centroid[frame] = total > 0 ? weighted / total : 0
+    result.magnitude[frame] = total
     result.lowFlux[frame] = lowRise
     result.low[frame] = low
     result.mid[frame] = mid
@@ -387,6 +409,7 @@ function shortSpectra(samples: Float32Array, rate: number, sides: Float32Array |
       let sum = 0
       for (let k = edges[b]!; k < Math.max(edges[b]! + 1, edges[b + 1]!); k++) sum += re[k]! * re[k]! + im[k]! * im[k]!
       bandLogs[b] = Math.log(sum + 1e-9)
+      result.bandPowers[frame * TIMBRE_BANDS + b] = sum
     }
     for (let c = 0; c < TIMBRE_COEFFS; c++) {
       let sum = 0
@@ -1327,6 +1350,75 @@ function repetitionScore(lines: LyricLine[], offset: number, sound: (time: numbe
   return (real - m) / sd
 }
 
+/**
+ * What kind of music it is, for telling a ballad from rap or EDM (see TrackMix.character): how much of the sound is
+ * percussive, how many attacks a second, how bright, and the mean timbre.
+ */
+function characterOf(spectra: ShortSpectra, onsets: { rise: Float32Array; step: number }, duration: number): TrackMix['character'] {
+  // Percussive share (median-filter HPSS on the log-spaced band powers): per band and frame, the median over 17
+  // frames (about 0.4 s) is the sustained part, the median over 5 neighbouring bands the percussive one; each frame's
+  // power goes to the larger of the two (soft, by their squares), and the percussive share of all power is taken.
+  const B = TIMBRE_BANDS
+  const n = spectra.count
+  const powers = spectra.bandPowers
+  let percussive = 0
+  let all = 0
+  const span: number[] = []
+  for (let f = 0; f < n; f++) {
+    for (let b = 0; b < B; b++) {
+      span.length = 0
+      for (let g = Math.max(0, f - 8); g <= Math.min(n - 1, f + 8); g++) span.push(powers[g * B + b]!)
+      const sustained = median(span)
+      span.length = 0
+      for (let c = Math.max(0, b - 2); c <= Math.min(B - 1, b + 2); c++) span.push(powers[f * B + c]!)
+      const struck = median(span)
+      const power = powers[f * B + b]!
+      const share = struck * struck + sustained * sustained > 0 ? (struck * struck) / (struck * struck + sustained * sustained) : 0
+      percussive += share * power
+      all += power
+    }
+  }
+  // Attacks a second: peaks of the broadband onset rise (smoothed over 10 ms) at least 50 ms apart that reach twice the
+  // rise's typical level (its 90th percentile).
+  const { rise, step } = onsets
+  const smoothWidth = Math.max(1, Math.round(0.01 / step))
+  const smoothed = new Float32Array(rise.length)
+  let running = 0
+  for (let i = 0; i < rise.length; i++) {
+    running += rise[i]!
+    if (i >= smoothWidth) running -= rise[i - smoothWidth]!
+    smoothed[i] = running / smoothWidth
+  }
+  const level = 2 * (quantile(smoothed, 0.9) || 1e-9)
+  const apart = Math.round(0.05 / step)
+  let count = 0
+  let last = -Infinity
+  for (let i = 1; i < smoothed.length - 1; i++) {
+    if (smoothed[i]! >= level && smoothed[i]! >= smoothed[i - 1]! && smoothed[i]! > smoothed[i + 1]! && i - last >= apart) {
+      count++
+      last = i
+    }
+  }
+  // Brightness: the spectral centroid, each frame weighted by its magnitude.
+  let weighted = 0
+  let weight = 0
+  for (let f = 0; f < n; f++) {
+    weighted += spectra.centroid[f]! * spectra.magnitude[f]!
+    weight += spectra.magnitude[f]!
+  }
+  const timbre = Array.from({ length: TIMBRE_COEFFS }, (_, c) => {
+    let sum = 0
+    for (let f = 0; f < n; f++) sum += spectra.timbre[f * TIMBRE_COEFFS + c]!
+    return round(n ? sum / n : 0, 2)
+  })
+  return {
+    percussive: round(all > 0 ? percussive / all : 0, 2),
+    onsetRate: round(count / Math.max(1, duration), 2),
+    brightness: Math.round(weight > 0 ? weighted / weight : 0),
+    timbre,
+  }
+}
+
 // ---- the analysis ----
 
 /**
@@ -2101,6 +2193,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     energy,
     bands,
     bandLoudness,
+    character: characterOf(spectra, onsets, duration),
     sections,
     drops: drops.map((time) => round(time)),
     vocals: vocals.map((stretch) => ({ start: round(stretch.start, 2), end: round(stretch.end, 2) })),

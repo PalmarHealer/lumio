@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { externalOf } from '@/lib/external-items'
 import { ticksToSeconds } from '@/lib/format'
-import { setTransitionProvider, useMusic, type TransitionProvider } from '../player/music-player'
+import { setBakedClipLoader, setTransitionProvider, useMusic, type TransitionProvider } from '../player/music-player'
 import { analysable, fetchMixes, mixerKey, playlistOfSource, prefetchMixes, useStableLumioFetch, usePlaylistMixer } from './queries'
 import { transitionFor } from './resolve'
 import type { PlaylistMixer } from './types'
@@ -53,7 +53,16 @@ export function MixerHost() {
       return transitionFor(settings, from.Id, to.Id, mixes, settings.style, { durations })
     }
     setTransitionProvider(provider)
-    return () => setTransitionProvider(null)
+    // Baked transitions' clips come from the Lumio server, in the playback quality (null: lossless).
+    setBakedClipLoader(async (baked, part, quality, signal) => {
+      const response = await lumioFetch(`${baked.url}${baked.url.includes('?') ? '&' : '?'}part=${part}&quality=${quality ?? 'original'}`, { signal })
+      if (!response.ok) throw new Error(`Clip ${response.status}`)
+      return response.arrayBuffer()
+    })
+    return () => {
+      setTransitionProvider(null)
+      setBakedClipLoader(null)
+    }
     // Registered once per playlist and switch: setting it again would call off a transition under way. A save (style,
     // "sort & build") counts from the next transition the player asks for.
   }, [on, playlistId, queryClient, lumioFetch])

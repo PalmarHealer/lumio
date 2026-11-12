@@ -27,6 +27,7 @@ import { asPlayed, createDeck, createMaster, freezeDeck, handoverPoint, rampAt, 
 import { bSettled, deckPlan, positionAt, rateOf, timeOfAdvance, trackSpan, withBrake, type DeckPlan } from '../mixer/deck-schedule'
 import { bufferDeckKind, tempoChangeKind, type BufferDeckKind } from '../mixer/buffer-deck'
 import { mono } from '../mixer/xcorr'
+import { alignPart, BAKE_MARGIN_S, bakeKey, CLIP_GAIN, sourceIdentity } from '../mixer/baked'
 import { currentPlayLead, followPlan, learnPlayLead, waitForCue, wakeAfter } from './deck-sync'
 import { calibratedStart, closeSide, crossfade, locateElement, medianStart, openSide, type BufferSide, type Located } from './mix-buffers'
 import { blobSlice, streamSlice, type Slice } from './slices'
@@ -1225,7 +1226,7 @@ interface Plan {
   /** Preset 'none': B follows A's real end (its `aOut` is kept on the element's own duration). */
   backToBack: boolean
   /** Buffers ready for the transition (A's slice, still to be lined up when armed; B's side), or null: without. */
-  buffered: { sliceA: Slice; sideB: BufferSide; kindA: BufferDeckKind } | null
+  buffered: { sliceA: Slice; sideB: BufferSide; kindA: BufferDeckKind; baked: BakedLoad | null } | null
   /** The buffers being loaded (to call off), and whether B's element is being lined up (it plays muted meanwhile). */
   loading: AbortController | null
   calibrating: boolean
@@ -1235,6 +1236,19 @@ interface Plan {
   offline: boolean
   cacheKey: string | null
   cancelCue: () => void
+}
+
+/**
+ * A baked transition's clip, decoded and lined up: its parts as slices in clip time (a part's `start` is minus its
+ * codec delay), the transition time span it covers, and A's slice start it was lined up against (A's slice is
+ * calibrated later, at the cue: the clip moves with it).
+ */
+interface BakedLoad {
+  a: Slice
+  b: Slice
+  start: number
+  end: number
+  sliceAStart: number
 }
 
 interface Running {
@@ -1269,6 +1283,11 @@ interface Running {
   limited: number
   /** A is gone; B is still on its buffer until it hands back. */
   trailing: boolean
+  /**
+   * Baked: the clip plays the transition (deck A's part on `sides.a`, deck B's on `clipB`) through neutral decks; B's
+   * own buffer (`sides.b`) takes over at the clip's end and hands back to the element as usual.
+   */
+  baked: { clipB: BufferSide; start: number; end: number } | null
 }
 
 let transitionProvider: TransitionProvider | null = null
@@ -1296,6 +1315,18 @@ let cancelEase = () => {}
  * Set by the mixer layer: decides the transitions. Set it only while a transition may come up (a mixer playlist is
  * around): with a provider, library tracks load with CORS and play through the (transparent) decks.
  */
+/**
+ * Fetches a baked transition's clip part (`a` or `b`) in a quality (kbps; null = lossless), as encoded audio. Set by
+ * the mixer layer (it talks to the Lumio server); without one, baked transitions play live.
+ */
+export type BakedClipLoader = (baked: NonNullable<Transition['baked']>, part: 'a' | 'b', quality: number | null, signal: AbortSignal) => Promise<ArrayBuffer>
+
+let bakedClipLoader: BakedClipLoader | null = null
+
+export function setBakedClipLoader(next: BakedClipLoader | null) {
+  bakedClipLoader = next
+}
+
 export function setTransitionProvider(next: TransitionProvider | null) {
   transitionProvider = next
   dropPlan()
@@ -1773,6 +1804,15 @@ async function beginBuffered(p: Plan) {
   buffered.sliceA.start = calibratedStart(located, ctx.sampleRate)
   // A plays at rate 1 into the transition: t = 0 is when it reaches aOut, counted from the located frame.
   const zero = located.frame / ctx.sampleRate + (transition.aOut - located.position)
+  const baked = buffered.baked ? await openBaked(ctx, a, p.element!, buffered.baked, buffered.sliceA.start, zero) : null
+  if (baked) {
+    if (plan !== p || p.buffered !== buffered) return closeBaked(baked)
+    plan = null
+    p.cancelCue = () => {}
+    startRunning(p, a, p.element!, zero, { a: baked.sideA, b: buffered.sideB }, baked)
+    p.buffered = null
+    return
+  }
   const sideA = await openSide(ctx, elementInput(a), buffered.sliceA, buffered.kindA).catch(() => null)
   if (plan !== p || p.buffered !== buffered) return void (sideA && closeSide(sideA))
   if (!sideA || zero - ctx.currentTime < sideA.deck.latency + MIN_HANDOVER_LEAD_S) {
@@ -1786,11 +1826,35 @@ async function beginBuffered(p: Plan) {
 }
 
 /**
+ * A baked clip's sides, lined up with A's calibrated slice, when there is time to splice it in before anything
+ * happens (A's sound must move to the clip while A still plays plainly); else null (it plays live, from the buffers).
+ */
+async function openBaked(ctx: BaseAudioContext, a: HTMLAudioElement, b: HTMLAudioElement, clip: BakedLoad, sliceAStart: number, zero: number) {
+  // The clip's A part was lined up against A's slice before it was calibrated: it moves with the slice.
+  const sliceA = { ...clip.a, start: clip.a.start + (sliceAStart - clip.sliceAStart) }
+  const opened = await Promise.all([openSide(ctx, elementInput(a), sliceA, 'exact'), openSide(ctx, elementInput(b), clip.b, 'exact')]).catch(() => null)
+  if (!opened) return null
+  const [sideA, sideB] = opened
+  const baked = { sideA, sideB, start: clip.start, end: clip.end }
+  const splice = Math.max(clip.start + 0.15, ctx.currentTime - zero + sideA.deck.latency + 0.05)
+  if (splice > -0.1) {
+    closeBaked(baked)
+    return null
+  }
+  return baked
+}
+
+function closeBaked(baked: { sideA: BufferSide; sideB: BufferSide }) {
+  closeSide(baked.sideA)
+  closeSide(baked.sideB)
+}
+
+/**
  * The transition starts (its t = 0 at context time `zero`). With `sides` the decks' sound comes from their buffers
  * (paths and loops as planned, see mix-buffers.ts) while the elements play on muted; without, the elements play it
  * themselves, straight (no loops) at the rate curves.
  */
-function startRunning(p: Plan, a: HTMLAudioElement, b: HTMLAudioElement, zero: number, sides: Running['sides']) {
+function startRunning(p: Plan, a: HTMLAudioElement, b: HTMLAudioElement, zero: number, sides: Running['sides'], baked: { sideA: BufferSide; sideB: BufferSide; start: number; end: number } | null = null) {
   const ctx = context!
   const transition = p.transition!
   const straight = (plan: DeckPlan): DeckPlan => (sides ? plan : { ...plan, lane: { start: plan.lane.start, path: [] } })
@@ -1815,6 +1879,12 @@ function startRunning(p: Plan, a: HTMLAudioElement, b: HTMLAudioElement, zero: n
     settled: bSettled(transition),
     limited: Math.max(bSettled(transition), tailsEnd(transition) ?? -Infinity),
     trailing: false,
+    baked: baked && { clipB: baked.sideB, start: baked.start, end: baked.end },
+  }
+  if (baked) {
+    // B hands back once the clip has ended; the limiter acts until then.
+    r.settled = baked.end
+    r.limited = baked.end
   }
   running = r
   cancelEase()
@@ -1825,6 +1895,20 @@ function startRunning(p: Plan, a: HTMLAudioElement, b: HTMLAudioElement, zero: n
   const deckA = decks.get(a)!
   const deckB = decks.get(b)!
   const from = Math.max(0, ctx.currentTime - zero)
+  if (baked && sides) {
+    // The clip is the transition: the decks stay neutral (only the players' levels act on it).
+    if (!safely(() => (resetDeck(deckA), resetDeck(deckB)))) return abortRunning()
+    const clipPlan: DeckPlan = { at: baked.start, lane: { start: 0, path: [] }, rate: [] }
+    r.handoverLead = Math.max(baked.start + 0.15, ctx.currentTime - zero + sides.a.deck.latency + 0.05)
+    sides.a.deck.play(clipPlan, r.handoverLead, baked.end, zero)
+    crossfade(elementGain(a).gain, sides.a.gain.gain, zero + r.handoverLead)
+    baked.sideB.gain.gain.setValueAtTime(1, zero + r.handoverLead)
+    baked.sideB.deck.play(clipPlan, r.handoverLead, baked.end, zero)
+    // At the clip's end both play B plainly: B's own buffer takes over there (and hands back to the element later).
+    sides.b.deck.play(r.planB, baked.end - 0.3, baked.end + HANDBACK_AFTER_S + HANDBACK_SPAN_S, zero)
+    crossfade(baked.sideB.gain.gain, sides.b.gain.gain, zero + baked.end - BAKE_MARGIN_S / 2)
+    return follow(r)
+  }
   if (!safely(() => scheduleTransition({ a: deckA, b: deckB }, transition, zero, { from }))) return abortRunning()
   if (sides) {
     // A's sound moves to its buffer (lined up to the sample) a little before t = 0; B's buffer starts at bAt.
@@ -1941,6 +2025,20 @@ function finishRunning(r: Running) {
   }
   for (const stop of r.stops) stop()
   r.stops = []
+  if (r.baked) {
+    // The clip still holds A's tails: A's element (muted) and deck go once it has ended.
+    r.trailing = true
+    follow(r)
+    const ctx = context!
+    const end = r.start + r.baked.end
+    r.stops.push(
+      wakeAfter(ctx, end - ctx.currentTime, () => {
+        r.sides?.a.deck.stopAt(ctx.currentTime)
+        retire(r.a, 0)
+      }),
+    )
+    return
+  }
   r.sides?.a.deck.stopAt(context!.currentTime)
   retire(r.a, ECHO_TAIL_S)
   const deckB = decks.get(r.b)
@@ -2006,6 +2104,8 @@ async function handBack(r: Running) {
 }
 
 function closeSides(r: Running) {
+  if (r.baked) closeSide(r.baked.clipB)
+  r.baked = null
   if (!r.sides) return
   closeSide(r.sides.a)
   closeSide(r.sides.b)
@@ -2025,6 +2125,14 @@ function abortRunning() {
   cancelEase()
   const keep = r.handedOver ? r.b : r.a
   const gone = r.handedOver ? r.a : r.b
+  if (r.baked && context) {
+    const clipB = r.baked.clipB
+    clipB.gain.gain.cancelScheduledValues(0)
+    clipB.gain.gain.setTargetAtTime(0, context.currentTime, 0.003)
+    clipB.deck.stopAt(context.currentTime + 0.02)
+    r.baked = null
+    wakeAfter(context, 0.05, () => closeSide(clipB))
+  }
   if (r.sides && context) {
     const now = context.currentTime
     const keepSide = keep === r.a ? r.sides.a : r.sides.b
@@ -2123,8 +2231,16 @@ function mixerPaused() {
     for (const stop of r.stops) stop()
     r.stops = []
     ;(r.handedOver ? r.a : r.b).pause()
-    if (r.sides && r.pausedAt < r.handoverLead) {
-      // Paused before any of it came from the buffers: it goes on without them (the elements play it, straight).
+    if (r.sides && (r.pausedAt < r.handoverLead || r.baked)) {
+      // Paused before any of it came from the buffers, or in a baked clip: it goes on without them (the elements play
+      // it, straight and live).
+      if (r.baked) {
+        const clipB = r.baked.clipB
+        clipB.deck.stopAt(now)
+        r.baked = null
+        wakeAfter(context, 0.05, () => closeSide(clipB))
+        if (r.trailing) retire(r.a, 0)
+      }
       const sides = r.sides
       sides.a.deck.stopAt(now)
       sides.b.deck.stopAt(now)
@@ -2257,12 +2373,43 @@ async function loadBuffered(p: Plan) {
     const kindB = bufferDeckKind(planB, Math.max(0, transition.bAt), settled, tempoChangeKind)
     const sideB = await openSide(ctx, elementInput(b), sliceB, kindB)
     if (plan !== p) return closeSide(sideB)
-    p.buffered = { sliceA, sideB, kindA: bufferDeckKind(planA, -HANDOVER_LEAD_S, transition.length, tempoChangeKind) }
+    const baked = await loadBaked(p, transition, sliceA, sliceB, ctx, abort.signal).catch(() => null)
+    if (plan !== p) return closeSide(sideB)
+    p.buffered = { sliceA, sideB, kindA: bufferDeckKind(planA, -HANDOVER_LEAD_S, transition.length, tempoChangeKind), baked }
     mixerTick()
   } catch {
     // Without buffers then.
   } finally {
     if (p.loading === abort) p.loading = null
+  }
+}
+
+/**
+ * A baked transition's clip, when it belongs to this transition and these songs (its key) and a loader is set: both
+ * parts fetched in the playback quality, decoded, back at full scale, and lined up against the songs' slices (A's head
+ * and B's tail, where the clip plays them plainly; a lossy part's codec delay is found there). Null otherwise: live.
+ */
+async function loadBaked(p: Plan, transition: Transition, sliceA: Slice, sliceB: Slice, ctx: BaseAudioContext, signal: AbortSignal): Promise<BakedLoad | null> {
+  const baked = transition.baked
+  const loader = bakedClipLoader
+  if (!baked || !loader || !connection) return null
+  const key = await bakeKey({ transition, a: sourceIdentity(p.from), b: sourceIdentity(p.to) })
+  if (key !== baked.key) return null
+  const quality = streamingMusicQuality(readLocalSettings(connection.userId))
+  const [rawA, rawB] = await Promise.all([loader(baked, 'a', quality, signal), loader(baked, 'b', quality, signal)])
+  const [bufferA, bufferB] = await Promise.all([ctx.decodeAudioData(rawA), ctx.decodeAudioData(rawB)])
+  const full = (buffer: AudioBuffer) => [0, 1].map((c) => Float32Array.from(buffer.getChannelData(Math.min(c, buffer.numberOfChannels - 1)), (x) => x / CLIP_GAIN))
+  const [a, b] = [full(bufferA), full(bufferB)]
+  const rate = ctx.sampleRate
+  const head = alignPart({ part: mono(a), sampleRate: rate, from: 0.1, reference: mono(sliceA.channels), referenceStart: sliceA.start, transition, deck: 'a', clipStart: baked.start })
+  const tail = alignPart({ part: mono(b), sampleRate: rate, from: baked.length - BAKE_MARGIN_S + 0.05, span: 0.35, reference: mono(sliceB.channels), referenceStart: sliceB.start, transition, deck: 'b', clipStart: baked.start })
+  if (!head || !tail) return null
+  return {
+    a: { channels: a as Float32Array<ArrayBuffer>[], start: -head.delay, sampleRate: rate },
+    b: { channels: b as Float32Array<ArrayBuffer>[], start: -tail.delay, sampleRate: rate },
+    start: baked.start,
+    end: baked.start + baked.length,
+    sliceAStart: sliceA.start,
   }
 }
 

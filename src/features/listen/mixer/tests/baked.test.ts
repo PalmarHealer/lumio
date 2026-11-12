@@ -15,17 +15,16 @@ test('a clip spans from before anything happens to after B settles and the tails
 })
 
 test('the key: the same for the same sound, different for any change', async () => {
-  const base = { transition: transition(), a: 'a:1', b: 'b:2', sampleRate: 44100 }
+  const base = { transition: transition(), a: 'a:1', b: 'b:2' }
   const key = await bakeKey(base)
   assert.match(key, /^[0-9a-f]{32}$/)
   // Key order, sub-0.1 ms noise, the editor's flags and the baked clip itself don't matter...
   const reordered = Object.fromEntries(Object.entries(transition()).reverse()) as ReturnType<typeof transition>
   assert.equal(await bakeKey({ ...base, transition: reordered }), key)
   assert.equal(await bakeKey({ ...base, transition: transition({ aOut: 100.00001, custom: true, confidence: 0.2, baked: { url: 'x', key: 'y', start: -0.5, length: 20 } }) }), key)
-  // ...any change of the sound, the songs or the rate does.
+  // ...any change of the sound or the songs does.
   assert.notEqual(await bakeKey({ ...base, transition: transition({ length: 16.5 }) }), key)
   assert.notEqual(await bakeKey({ ...base, b: 'b:3' }), key)
-  assert.notEqual(await bakeKey({ ...base, sampleRate: 48000 }), key)
   assert.ok(keyText(base).startsWith('{"a":"a:1"'))
 })
 

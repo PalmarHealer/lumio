@@ -1864,7 +1864,9 @@ function planSeveral(
   const shapeFor = (variant: Variant, beat: number) => {
     // Half time: B's bar spans two of A's, so the swap goes on an even bar of A.
     const rawSwap = variant.pre ?? variant.bars * variant.swapFraction
-    const swapBar = tempo.synced && tempo.multiple === 2 ? 2 * Math.round(rawSwap / 2) : Math.round(rawSwap)
+    // (A wordplay swap may sit on an 8th: its bar count is kept as given.)
+    const exact = variant.volume === 'answer' || variant.volume === 'jumpcut'
+    const swapBar = exact ? rawSwap : tempo.synced && tempo.multiple === 2 ? 2 * Math.round(rawSwap / 2) : Math.round(rawSwap)
     const key = `${variant.preset}:${variant.bars}:${variant.pre}:${swapBar}:${variant.preRollBars}:${variant.filter}:${variant.midSwap}:${variant.volume}:${variant.bassAt}:${variant.filterIn}:${variant.filterOut}:${variant.callback}:${variant.meet}:${beat.toFixed(5)}`
     let stats = shapes.get(key)
     if (!stats) {
@@ -1998,24 +2000,27 @@ function planSeveral(
           const grid = (track: PreparedTrack) => (onWord ? track.beats : track.downbeats)
           const unit = onWord ? 4 : 1
           // (an 8th between beats keeps its offset from the beat before it)
+          // Both lanes start on a beat (B's entry is never off the beat); an 8th between beats adds half a beat before
+          // the swap, which then sits on the 8th itself.
           const span = (track: PreparedTrack, t: number, before: number, after: number) => {
             const list = grid(track)
             const i = floorIndex(list, t + 0.01)
             const from = list[i - before]
             const to = list[i + after]
-            return i < 0 || from === undefined || to === undefined ? null : { start: from + (t - list[i]), end: to + (t - list[i]) }
+            return i < 0 || from === undefined || to === undefined ? null : { start: from, end: to + (t - list[i]), half: t - list[i] > 0.05 }
           }
           const sa = span(a, pa.t, pre * unit, post * unit)
           const sb = span(b, pb.t, preB * unit, postB * unit)
-          if (!sa || !sb) continue
+          if (!sa || !sb || sa.half !== sb.half) continue
           const { start: startA, end: endA } = sa
           const { start: startB, end: endB } = sb
-          if (startA === undefined || endA === undefined || startB === undefined || endB === undefined) continue
-          const stats = shapeFor(variant, (endA - startA) / (4 * variant.bars))
+          const extra = sa.half ? 0.125 : 0
+          const job = extra > 0 ? { ...variant, bars: variant.bars + extra, pre: pre + extra } : variant
+          const stats = shapeFor(job, (endA - startA) / (4 * job.bars))
           const length = stats.shape.length
           const rate = (endB - startB) / length
           if (!rateOk(rate)) continue
-          const base = { stats, variant, laneA: { start: startA, path: [] }, laneB: { start: startB, path: [] }, bStart: PHASE_SLACK, rate, beatmatched: true, clarity: NaN, loops: 0, slack: PHASE_SLACK, pa, pb }
+          const base = { stats, variant: job, laneA: { start: startA, path: [] }, laneB: { start: startB, path: [] }, bStart: PHASE_SLACK, rate, beatmatched: true, clarity: NaN, loops: 0, slack: PHASE_SLACK, pa, pb }
           placements.push({ ...base, ...scoreBound(base) })
         }
         continue

@@ -57,10 +57,11 @@ import { useHistory } from './use-history'
 import { envelopeOf, type Envelope } from './envelope'
 import { useChecks } from './use-assist'
 import type { PreviewControls } from './use-preview'
+import type { DeckStems } from './use-stems'
 
 const GROUP_NAMES: Record<'de' | 'en', Record<string, string>> = {
-  de: { level: 'Pegel & EQ', effects: 'Filter & Hall', tempo: 'Tempo', stems: 'Smarte Filter · Näherung' },
-  en: { level: 'Level & EQ', effects: 'Filter & reverb', tempo: 'Tempo', stems: 'Smart filters · approximation' },
+  de: { level: 'Pegel & EQ', effects: 'Filter & Hall', tempo: 'Tempo', stems: 'Smarte Filter' },
+  en: { level: 'Level & EQ', effects: 'Filter & reverb', tempo: 'Tempo', stems: 'Smart filters' },
 }
 
 const PARAM_NAMES: Record<'de' | 'en', Record<LaneParam, string>> = {
@@ -130,6 +131,8 @@ const messages = defineMessages({
     startsLoading: 'Vorschläge werden berechnet …',
     startsNone: 'Ohne Analyse keine Vorschläge',
     hints: 'Hinweise',
+    stemState: (state: DeckStems) => ({ approx: 'Näherung', loading: 'Stems laden …', ready: 'Stems', failed: 'Stems fehlgeschlagen' })[state],
+    realStem: (param: LaneParam) => ({ drums: 'Drums', vocals: 'Stimme', instrumental: 'Instrumental' })[param as 'drums'] ?? param,
     addPoint: 'Punkt',
     addPointHint: (lane: string, deck: string) => `Punkt auf „${lane} ${deck}“ an der Abspielposition (Taste K)`,
     loops: 'Loops:',
@@ -159,6 +162,8 @@ const messages = defineMessages({
     startsLoading: 'Working out suggestions …',
     startsNone: 'No suggestions without an analysis',
     hints: 'Hints',
+    stemState: (state: DeckStems) => ({ approx: 'approximation', loading: 'loading stems …', ready: 'stems', failed: 'stems failed' })[state],
+    realStem: (param: LaneParam) => ({ drums: 'Drums', vocals: 'Voice', instrumental: 'Instrumental' })[param as 'drums'] ?? param,
     addPoint: 'Point',
     addPointHint: (lane: string, deck: string) => `Point on "${lane} ${deck}" at the playhead (key K)`,
     loops: 'Loops:',
@@ -183,6 +188,8 @@ const LABEL_NARROW = 84
 /** Each deck's half of the visualizer, and a lane row. */
 const DECK_H = 170
 const LANE_H = 52
+/** The lanes real stems can take over. */
+const STEM_LANES: ReadonlySet<LaneParam> = new Set(['drums', 'vocals', 'instrumental'])
 /** The checks' row. */
 const HINTS_H = 28
 const HINT_ROW_H = 22
@@ -221,6 +228,8 @@ export interface TransitionEditorProps {
   preview?: PreviewControls
   /** The planner's suggestions for the pair (starting points, out and in points), once worked out. */
   suggestions?: Suggestions | null
+  /** Per deck, whether its stem lanes play real stems (Mix-Modus) or the live approximation. */
+  stems?: { a: DeckStems; b: DeckStems }
   /** Reports a new starting point (a suggestion's id, 'initial', or null for blank) with its plan. */
   onStart?: (start: { variant: string | null; plan: Transition }) => void
 }
@@ -237,7 +246,7 @@ type Gesture =
  * bar grid, the overlap as a card with its bar count) and automation lanes below it, one row per parameter and deck, in
  * collapsible groups. A click anywhere sets the playhead; no gesture needs a double click.
  */
-export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuration, bDuration, onChange, onLive, preview, suggestions, onStart }: TransitionEditorProps) {
+export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuration, bDuration, onChange, onLive, preview, suggestions, onStart, stems }: TransitionEditorProps) {
   const t = useMessages(messages)
   const history = useHistory(initial)
   const transition = history.value
@@ -811,10 +820,16 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
                 onClick={() => setCollapsed({ ...collapsed, [group.id]: !collapsed[group.id] })}
                 aria-expanded={!collapsed[group.id]}
                 className="sticky left-0 z-10 flex h-8 items-center gap-1.5 px-3 text-xs font-semibold uppercase tracking-wide outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                style={{ color: STUDIO.label, background: STUDIO.surface, width: LABEL_W }}
+                style={{ color: STUDIO.label, background: STUDIO.surface, minWidth: LABEL_W }}
               >
                 {collapsed[group.id] ? <IconChevronRight className="size-4" /> : <IconChevronDown className="size-4" />}
                 {t.group(group.id)}
+                {group.id === 'stems' &&
+                  (['a', 'b'] as const).map((deck) => (
+                    <span key={deck} className="ml-2 whitespace-nowrap rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal">
+                      {deck.toUpperCase()}: {t.stemState(stems?.[deck] ?? 'approx')}
+                    </span>
+                  ))}
               </button>
               {rows
                 .filter((row) => row.group === group.id)
@@ -825,7 +840,7 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
                       style={{ width: LABEL_W, height: LANE_H, background: activeLane.deck === row.deck && activeLane.param === row.param ? '#262626' : STUDIO.surface, color: STUDIO.label }}
                     >
                       <span className="size-2.5 shrink-0 rounded-full" style={{ background: LANE_COLOR[row.param] }} />
-                      <span className="truncate">{t.param(row.param)}</span>
+                      <span className="truncate">{STEM_LANES.has(row.param) && stems?.[row.deck] === 'ready' ? t.realStem(row.param) : t.param(row.param)}</span>
                       <span className="ml-auto font-bold opacity-70">{row.deck.toUpperCase()}</span>
                     </div>
                     <LaneCanvas

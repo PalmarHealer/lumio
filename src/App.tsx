@@ -28,6 +28,7 @@ import { FollowListPage, ProfilePage as ListenProfilePage } from '@/features/lis
 import { ListenShell } from '@/features/listen/listen-shell'
 import { MusicPlayerHost } from '@/features/listen/player/music-host'
 import { MixerHost } from '@/features/listen/mixer/mixer-host'
+import { MixModeHost } from '@/features/listen/mixer/mixmode/mix-mode-host'
 import { TransitionEditorPage } from '@/features/listen/mixer/editor/editor-page'
 import { VideoDownloadsHost } from '@/features/player/video-download-ui'
 import { PlayEntry } from '@/features/listen/player/play-entry'
@@ -95,6 +96,7 @@ function SocialHostWhenSignedIn() {
       <SocialHost />
       <VideoDownloadsHost />
       <MixerHost />
+      <MixModeHost />
     </>
   ) : null
 }

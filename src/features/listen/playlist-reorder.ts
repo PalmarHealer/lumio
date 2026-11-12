@@ -5,6 +5,8 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { toast } from 'sonner'
 import { useAuthedSession } from '@/features/auth/session'
 import { defineMessages, useMessages } from '@/lib/i18n'
+import { dropStaleBakes } from './mixer/mixmode/bake'
+import { mixerKey, useStableLumioFetch } from './mixer/queries'
 import { entriesInOrder, hasSharedEntries, planMoves } from './mixer/reorder'
 
 /**
@@ -110,6 +112,7 @@ export function usePlaylistReorder(playlistId: string) {
   const { api, session } = useAuthedSession()
   const queryClient = useQueryClient()
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
+  const lumioFetch = useStableLumioFetch()
   const tracksKey = ['playlist-tracks', session.userId, playlistId]
 
   /**
@@ -157,6 +160,9 @@ export function usePlaylistReorder(playlistId: string) {
       setProgress(null)
       if (moved > 0) {
         await queryClient.invalidateQueries({ queryKey: tracksKey })
+        // Baked clips of pairs that are no longer neighbours are let go (mixer playlists).
+        const now = queryClient.getQueryData<BaseItemDto[]>(tracksKey)
+        if (now) void dropStaleBakes(lumioFetch, playlistId, now.map((track) => track.Id ?? '')).then(() => queryClient.invalidateQueries({ queryKey: mixerKey(playlistId) }))
         // Whatever was reached, the order before can be had back.
         if (remember && before) setPrevious(playlistId, before)
       }

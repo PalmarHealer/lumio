@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useAuthedSession } from '@/features/auth/session'
 import { jellyfin } from '@/lib/jellyfin'
 import { music } from '../../player/music-player'
-import { createTransitionPreview, type PreviewSource, type TransitionPreview } from '../preview'
+import { createTransitionPreview, type PreviewSource, type PreviewStems, type TransitionPreview } from '../preview'
 import { deckPlan, trackSpan } from '../deck-schedule'
 import type { Transition } from '../types'
 import { loadDeckAudio, sourceEnd } from './audio'
@@ -32,6 +32,8 @@ export interface PreviewControls {
   seek: (t: number) => void
   scrub: (t: number) => void
   setLoop: (region: { from: number; to: number } | null) => void
+  /** Real stems for a deck (Mix-Modus): they take over from the live approximation. */
+  setStems: (deck: 'a' | 'b', stems: PreviewStems) => Promise<void>
   /** The audio loaded for each deck (for drawing it finer than the analysis). */
   sources: { a: PreviewSource | null; b: PreviewSource | null }
 }
@@ -142,6 +144,9 @@ export function useTransitionPreview(options: { fromId: string; toId: string; tr
         setPosition(t)
       },
       setLoop: (region: { from: number; to: number } | null) => preview.current?.setLoop(region),
+      setStems: async (deck: 'a' | 'b', stems: PreviewStems) => {
+        await preview.current?.setStems(deck, stems)
+      },
     }),
     [],
   )

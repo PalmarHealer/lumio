@@ -46,6 +46,7 @@ import { useHeldByDownload } from './download-ui'
 import { MixerBadge, MixerMenuItems, SortBuildDialog } from './mixer/mixer-ui'
 import { useMixInfo, usePlaylistMixer } from './mixer/queries'
 import { PlaylistSortMenu } from './playlist-sort-menu'
+import { MixModeBanner, MixModeMenuItem } from './mixer/mixmode/mix-mode-ui'
 
 const messages = defineMessages({
   de: {
@@ -149,12 +150,14 @@ interface CollectionProps {
   /** A column beside the songs (plays, listeners), by track id, with its heading. */
   extras?: Record<string, ReactNode>
   extraLabel?: string
+  /** A strip above the songs (a playlist in Mix-Modus: how far its stems are). */
+  notice?: ReactNode
   /** Items on top of a row's menu (in the list's order as shown). */
   rowMenu?: (track: BaseItemDto, index: number, tracks: BaseItemDto[]) => ReactNode
 }
 
 /** The layout shared by playlists, official playlists and liked songs: header, actions, track table with albums. */
-export function Collection({ kind, badge, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel, rowMenu }: CollectionProps) {
+export function Collection({ kind, badge, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel, rowMenu, notice }: CollectionProps) {
   const t = useMessages(messages)
   // Dragging reorders right away; the server's order replaces it once it has saved the move.
   const [reordered, setReordered] = useState<{ from: BaseItemDto[]; order: BaseItemDto[] } | null>(null)
@@ -225,6 +228,8 @@ export function Collection({ kind, badge, title, cover, byline, description, tra
         <ShuffleToggle source={source} />
         {actions}
       </div>
+
+      {notice && <div className="px-4 pb-4 sm:px-8">{notice}</div>}
 
       <div className="px-4 sm:px-8">
         <div
@@ -402,6 +407,7 @@ export function PlaylistPage() {
         empty={canEdit ? t.empty : undefined}
         extras={addedBy ?? (mixing ? mixInfo : undefined)}
         extraLabel={addedBy ? t.addedBy : t.tempoKey}
+        notice={mixing ? <MixModeBanner playlistId={id} tracks={list} mixer={mixer.data} canLeave={canEdit} /> : undefined}
         rowMenu={
           mixing && canEdit
             ? (track, index, shown) => {
@@ -435,6 +441,7 @@ export function PlaylistPage() {
                 <DownloadMenuItem downloadKey={`playlist:${id}`} name={item?.Name ?? ''} items={tracks.data} collection={item} />
                 <TasteMenuItem kind="playlists" id={id} />
                 {canEdit && <MixerMenuItems playlistId={id} onBuild={() => setBuilding(true)} />}
+                {canEdit && mixing && <MixModeMenuItem playlistId={id} tracks={list} mixer={mixer.data} />}
                 {mine && (
                   <>
                     <DropdownMenuSeparator />

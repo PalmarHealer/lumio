@@ -19,6 +19,7 @@ import { editDiff } from './timeline-math'
 import { TransitionEditor } from './transition-editor'
 import { useSuggestions } from './use-assist'
 import { useTransitionPreview } from './use-preview'
+import { useDeckStems } from './use-stems'
 
 const messages = defineMessages({
   de: {
@@ -115,6 +116,8 @@ export function TransitionEditorPage() {
   // What is being edited right now (also mid-drag), for the preview.
   const [live, setLive] = useState<Transition | null>(null)
   const preview = useTransitionPreview({ fromId: from, toId: to, transition: live ?? initial, aDuration, bDuration })
+  // Real stems in Mix-Modus, for the transition as last saved or edited (not every drag).
+  const stems = useDeckStems({ playlistId: id, from, to, transition: edited ?? initial, preview })
 
   const suggestions = useSuggestions(aMix, bMix, { from, to }, mixer.data?.style ?? 'clean')
 
@@ -142,7 +145,9 @@ export function TransitionEditorPage() {
 
   const onSave = () => {
     if (!edited) return
-    const transition: Transition = { ...edited, custom: true }
+    // An edited transition plays live until it is baked again (leaving Mix-Modus): its old clip no longer fits.
+    const { baked: _baked, ...rest } = edited
+    const transition: Transition = { ...rest, custom: true }
     save.mutate(
       { transitions: { ...(mixer.data?.transitions ?? {}), [pairKey(from, to)]: transition } },
       {
@@ -204,6 +209,7 @@ export function TransitionEditorPage() {
             preview={preview}
             suggestions={suggestions}
             onStart={setStart}
+            stems={stems}
           />
         </>
       )}

@@ -163,12 +163,14 @@ export interface TrackMix {
   vocalSource: 'lyrics' | 'unplaced' | 'audio' | 'none'
   /**
    * The sung lines when `vocalSource` is 'lyrics', placed like `vocals` but unpadded: `time` where the line starts,
-   * `end` where it is estimated to end (see `vocals`), and `words`, its content words as 32-bit FNV-1a hashes of their
-   * UTF-8 (lowercased, accents folded, apostrophes removed, a plural -s or -ies taken off, English and German stopwords
-   * left out; each word once). Two songs' lines can be matched by word (wordplay: B's line answers A's with the same
-   * word) without their text. Empty otherwise and in analyses made before it.
+   * `end` where it is estimated to end (see `vocals`), `words`, its content words in order (repeats kept) as 32-bit
+   * FNV-1a hashes of their UTF-8 (lowercased, accents folded, apostrophes removed, a plural -s or -ies taken off,
+   * English and German stopwords left out), and `wordTimes`, when each of those words starts (same index): the line
+   * shared out by syllables, each start moved to a clear voice onset within 150 ms. Two songs' lines can be matched by
+   * word (wordplay: B's line answers A's with the same word) without their text. Empty otherwise and in analyses made
+   * before it (and `wordTimes` missing in analyses made before it).
    */
-  lines: Array<{ time: number; end: number; words: number[] }>
+  lines: Array<{ time: number; end: number; words: number[]; wordTimes?: number[] }>
   /**
    * The content words of the track's title, hashed like `lines` (what is in brackets, such as "(feat. …)", left out):
    * a line with a title word is likely the hook. Empty when the title is unknown and in analyses made before it.
@@ -1142,21 +1144,30 @@ function fnv1a(text: string) {
   return hash
 }
 
-/**
- * The content words of a text as FNV-1a hashes (see TrackMix.lines): lowercased, accents folded, apostrophes removed,
- * stopwords left out, a plural -s (or -ies) taken off; each word once.
- */
-export function wordHashes(text: string): number[] {
-  const words = text
+/** A text's words as the fingerprints see them: lowercased, accents folded, apostrophes removed, in order. */
+function plainWords(text: string): string[] {
+  return text
     .normalize('NFKD')
     .replace(/\p{M}/gu, '')
     .toLowerCase()
     .replace(/['’`´]/g, '')
     .split(/[^\p{L}\p{N}]+/u)
-    .filter((word) => word && !STOPWORDS.has(word))
-    .map((word) => (word.length > 4 && word.endsWith('ies') ? word.slice(0, -3) + 'y' : word.length > 3 && word.endsWith('s') && !word.endsWith('ss') ? word.slice(0, -1) : word))
-  return [...new Set(words)].map(fnv1a)
+    .filter(Boolean)
 }
+
+/** A content word's fingerprint (see TrackMix.lines): a plural -s (or -ies) taken off, FNV-1a; null for a stopword. */
+function wordHash(word: string): number | null {
+  if (STOPWORDS.has(word)) return null
+  return fnv1a(word.length > 4 && word.endsWith('ies') ? word.slice(0, -3) + 'y' : word.length > 3 && word.endsWith('s') && !word.endsWith('ss') ? word.slice(0, -1) : word)
+}
+
+/** The content words of a text as hashes (see TrackMix.lines), each once (for the title). */
+export function wordHashes(text: string): number[] {
+  return [...new Set(plainWords(text).flatMap((word) => wordHash(word) ?? []))]
+}
+
+/** About how many syllables a word has: its groups of vowels, at least one. */
+const syllables = (word: string) => Math.max(1, (word.match(/[aeiouyäöü]+/g) ?? []).length)
 
 /**
  * How the lyrics' sung stretches, moved by a number of frames, correlate with the vocal activity (Pearson over the
@@ -1673,11 +1684,37 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
       }
       vocalSource = 'lyrics'
       const placedAt = offset
-      wordLines = sungLines(usable).map((line) => ({
-        time: round(clamp(line.time + placedAt, 0, duration), 2),
-        end: round(clamp(line.end + placedAt, 0, duration), 2),
-        words: wordHashes(line.text),
-      }))
+      // Where each word starts: the line's time shared out by syllables (all its words, stopwords too, sung at an even
+      // pace up to the line's end), then each start moved to the strongest voice onset within 150 ms, where one stands
+      // out (the rise of the centre's vocal band, 300–3000 Hz, at least twice its typical rise).
+      const voiceRise = new Float64Array(spectra.count)
+      for (let i = 1; i < spectra.count; i++) voiceRise[i] = Math.max(0, Math.log(spectra.centre[i]! + 1e-9) - Math.log(spectra.centre[i - 1]! + 1e-9))
+      const typicalRise = quantile(voiceRise, 0.75) || 1e-9
+      const onsetNear = (time: number) => {
+        const centre = Math.round((time - spectra.time(0)) * spectra.rate)
+        const reach = Math.round(0.15 * spectra.rate)
+        let best = -1
+        for (let i = Math.max(1, centre - reach); i <= Math.min(spectra.count - 1, centre + reach); i++) if (best < 0 || voiceRise[i]! > voiceRise[best]!) best = i
+        return best >= 0 && voiceRise[best]! >= 2 * typicalRise ? spectra.time(best) - 0.5 / spectra.rate : time
+      }
+      wordLines = sungLines(usable).map((line) => {
+        const words = plainWords(line.text)
+        const total = words.reduce((sum, word) => sum + syllables(word), 0)
+        const start = line.time + placedAt
+        const pace = (line.end - line.time) / Math.max(1, total)
+        const hashes: number[] = []
+        const times: number[] = []
+        let at = 0
+        for (const word of words) {
+          const hash = wordHash(word)
+          if (hash !== null) {
+            hashes.push(hash)
+            times.push(round(clamp(onsetNear(start + at * pace), 0, duration), 2))
+          }
+          at += syllables(word)
+        }
+        return { time: round(clamp(start, 0, duration), 2), end: round(clamp(line.end + placedAt, 0, duration), 2), words: hashes, wordTimes: times }
+      })
       // Counted without what is in brackets (backing vocals, ad-libs), so "Don't show up (don't show up)" is the line.
       const normal = (text: string) => text.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
       const counts = new Map<string, number>()

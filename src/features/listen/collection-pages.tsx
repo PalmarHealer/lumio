@@ -14,6 +14,7 @@ import {
   IconVinyl,
   IconWorld,
 } from '@tabler/icons-react'
+import { useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState, type ReactNode } from 'react'
 import { Navigate, useNavigate, useParams } from 'react-router'
 import { ModeTile } from '@/components/app-switcher'
@@ -44,7 +45,7 @@ import { TasteMenuItem } from './taste'
 import { DownloadButton, DownloadMenuItem } from './download-ui'
 import { useHeldByDownload } from './download-ui'
 import { MixerBadge, MixerMenuItems, SortBuildDialog } from './mixer/mixer-ui'
-import { useMixInfo, usePlaylistMixer, useStableLumioFetch } from './mixer/queries'
+import { mixerKey, useMixInfo, usePlaylistMixer, useStableLumioFetch } from './mixer/queries'
 import { PlaylistSortMenu } from './playlist-sort-menu'
 import { dropStaleBakes } from './mixer/mixmode/bake'
 import { MixModeBanner, MixModeMenuItem } from './mixer/mixmode/mix-mode-ui'
@@ -361,6 +362,7 @@ export function PlaylistPage() {
   const mixer = usePlaylistMixer(id)
   const mixing = mixer.data?.on === true
   const lumioFetch = useStableLumioFetch()
+  const queryClient = useQueryClient()
   const shareInfo = infos.data?.find((info) => info.playlist.Id === id)
   const adds = usePlaylistAdds(id, (shareInfo?.editors.length ?? 0) > 1).data
   // A mixer playlist shows each song's tempo and key (what its transitions are planned with) where a shared one shows
@@ -431,7 +433,17 @@ export function PlaylistPage() {
                 const order = list.map((entry) => entry.Id ?? '')
                 const from = list.findIndex((entry) => entry.PlaylistItemId === track.PlaylistItemId)
                 if (from >= 0) order.splice(index, 0, ...order.splice(from, 1))
-                actions.move.mutate({ playlistId: id, entryId: track.PlaylistItemId, index }, { onSuccess: () => mixing && void dropStaleBakes(lumioFetch, id, order) })
+                actions.move.mutate(
+                  { playlistId: id, entryId: track.PlaylistItemId, index },
+                  {
+                    onSuccess: () => {
+                      if (!mixing) return
+                      void dropStaleBakes(lumioFetch, id, order).then((changed) => {
+                        if (changed) void queryClient.invalidateQueries({ queryKey: mixerKey(id) })
+                      })
+                    },
+                  },
+                )
               }
             : undefined
         }

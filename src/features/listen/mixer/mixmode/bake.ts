@@ -1,6 +1,8 @@
 import type { Api } from '@jellyfin/sdk'
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
+import { getPlaylistApi } from '@jellyfin/sdk/lib/utils/api/playlist-api'
 import type { LumioFetch } from '@/features/social/social'
+import { ticksToSeconds } from '@/lib/format'
 import { bakeKey, bakeTransition, clipRange, ENGINE_VERSION, sourceIdentity, wav24 } from '../baked'
 import { deckPlan, trackSpan } from '../deck-schedule'
 import { loadDeckAudio } from '../editor/audio'
@@ -9,7 +11,7 @@ import type { RenderStems } from '../render'
 import type { PlaylistMixer, Transition } from '../types'
 import { laneStems, stemsToLoad } from './lane-stems'
 import { loadStem, stemStatus, type StemWindowStatus } from './mix-mode'
-import { covered } from './windows'
+import { covered, MAX_SONG } from './windows'
 
 /**
  * Baking one transition when a playlist leaves Mix-Modus: both songs' audio (as far as the clip reaches) and their real
@@ -36,8 +38,10 @@ const toBuffer = (source: PreviewSource) => {
 }
 
 /** The song's real stems over [from, to] of its track, when one separated window covers it; else none (approximated). */
-async function stemsFor(deps: BakeDeps, item: string, windows: StemWindowStatus[] | undefined, from: number, to: number, context: BaseAudioContext): Promise<RenderStems | undefined> {
-  const window = windows?.find((w) => w.state === 'ready' && covered([w.window], Math.max(0, from - 1), to + 1))
+async function stemsFor(deps: BakeDeps, item: string, windows: StemWindowStatus[] | undefined, from: number, to: number, duration: number, context: BaseAudioContext): Promise<RenderStems | undefined> {
+  // A second to spare either side, but never past the song (or what the server separates): the windows end there.
+  const end = Math.min(to + 1, duration > 0 ? duration : Infinity, MAX_SONG)
+  const window = windows?.find((w) => w.state === 'ready' && covered([w.window], Math.max(0, from - 1), end))
   if (!window) return undefined
   const names = stemsToLoad()
   const loaded = await Promise.all(names.map((stem) => loadStem(deps.lumioFetch, item, window.window, stem, context)))
@@ -60,8 +64,8 @@ export async function bakePair(deps: BakeDeps, playlistId: string, items: { a: B
     stemStatus(deps.lumioFetch, [from, to]).catch(() => ({}) as Record<string, StemWindowStatus[]>),
   ])
   const [stemsA, stemsB] = await Promise.all([
-    stemsFor(deps, from, status[from], reachA.from, reachA.to, decode).catch(() => undefined),
-    stemsFor(deps, to, status[to], reachB.from, reachB.to, decode).catch(() => undefined),
+    stemsFor(deps, from, status[from], reachA.from, reachA.to, ticksToSeconds(items.a.RunTimeTicks ?? 0), decode).catch(() => undefined),
+    stemsFor(deps, to, status[to], reachB.from, reachB.to, ticksToSeconds(items.b.RunTimeTicks ?? 0), decode).catch(() => undefined),
   ])
   const clip = await bakeTransition({ a: toBuffer(a), b: toBuffer(b), transition, stems: { a: stemsA, b: stemsB } })
   const key = await bakeKey({ playlist: playlistId, transition, a: sourceIdentity(items.a), b: sourceIdentity(items.b) })
@@ -100,19 +104,35 @@ export async function attachBaked(lumioFetch: LumioFetch, playlistId: string, pa
  * After the playlist's order changed: baked clips of pairs that are no longer neighbours are let go (their transitions
  * stay, as the user made them; only the reference to the clip goes, and the server frees clips nothing refers to).
  */
-export async function dropStaleBakes(lumioFetch: LumioFetch, playlistId: string, order: readonly string[]) {
-  const response = await lumioFetch(`/music/mixer/${playlistId}`).catch(() => null)
-  if (!response?.ok) return
-  const current = (await response.json()) as PlaylistMixer
-  const neighbours = new Set(order.slice(1).map((to, i) => `${order[i]}>${to}`))
-  let changed = false
-  const transitions = Object.fromEntries(
-    Object.entries(current.transitions ?? {}).map(([pair, transition]) => {
-      if (!transition.baked || neighbours.has(pair)) return [pair, transition]
-      changed = true
-      const { baked: _baked, ...rest } = transition
-      return [pair, rest as Transition]
-    }),
-  )
-  if (changed) await lumioFetch(`/music/mixer/${playlistId}`, { method: 'PUT', body: JSON.stringify({ ...current, transitions }) }).catch(() => null)
+export async function dropStaleBakes(lumioFetch: LumioFetch, playlistId: string, order: readonly string[]): Promise<boolean> {
+  const neighbours = new Set(neighbourPairs(order))
+  // On top of the settings as they are; again when someone (a bake, another editor) saved in between (409).
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await lumioFetch(`/music/mixer/${playlistId}`).catch(() => null)
+    if (!response?.ok) return false
+    const current = (await response.json()) as PlaylistMixer
+    let changed = false
+    const transitions = Object.fromEntries(
+      Object.entries(current.transitions ?? {}).map(([pair, transition]) => {
+        if (!transition.baked || neighbours.has(pair)) return [pair, transition]
+        changed = true
+        const { baked: _baked, ...rest } = transition
+        return [pair, rest as Transition]
+      }),
+    )
+    if (!changed) return false
+    const saved = await lumioFetch(`/music/mixer/${playlistId}`, { method: 'PUT', body: JSON.stringify({ ...current, transitions }) }).catch(() => null)
+    if (saved?.ok) return true
+    if (saved?.status !== 409) return false
+  }
+  return false
+}
+
+/** The pair keys of neighbouring songs in an order. */
+export const neighbourPairs = (order: readonly string[]) => order.slice(1).map((to, i) => `${order[i]}>${to}`)
+
+/** The playlist's song order as Jellyfin has it now. */
+export async function playlistOrder(deps: BakeDeps, playlistId: string): Promise<string[]> {
+  const items = (await getPlaylistApi(deps.api).getPlaylistItems({ playlistId, userId: deps.userId })).data.Items ?? []
+  return items.map((item) => item.Id ?? '')
 }

@@ -1,7 +1,7 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
 import { IconAlertTriangle, IconLoader2, IconWaveSine } from '@tabler/icons-react'
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { DropdownMenuItem } from '@/components/ui/dropdown-menu'
@@ -120,6 +120,20 @@ export function MixModeBanner({ playlistId, tracks, mixer, canLeave }: { playlis
     },
     queryFn: () => stemStatus(lumioFetch, songIds),
   })
+  // Windows the server doesn't know (any more: it was restarted, its queue is gone) are asked for again once by
+  // themselves; after that they count as failed, with "Erneut versuchen".
+  const [askedAgain, setAskedAgain] = useState(false)
+  const asking = useRef(false)
+  const lost = status.data ? songIds.filter((id) => ['missing', 'none'].includes(songStemState(status.data[id]))).length : 0
+  const refetch = status.refetch
+  useEffect(() => {
+    if (state?.phase !== 'on' || !lost || asking.current || !canLeave) return
+    asking.current = true
+    void heat(lumioFetch, playlistId, tracks, mixer).then(() => {
+      setAskedAgain(true)
+      void refetch()
+    })
+  }, [state?.phase, lost, canLeave, lumioFetch, playlistId, tracks, mixer, refetch])
   if (!state) return null
 
   if (state.phase === 'baking') {
@@ -135,7 +149,7 @@ export function MixModeBanner({ playlistId, tracks, mixer, canLeave }: { playlis
 
   const states = songIds.map((id) => songStemState(status.data?.[id]))
   const ready = states.filter((s) => s === 'ready').length
-  const failed = states.filter((s) => s === 'failed').length
+  const failed = states.filter((s) => s === 'failed' || (askedAgain && (s === 'missing' || s === 'none'))).length
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-lg border border-listen/30 bg-listen/10 px-4 py-3 text-sm">
       <IconWaveSine className="size-4 text-listen" />

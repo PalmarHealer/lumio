@@ -8,7 +8,7 @@ import { defineMessages, useMessages } from '@/lib/i18n'
 import { bakeKey, sourceIdentity } from '../baked'
 import { mixerKey, useStableLumioFetch } from '../queries'
 import type { PlaylistMixer } from '../types'
-import { attachBaked, bakePair, type BakeDeps } from './bake'
+import { attachBaked, bakePair, neighbourPairs, playlistOrder, type BakeDeps } from './bake'
 import { mixModeOf, releaseStems, setMixMode, useMixModes } from './mix-mode'
 
 const messages = defineMessages({
@@ -98,6 +98,10 @@ async function bakeOne(deps: BakeDeps, playlistId: string, pair: string): Promis
   const sources = { a: sourceIdentity(a), b: sourceIdentity(b) }
   // Baked as it is already: nothing to do.
   if (transition.baked?.key && transition.baked.key === (await bakeKey({ playlist: playlistId, transition, ...sources }))) return 'baked'
+  // Only songs that are neighbours (now, and still after the bake): a clip of a pair moved apart would never play.
+  const adjacent = async () => neighbourPairs(await playlistOrder(deps, playlistId)).includes(pair)
+  if (!(await adjacent())) return 'skipped'
   const key = await bakePair(deps, playlistId, { a, b }, transition)
+  if (!(await adjacent())) return 'skipped'
   return (await attachBaked(deps.lumioFetch, playlistId, pair, key, sources)) ? 'baked' : 'skipped'
 }

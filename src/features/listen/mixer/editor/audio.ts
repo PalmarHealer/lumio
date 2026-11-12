@@ -22,8 +22,13 @@ export async function loadDeckAudio(options: {
   const { api, userId, accessToken, deviceId, id, until, context, signal } = options
   const downloaded = await downloadedAudioUrl(id)
   if (downloaded) {
-    const slice = await blobSlice(downloaded, 0, until, context)
-    return { channels: slice.channels, origin: slice.start, sampleRate: slice.sampleRate }
+    try {
+      const slice = await blobSlice(downloaded, 0, until, context)
+      return { channels: slice.channels, origin: slice.start, sampleRate: slice.sampleRate }
+    } finally {
+      // The object URL is a whole song held in memory: let it go once decoded (or not).
+      URL.revokeObjectURL(downloaded)
+    }
   }
   const params = new URLSearchParams({
     UserId: userId,

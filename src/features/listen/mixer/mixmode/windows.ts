@@ -11,6 +11,8 @@ import type { Transition } from '../types.ts'
  */
 
 export const MAX_WINDOW = 300
+/** The server separates nothing past this far into a song (its MAX_SONG). */
+export const MAX_SONG = 1200
 export const MAX_WINDOWS = 8
 /** Around what a stored transition plays (its pre- and post-roll in the editor, and a little more). */
 const MARGIN_S = 10
@@ -33,10 +35,14 @@ export function transitionWindows(transition: Transition): { a: Window; b: Windo
   }
 }
 
-/** Overlapping or touching windows joined, long ones cut into pieces the server takes, at most `MAX_WINDOWS`. */
+/**
+ * Overlapping or touching windows joined, long ones cut into pieces the server takes (each shorter than `MAX_WINDOW`
+ * even after rounding to milliseconds, none past `MAX_SONG`), at most `MAX_WINDOWS`.
+ */
 export function tidyWindows(windows: readonly Window[], duration: number): Window[] {
+  const limit = Number.isFinite(duration) && duration > 0 ? Math.min(duration, MAX_SONG) : MAX_SONG
   const clamped = windows
-    .map((w) => ({ start: Math.max(0, w.start), end: Number.isFinite(duration) && duration > 0 ? Math.min(duration, w.end) : w.end }))
+    .map((w) => ({ start: Math.max(0, w.start), end: Math.min(limit, w.end) }))
     .filter((w) => w.end - w.start > 0.5)
     .sort((x, y) => x.start - y.start)
   const joined: Window[] = []
@@ -47,7 +53,10 @@ export function tidyWindows(windows: readonly Window[], duration: number): Windo
   }
   const pieces: Window[] = []
   for (const w of joined) {
-    for (let start = w.start; start < w.end - 0.5; start += MAX_WINDOW) pieces.push({ start: round(start), end: round(Math.min(w.end, start + MAX_WINDOW)) })
+    // Rounded first, then measured: a piece is never longer than the server allows (a millisecond to spare).
+    for (let start = round(w.start); start < w.end - 0.5; start = round(start + MAX_WINDOW - 0.001)) {
+      pieces.push({ start, end: Math.min(round(w.end), round(start + MAX_WINDOW - 0.001)) })
+    }
   }
   return pieces.slice(0, MAX_WINDOWS)
 }
@@ -85,4 +94,18 @@ export function covered(windows: readonly Window[], start: number, end: number):
     if (at >= end - 0.01) return true
   }
   return at >= end - 0.01
+}
+
+/** Whether the server takes a window (it turns down a whole request for one it doesn't). */
+export const validWindow = (w: Window) => w.start >= 0 && w.end > w.start && w.end - w.start <= MAX_WINDOW && w.end <= MAX_SONG
+
+/**
+ * One stretch the editor needs real stems for, as a window the server takes: inside the song and `MAX_SONG`, at most
+ * `MAX_WINDOW` long (a longer reach keeps its start; the rest plays approximated).
+ */
+export function neededWindow(w: Window, duration: number): Window | null {
+  const end = Math.min(w.end, Number.isFinite(duration) && duration > 0 ? duration : Infinity, MAX_SONG)
+  const start = round(Math.max(0, w.start))
+  const clamped = { start, end: Math.min(round(end), round(start + MAX_WINDOW - 0.001)) }
+  return clamped.end - clamped.start > 0.5 ? clamped : null
 }

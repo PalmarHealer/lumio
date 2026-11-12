@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react'
 import type { LumioFetch } from '@/features/social/social'
 import type { PreviewSource } from '../preview'
 import { pairKey, type Transition } from '../types'
-import type { Window } from './windows'
+import { validWindow, type Window } from './windows'
 
 /**
  * "Mix-Modus" of a playlist (spec §4, Tier B): entering it pre-heats the playlist (the server separates stems for the
@@ -68,12 +68,26 @@ export type PreheatAnswer = { queued: number; ready: number } | 'unavailable' | 
 
 /** Asks for the songs' stems (their windows), held for the playlist. 'unavailable': the server has no stem worker. */
 export async function preheat(lumioFetch: LumioFetch, playlistId: string, items: Array<{ id: string; windows: Window[] }>): Promise<PreheatAnswer> {
-  const response = await lumioFetch('/music/stems/preheat', { method: 'POST', body: JSON.stringify({ playlistId, items }) }).catch(() => null)
+  // Only windows the server takes (it turns down the whole request for one it doesn't).
+  const wanted = items.map((item) => ({ id: item.id, windows: item.windows.filter(validWindow) })).filter((item) => item.windows.length)
+  if (!wanted.length) return { queued: 0, ready: 0 }
+  const ask = async (list: typeof wanted) => lumioFetch('/music/stems/preheat', { method: 'POST', body: JSON.stringify({ playlistId, items: list }) }).catch(() => null)
+  const response = await ask(wanted)
   if (!response) return 'failed'
   if (response.status === 503) return 'unavailable'
   if (response.status === 403) return 'forbidden'
-  if (!response.ok) return 'failed'
-  return (await response.json()) as { queued: number; ready: number }
+  if (response.ok) return (await response.json()) as { queued: number; ready: number }
+  if (response.status !== 400 || wanted.length < 2) return 'failed'
+  // Turned down as a whole: one song at a time, so one the server won't take doesn't keep the others from it.
+  const total = { queued: 0, ready: 0 }
+  for (const item of wanted) {
+    const single = await ask([item])
+    if (!single?.ok) continue
+    const counts = (await single.json()) as { queued: number; ready: number }
+    total.queued += counts.queued
+    total.ready += counts.ready
+  }
+  return total
 }
 
 /** Lets go of the playlist's stems (the server deletes those no other playlist holds). */
@@ -93,9 +107,14 @@ export async function stemStatus(lumioFetch: LumioFetch, ids: readonly string[])
 }
 
 /** Where a song stands: all its windows separated, some still coming, or one failed. */
-export function songStemState(windows: readonly StemWindowStatus[] | undefined): 'ready' | 'waiting' | 'failed' | 'none' {
+/**
+ * Where a song stands: all its windows separated, some still coming, one failed, or one the server has lost (it was
+ * restarted: its queue is gone, the window must be asked for again).
+ */
+export function songStemState(windows: readonly StemWindowStatus[] | undefined): 'ready' | 'waiting' | 'failed' | 'missing' | 'none' {
   if (!windows?.length) return 'none'
   if (windows.some((w) => w.state === 'failed')) return 'failed'
+  if (windows.some((w) => w.state === 'missing')) return 'missing'
   return windows.every((w) => w.state === 'ready') ? 'ready' : 'waiting'
 }
 

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { laneStems, stemsToLoad } from '../mixmode/lane-stems'
 import { loadStem, preheat, stemStatus, useMixMode, type StemWindowStatus } from '../mixmode/mix-mode'
-import { covered, transitionWindows, type Window } from '../mixmode/windows'
+import { covered, neededWindow, transitionWindows, type Window } from '../mixmode/windows'
 import { useStableLumioFetch } from '../queries'
 import type { Transition } from '../types'
 import type { PreviewControls } from './use-preview'
@@ -21,19 +21,29 @@ const windowFor = (windows: StemWindowStatus[] | undefined, need: Window) => win
  * stems of each deck's window and hands them to the preview (see lane-stems.ts: vocals, drums, and the rest as the
  * instrumental; the bass stays on the EQ). Outside Mix-Modus both decks stay approximated.
  */
-export function useDeckStems(options: { playlistId: string; from: string; to: string; transition: Transition | null; preview: PreviewControls }): { a: DeckStems; b: DeckStems } {
-  const { playlistId, from, to, transition, preview } = options
+export function useDeckStems(options: {
+  playlistId: string
+  from: string
+  to: string
+  transition: Transition | null
+  preview: PreviewControls
+  /** Song lengths (seconds): the windows stay inside the songs. */
+  durations: { a: number; b: number }
+}): { a: DeckStems; b: DeckStems } {
+  const { playlistId, from, to, transition, preview, durations } = options
   const mode = useMixMode(playlistId)
   const on = mode?.phase === 'on'
   const lumioFetch = useStableLumioFetch()
   const [state, setState] = useState<{ a: DeckStems; b: DeckStems }>({ a: 'approx', b: 'approx' })
-  // The windows needed, rounded to whole seconds so small edits don't ask again.
+  // The windows needed, rounded to whole seconds so small edits don't ask again, and cut to what the server takes.
   const needed = useMemo(() => {
     if (!transition) return null
     const w = transitionWindows(transition)
     const round = (x: Window) => ({ start: Math.floor(x.start), end: Math.ceil(x.end) })
-    return { a: round(w.a), b: round(w.b) }
-  }, [transition])
+    const a = neededWindow(round(w.a), durations.a)
+    const b = neededWindow(round(w.b), durations.b)
+    return a && b ? { a, b } : null
+  }, [transition, durations.a, durations.b])
   const neededKey = needed ? `${needed.a.start}-${needed.a.end}|${needed.b.start}-${needed.b.end}` : ''
   const ready = preview.status === 'ready'
   const setStems = preview.setStems
@@ -61,8 +71,13 @@ export function useDeckStems(options: { playlistId: string; from: string; to: st
       }
       if (stopped) return
       const decks = { a: { id: from, need: needed.a }, b: { id: to, need: needed.b } }
-      // Stretches no window covers yet are asked for (once per check run).
-      const missing = (['a', 'b'] as const).filter((deck) => !windowFor(status[decks[deck].id], decks[deck].need))
+      // Stretches no window covers yet, or covers in a window the server has lost (restarted), are asked for, once
+      // per run; still lost after that, they count as failed.
+      const missing = (['a', 'b'] as const).filter((deck) => {
+        const window = windowFor(status[decks[deck].id], decks[deck].need)
+        return !window || window.state === 'missing'
+      })
+      const askedBefore = asked
       if (missing.length && !asked) {
         asked = true
         await preheat(
@@ -74,6 +89,10 @@ export function useDeckStems(options: { playlistId: string; from: string; to: st
       let waiting = false
       for (const deck of ['a', 'b'] as const) {
         const window = windowFor(status[decks[deck].id], decks[deck].need)
+        if (window?.state === 'missing' && asked && askedBefore) {
+          setState((before) => ({ ...before, [deck]: 'failed' }))
+          continue
+        }
         if (!window || window.state === 'queued' || window.state === 'running' || window.state === 'missing') {
           waiting = true
           setState((before) => ({ ...before, [deck]: 'loading' }))

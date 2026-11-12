@@ -162,7 +162,9 @@ export function usePlaylistReorder(playlistId: string) {
         await queryClient.invalidateQueries({ queryKey: tracksKey })
         // Baked clips of pairs that are no longer neighbours are let go (mixer playlists).
         const now = queryClient.getQueryData<BaseItemDto[]>(tracksKey)
-        if (now) void dropStaleBakes(lumioFetch, playlistId, now.map((track) => track.Id ?? '')).then(() => queryClient.invalidateQueries({ queryKey: mixerKey(playlistId) }))
+        if (now) void dropStaleBakes(lumioFetch, playlistId, now.map((track) => track.Id ?? '')).then((changed) => {
+            if (changed) void queryClient.invalidateQueries({ queryKey: mixerKey(playlistId) })
+          })
         // Whatever was reached, the order before can be had back.
         if (remember && before) setPrevious(playlistId, before)
       }

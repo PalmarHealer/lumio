@@ -117,7 +117,7 @@ export function TransitionEditorPage() {
   const [live, setLive] = useState<Transition | null>(null)
   const preview = useTransitionPreview({ fromId: from, toId: to, transition: live ?? initial, aDuration, bDuration })
   // Real stems in Mix-Modus, for the transition as last saved or edited (not every drag).
-  const stems = useDeckStems({ playlistId: id, from, to, transition: edited ?? initial, preview })
+  const stems = useDeckStems({ playlistId: id, from, to, transition: edited ?? initial, preview, durations: { a: aDuration, b: bDuration } })
 
   const suggestions = useSuggestions(aMix, bMix, { from, to }, mixer.data?.style ?? 'clean')
 

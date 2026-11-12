@@ -130,10 +130,10 @@ export interface TrackMix {
   /**
    * Each band's level where its curve in `bands` is 1 (the band's loudest frame), in dB of full scale like `loudness`
    * (the mean square of the samples in that band; one scale for every song). A frame's absolute band level is
-   * bandLoudness + 20·log10(curve value), so A's and B's lows, mids and highs can be compared. 0 for all three in
-   * analyses made before it.
+   * bandLoudness + 20·log10(curve value), so A's and B's lows, mids and highs can be compared. Missing in analyses made
+   * before it.
    */
-  bandLoudness: { low: number; mid: number; high: number }
+  bandLoudness?: { low: number; mid: number; high: number }
   /** The song's structure, in order, covering the whole track. */
   sections: MixSection[]
   /** Drop moments (a phrase start where bass and energy jump after a build-up). */
@@ -1539,7 +1539,8 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     const stayClear = !!stay && (stay.z ?? 0) >= 1.8 && stay.fit >= 0.3 && (stay.repetition ?? 0) >= 2 && placed.every((placement) => placement.fit <= stay.fit)
     if (best && best.repetition === null) offset = stay && placed.every((placement) => placement.fit <= stay.fit + 0.1) ? 0 : null
     else if (best && best.offset === 0) offset = best.repetition! >= 4 || stayFits || stayBest || stayClear ? 0 : null
-    else if (best) offset = best.repetition! >= 5 && best.fit >= 0.2 && best.fit >= (stay?.fit ?? -1) + 0.08 ? best.offset : stayFits || stayClear ? 0 : null
+    // A better-scoring place that isn't clearly better (moving takes more): judged by the rules for staying instead.
+    else if (best) offset = best.repetition! >= 5 && best.fit >= 0.2 && best.fit >= (stay?.fit ?? -1) + 0.08 ? best.offset : (stay?.repetition ?? -Infinity) >= 4 || stayFits || stayBest || stayClear ? 0 : null
     // Decoys: the same lyrics on timelines they can't belong to (mirrored, rotated by about a third, a half and two
     // thirds of their span, mirrored and rotated), scored alike: the best of them is what these lyrics score on this
     // song by chance (one that sounds alike all through, or is sung all through, scores any lyrics high). The chosen

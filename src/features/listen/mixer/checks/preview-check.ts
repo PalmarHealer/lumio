@@ -141,6 +141,15 @@ export async function checkPreview() {
   await wait(0.5)
   const scrub = { clicks: onsetsOf(blocks).filter((t) => t > scrubAt).length, playing: preview.playing }
 
+  // 5. A real stem arriving: B's whole track as its "voice" stem, the voice lane at 0: B falls silent.
+  await preview.setStems('b', { vocals: b })
+  preview.setTransition(transition({ b: { ...neutral(), vocals: [{ t: 0, v: 0 }] } }))
+  const stemAt = ctx.currentTime
+  preview.play(3)
+  await wait(1)
+  preview.pause()
+  const realStem = { clicks: onsetsOf(blocks).filter((t) => t > stemAt).length, peakDb: +peakOf(blocks, stemAt + 0.3, stemAt + 1).toFixed(1) }
+
   preview.dispose()
   await ctx.close()
   const pass =
@@ -154,5 +163,5 @@ export async function checkPreview() {
     timingEdit.gapsOnGrid &&
     scrub.clicks >= 1 &&
     !scrub.playing
-  return { loop, positionsInLoop, automationEdit, timingEdit, scrub, pass }
+  return { loop, positionsInLoop, automationEdit, timingEdit, scrub, realStem, pass: pass && realStem.clicks === 0 && realStem.peakDb < -60 }
 }

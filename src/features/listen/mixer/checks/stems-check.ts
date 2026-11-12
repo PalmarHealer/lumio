@@ -1,4 +1,4 @@
-import { createDeck, loadEngineWorklets, scheduleAutomation } from '../engine'
+import { createDeck, loadEngineWorklets, scheduleAutomation, switchToRealStem } from '../engine'
 import type { DeckAutomation } from '../types'
 
 /**
@@ -11,8 +11,17 @@ const RATE = 48000
 
 const neutral = (): DeckAutomation => ({ gain: [], low: [], mid: [], high: [], filter: [] })
 
-/** `seconds` of `source` (from `from`) through a deck with `lanes` (stem lane values held throughout). */
-export async function listen(source: AudioBuffer, from: number, seconds: number, lanes: { drums?: number; vocals?: number; instrumental?: number }) {
+/**
+ * `seconds` of `source` (from `from`) through a deck with `lanes` (stem lane values held throughout), and real stems
+ * (aligned with `source`) in place of the approximation where given.
+ */
+export async function listen(
+  source: AudioBuffer,
+  from: number,
+  seconds: number,
+  lanes: { drums?: number; vocals?: number; instrumental?: number },
+  real: Partial<Record<'drums' | 'vocals' | 'instrumental', AudioBuffer>> = {},
+) {
   const rate = source.sampleRate
   const ctx = new OfflineAudioContext(2, Math.round(seconds * rate), rate)
   await loadEngineWorklets(ctx)
@@ -20,6 +29,11 @@ export async function listen(source: AudioBuffer, from: number, seconds: number,
   const player = new AudioBufferSourceNode(ctx, { buffer: source })
   player.connect(deck.input)
   player.start(0, from)
+  for (const [stem, buffer] of Object.entries(real) as Array<['drums' | 'vocals' | 'instrumental', AudioBuffer]>) {
+    const stemPlayer = new AudioBufferSourceNode(ctx, { buffer })
+    stemPlayer.start(0, from)
+    switchToRealStem(deck, stem, stemPlayer, 0, 0)
+  }
   const automation = neutral()
   for (const [lane, value] of Object.entries(lanes) as Array<[keyof typeof lanes, number]>) automation[lane] = [{ t: 0, v: value }]
   scheduleAutomation(deck, automation, 0)
@@ -58,6 +72,13 @@ export async function checkStems() {
   // What is left is the bass alone: left and right alike.
   let wide = 0
   for (let i = RATE; i < 2 * RATE; i++) wide = Math.max(wide, Math.abs(noPad.getChannelData(0)[i]! - right[i]!))
-  const report = { voiceRemovedDb: removed, directExact: exact, splitRounding: rounding, padLeftDb: 20 * Math.log10(wide / 2 + 1e-12) }
-  return { ...report, pass: removed < -20 && exact === 0 && rounding < 1e-5 && report.padLeftDb < -30 }
+  // The voice's real stem: the voice lane at 0 takes it away completely, the wide pad stays.
+  const mix = toneBuffer((t, c) => 0.3 * Math.sin(2 * Math.PI * 1000 * t) + (c ? -1 : 1) * 0.2 * Math.sin(2 * Math.PI * 3000 * t), 2)
+  const voice = toneBuffer((t) => 0.3 * Math.sin(2 * Math.PI * 1000 * t), 2)
+  const withStem = await listen(mix, 0, 2, { vocals: 0 }, { vocals: voice })
+  const padOnly = toneBuffer((t, c) => (c ? -1 : 1) * 0.2 * Math.sin(2 * Math.PI * 3000 * t), 2)
+  let residue = 0
+  for (let i = RATE; i < 2 * RATE; i++) residue = Math.max(residue, Math.abs(withStem.getChannelData(0)[i]! - padOnly.getChannelData(0)[i]!))
+  const report = { voiceRemovedDb: removed, directExact: exact, splitRounding: rounding, padLeftDb: 20 * Math.log10(wide / 2 + 1e-12), realVoiceResidueDb: 20 * Math.log10(residue + 1e-12) }
+  return { ...report, pass: removed < -20 && exact === 0 && rounding < 1e-5 && report.padLeftDb < -30 && report.realVoiceResidueDb < -60 }
 }

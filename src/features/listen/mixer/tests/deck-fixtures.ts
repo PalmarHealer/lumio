@@ -73,7 +73,9 @@ export function fakeDeck(sampleRate = 48000, options: { stems?: boolean } = {}):
     paths: { dry: node(1), coloured: node(0) },
     direct: node(1),
     shaped: node(1),
-    stems: options.stems ? { node: {} as Deck['post'], out: node(0), drums: param(1), vocals: param(1), instrumental: param(1) } : null,
+    stems: options.stems
+      ? { node: {} as Deck['post'], out: node(0), drums: param(1), vocals: param(1), instrumental: param(1), real: { drums: param(0), vocals: param(0), instrumental: param(0) } }
+      : null,
     level: node(1),
     source: null,
     dispose: () => undefined,

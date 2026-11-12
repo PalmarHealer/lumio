@@ -1,6 +1,6 @@
 import { bSettled, deckPlan, positionAt } from './deck-schedule.ts'
 import { tailsEnd } from './engine.ts'
-import { renderTransition } from './render.ts'
+import { renderTransition, type RenderTransitionOptions } from './render.ts'
 import type { Transition } from './types.ts'
 import { locate } from './xcorr.ts'
 
@@ -78,11 +78,11 @@ export interface BakedClip {
 }
 
 /** Renders a transition's clip from the songs' decoded audio (whole songs: their first sample is position 0). */
-export async function bakeTransition(options: { a: AudioBuffer; b: AudioBuffer; transition: Transition; sampleRate?: number }): Promise<BakedClip> {
+export async function bakeTransition(options: { a: AudioBuffer; b: AudioBuffer; transition: Transition; sampleRate?: number; stems?: RenderTransitionOptions['stems'] }): Promise<BakedClip> {
   const sampleRate = Math.min(MAX_CLIP_RATE, options.sampleRate ?? options.a.sampleRate)
   const { start, end } = clipRange(options.transition)
   const length = Math.max(0, options.transition.length)
-  const rendered = await renderTransition({ a: options.a, b: options.b, transition: options.transition, preRoll: -start, postRoll: end - length, sampleRate, parts: true })
+  const rendered = await renderTransition({ a: options.a, b: options.b, transition: options.transition, preRoll: -start, postRoll: end - length, sampleRate, parts: true, stems: options.stems })
   const part = (first: number) => [0, 1].map((c) => Float32Array.from(rendered.getChannelData(first + c), (x) => x * CLIP_GAIN))
   return { start, length: rendered.length / sampleRate, sampleRate, a: part(0), b: part(2) }
 }

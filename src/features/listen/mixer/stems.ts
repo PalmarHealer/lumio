@@ -14,9 +14,23 @@
  *   counts as voice too.
  * - Instrumental: the rest, without its bass (below 150 Hz: the bass stays on the EQ's low lane and always plays).
  *
+ * Real stems, where they have arrived (a separation of the song, perhaps only its voice), take a component's place one
+ * by one (`real`: per stem 0 = approximated, 1 = real, crossfading in between): drums and voice as given, the
+ * instrumental as given or else what remains of the mix without the (real or approximated) drums, voice and bass. What
+ * isn't drums, voice or instrumental always plays (the bass, and whatever the stems leave out), so the output stays
+ * the input whenever the three lanes are at 1.
+ *
  * `StemSplit` is self-contained (no imports, no closures, no class fields that compile to helpers): the AudioWorklet's
  * source is made from its text (`stemsProcessorSource`), and node tests run it directly.
  */
+
+/** Real stems for a block (stereo each, where loaded), and per stem how much of it is used (0–1, one value or `n`). */
+export interface RealStems {
+  drums?: Float32Array[]
+  vocals?: Float32Array[]
+  instrumental?: Float32Array[]
+  use: { drums: Float32Array; vocals: Float32Array; instrumental: Float32Array }
+}
 
 export class StemSplit {
   declare state: Float64Array
@@ -85,7 +99,18 @@ export class StemSplit {
    * Splits `n` frames of `left`/`right` and writes `drums·D + vocals·V + instrumental·I + bass` to `outLeft`/`outRight`
    * (each gain an array of one value or of `n`). With all three at 1 the output is the input (to rounding).
    */
-  run(left: Float32Array, right: Float32Array, outLeft: Float32Array, outRight: Float32Array, drums: Float32Array, vocals: Float32Array, instrumental: Float32Array, n: number) {
+  run(
+    left: Float32Array,
+    right: Float32Array,
+    outLeft: Float32Array,
+    outRight: Float32Array,
+    drums: Float32Array,
+    vocals: Float32Array,
+    instrumental: Float32Array,
+    n: number,
+    real?: RealStems,
+  ) {
+    const at = (values: Float32Array, i: number) => (values.length > 1 ? values[i]! : values[0]!)
     for (let i = 0; i < n; i++) {
       const l = left[i]!
       const r = right[i]!
@@ -119,8 +144,13 @@ export class StemSplit {
       const rLow = this.lp
       this.step(1, 10, r)
       const rHigh = this.hp
-      const dL = this.mask[0]! * lLow + this.mask[1]! * (l - lLow - lHigh) + this.mask[2]! * lHigh
-      const dR = this.mask[0]! * rLow + this.mask[1]! * (r - rLow - rHigh) + this.mask[2]! * rHigh
+      let dL = this.mask[0]! * lLow + this.mask[1]! * (l - lLow - lHigh) + this.mask[2]! * lHigh
+      let dR = this.mask[0]! * rLow + this.mask[1]! * (r - rLow - rHigh) + this.mask[2]! * rHigh
+      const useDrums = real?.drums ? at(real.use.drums, i) : 0
+      if (useDrums > 0) {
+        dL += useDrums * (real!.drums![0]![i]! - dL)
+        dR += useDrums * (real!.drums![1]![i]! - dR)
+      }
       const xL = l - dL
       const xR = r - dR
       // Voice: the centre of the rest in the voice's range, less the octaves that are wide.
@@ -147,20 +177,42 @@ export class StemSplit {
         v -= (1 - weight) * this.bp
       }
       // The rest's bass (what of the low band isn't an attack) always plays.
+      let vL = v
+      let vR = v
+      const useVocals = real?.vocals ? at(real.use.vocals, i) : 0
+      if (useVocals > 0) {
+        vL += useVocals * (real!.vocals![0]![i]! - vL)
+        vR += useVocals * (real!.vocals![1]![i]! - vR)
+      }
       const bassL = (1 - this.mask[0]!) * lLow
       const bassR = (1 - this.mask[0]!) * rLow
-      outLeft[i] = gd * dL + gv * v + gi * (xL - v - bassL) + bassL
-      outRight[i] = gd * dR + gv * v + gi * (xR - v - bassR) + bassR
+      // The instrumental: what remains (without the bass), or the real one.
+      let iL = xL - vL - bassL
+      let iR = xR - vR - bassR
+      const useRest = real?.instrumental ? at(real.use.instrumental, i) : 0
+      if (useRest > 0) {
+        iL += useRest * (real!.instrumental![0]![i]! - iL)
+        iR += useRest * (real!.instrumental![1]![i]! - iR)
+      }
+      // Whatever isn't drums, voice or instrumental always plays: the output is the input with all lanes at 1.
+      outLeft[i] = l + (gd - 1) * dL + (gv - 1) * vL + (gi - 1) * iL
+      outRight[i] = r + (gd - 1) * dR + (gv - 1) * vR + (gi - 1) * iR
     }
   }
 }
 
-/** The AudioWorklet module source: `StemSplit` behind three a-rate gains (drums, vocals, instrumental, 0–1). */
+/**
+ * The AudioWorklet module source: `StemSplit` behind three a-rate gains (drums, vocals, instrumental, 0–1). Inputs: 0
+ * the deck's sound, 1–3 its real drums, voice and instrumental where loaded; `realDrums` etc. (0–1) switch to them.
+ */
 export const stemsProcessorSource = () => `
 const StemSplit = ${StemSplit.toString()}
 class LumioStems extends AudioWorkletProcessor {
   static get parameterDescriptors() {
-    return ['drums', 'vocals', 'instrumental'].map((name) => ({ name, defaultValue: 1, minValue: 0, maxValue: 1, automationRate: 'a-rate' }))
+    return [
+      ...['drums', 'vocals', 'instrumental'].map((name) => ({ name, defaultValue: 1, minValue: 0, maxValue: 1, automationRate: 'a-rate' })),
+      ...['realDrums', 'realVocals', 'realInstrumental'].map((name) => ({ name, defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'a-rate' })),
+    ]
   }
   constructor() {
     super()
@@ -173,7 +225,13 @@ class LumioStems extends AudioWorkletProcessor {
     const n = output[0].length
     const left = input && input[0] ? input[0] : this.silence
     const right = input && input[1] ? input[1] : left
-    this.split.run(left, right, output[0], output[1] || output[0], parameters.drums, parameters.vocals, parameters.instrumental, n)
+    // A real stem counts once it is connected (its input has channels).
+    const stem = (index) => {
+      const channels = inputs[index]
+      return channels && channels.length ? [channels[0], channels[1] || channels[0]] : undefined
+    }
+    const real = { drums: stem(1), vocals: stem(2), instrumental: stem(3), use: { drums: parameters.realDrums, vocals: parameters.realVocals, instrumental: parameters.realInstrumental } }
+    this.split.run(left, right, output[0], output[1] || output[0], parameters.drums, parameters.vocals, parameters.instrumental, n, real.drums || real.vocals || real.instrumental ? real : undefined)
     return true
   }
 }

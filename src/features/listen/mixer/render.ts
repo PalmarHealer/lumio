@@ -1,6 +1,6 @@
 import { bufferDeckKind, createBufferDeck, tempoChangeKind } from './buffer-deck.ts'
 import { bSettled, deckPlan, withBrake } from './deck-schedule.ts'
-import { asPlayed, createDeck, createMaster, limiterLatency, loadEngineWorklets, resetDeck, releaseEcho, releaseReverb, scheduleTransition, tailsEnd, type LimiterStats } from './engine.ts'
+import { asPlayed, createDeck, createMaster, limiterLatency, loadEngineWorklets, resetDeck, releaseEcho, releaseReverb, scheduleTransition, tailsEnd, switchToRealStem, type LimiterStats } from './engine.ts'
 import type { Transition } from './types.ts'
 
 /**
@@ -34,7 +34,11 @@ export interface RenderTransitionOptions {
    * automation, effects and tails, before any level and the limiter (a baked clip, see baked.ts).
    */
   parts?: boolean
+  /** Real stems of either song (whole songs, aligned with `a` / `b`): they replace the stem lanes' approximation. */
+  stems?: { a?: RenderStems; b?: RenderStems }
 }
+
+export type RenderStems = Partial<Record<'drums' | 'vocals' | 'instrumental', AudioBuffer>>
 
 /** Sample-rate independent time → frame conversion used for the render's length. */
 const frames = (seconds: number, sampleRate: number) => Math.max(1, Math.round(seconds * sampleRate))
@@ -102,6 +106,21 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   playerA.play(braked.plan, aFrom, length, zero, braked.semitones)
   playerA.stopAt(zero + length + 0.02)
   playerB.play(planB, bAt, bTo, zero)
+  // Real stems play along with their deck's source, into its stem split.
+  const stemPlayers = []
+  for (const [deck, stems] of [['a', options.stems?.a], ['b', options.stems?.b]] as const) {
+    for (const [stem, buffer] of Object.entries(stems ?? {}) as Array<['drums' | 'vocals' | 'instrumental', AudioBuffer]>) {
+      const out = new GainNode(ctx)
+      const player = await createBufferDeck(ctx, out, deck === 'a' ? playerA.kind : playerB.kind)
+      await player.load(stereo(buffer), 0, buffer.sampleRate)
+      if (deck === 'a') {
+        player.play(braked.plan, aFrom, length, zero, braked.semitones)
+        player.stopAt(zero + length + 0.02)
+      } else player.play(planB, bAt, bTo, zero)
+      switchToRealStem(deck === 'a' ? deckA : deckB, stem, out, 0, 0)
+      stemPlayers.push(player)
+    }
+  }
 
   scheduleTransition({ a: deckA, b: deckB }, transition, zero)
   // As in the player: A's echo rings out after A is gone; B glides back to neutral and plays on.
@@ -114,12 +133,13 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   master?.engage(false, zero + Math.max(length, bSettled(transition), tailsEnd(transition) ?? -Infinity) + 0.05)
 
   // The stretchers' changes travel by message: all must have arrived before rendering runs past them.
-  await Promise.all([playerA.settled(), playerB.settled()])
+  await Promise.all([playerA, playerB, ...stemPlayers].map((player) => player.settled()))
 
   // Without the lead and the limiter's delay at the front.
   const rendered = await ctx.startRendering()
   playerA.dispose()
   playerB.dispose()
+  for (const player of stemPlayers) player.dispose()
   const out = new AudioBuffer({ numberOfChannels: rendered.numberOfChannels, length: wanted, sampleRate })
   for (let channel = 0; channel < rendered.numberOfChannels; channel++) out.copyToChannel(rendered.getChannelData(channel).subarray(lead + latency, lead + latency + wanted), channel)
   return out

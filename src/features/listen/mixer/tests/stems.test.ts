@@ -91,3 +91,35 @@ test('instrumental at 0: the rest goes, the bass stays', () => {
   assert.ok(Math.abs(tone(ol, 60, 1, 2) - tone(l, 60, 1, 2)) < 1, 'bass changed')
   assert.ok(tone(l, 3000, 1, 2) - tone(ol, 3000, 1, 2) > 15, 'pad stayed')
 })
+
+test('real stems take a component over: the voice from its stem, the instrumental as the mix without it', () => {
+  // A centred 1 kHz "voice" (also given as its real stem) over a wide 3 kHz pad.
+  const [l, r] = signal(2, (t, c) => 0.3 * Math.sin(2 * Math.PI * 1000 * t) + (c ? -1 : 1) * 0.2 * Math.sin(2 * Math.PI * 3000 * t))
+  const voice = signal(2, (t) => 0.3 * Math.sin(2 * Math.PI * 1000 * t))
+  const run = (gains: { vocals: number; instrumental: number }, use: number) => {
+    const s = new StemSplit(RATE)
+    const out = [new Float32Array(l.length), new Float32Array(l.length)]
+    for (let at = 0; at < l.length; at += 128) {
+      const n = Math.min(128, l.length - at)
+      const slice = (x: Float32Array) => x.subarray(at, at + n)
+      s.run(slice(l), slice(r), slice(out[0]!), slice(out[1]!), Float32Array.of(1), Float32Array.of(gains.vocals), Float32Array.of(gains.instrumental), n, {
+        vocals: voice.map(slice),
+        use: { drums: Float32Array.of(0), vocals: Float32Array.of(use), instrumental: Float32Array.of(0) },
+      })
+    }
+    return out
+  }
+  // With its real stem, the voice goes completely (not to -24 dB) and the pad stays.
+  const [noVoice] = run({ vocals: 0, instrumental: 1 }, 1)
+  assert.ok(tone(l, 1000, 1, 2) - tone(noVoice!, 1000, 1, 2) > 60, 'voice left')
+  assert.ok(Math.abs(tone(noVoice!, 3000, 1, 2) - tone(l, 3000, 1, 2)) < 0.5, 'pad changed')
+  // The instrumental is the mix without the real voice: at 0 the pad goes, the voice stays.
+  const [noRest] = run({ vocals: 1, instrumental: 0 }, 1)
+  assert.ok(tone(l, 3000, 1, 2) - tone(noRest!, 3000, 1, 2) > 20, 'pad left')
+  assert.ok(Math.abs(tone(noRest!, 1000, 1, 2) - tone(l, 1000, 1, 2)) < 0.5, 'voice changed')
+  // All lanes at 1 with real stems in use: the input again.
+  const [same] = run({ vocals: 1, instrumental: 1 }, 1)
+  let worst = 0
+  for (let i = 0; i < l.length; i++) worst = Math.max(worst, Math.abs(same![i]! - l[i]!))
+  assert.ok(worst < 1e-5, `${worst}`)
+})

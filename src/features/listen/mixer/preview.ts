@@ -1,6 +1,6 @@
 import { createBufferDeck, type BufferDeck } from './buffer-deck.ts'
 import { deckPlan, withBrake, type DeckPlan } from './deck-schedule.ts'
-import { asPlayed, createDeck, createMaster, freezeDeck, releaseEcho, releaseReverb, resetDeck, scheduleTransition, type Deck, type Master } from './engine.ts'
+import { asPlayed, createDeck, createMaster, freezeDeck, releaseEcho, releaseReverb, resetDeck, scheduleTransition, switchToRealStem, type Deck, type Master } from './engine.ts'
 import type { Transition } from './types.ts'
 
 /**
@@ -35,6 +35,9 @@ export interface PreviewOptions {
   destination?: AudioNode
 }
 
+/** Real stems of a song (windows like its own audio: each with its own `origin`). */
+export type PreviewStems = Partial<Record<'drums' | 'vocals' | 'instrumental', PreviewSource>>
+
 export interface TransitionPreview {
   readonly playing: boolean
   /** Plays from transition time `from` (default: where it is). */
@@ -58,6 +61,12 @@ export interface TransitionPreview {
    * the preview goes on from where it is with it.
    */
   setSource(deck: 'a' | 'b', source: PreviewSource): Promise<void>
+  /**
+   * Real stems for a deck as they arrive (any of them; the others stay approximated). They take over from the
+   * approximation with a 20 ms crossfade: at the next loop pass while looping (a seam already), else from the moment
+   * just ahead (paused: at once).
+   */
+  setStems(deck: 'a' | 'b', stems: PreviewStems): Promise<void>
   dispose(): void
 }
 
@@ -102,6 +111,9 @@ export async function createTransitionPreview(options: PreviewOptions): Promise<
   let cancelTimer: () => void = () => undefined
   const listeners = new Set<(t: number, playing: boolean) => void>()
   let frame = 0
+  /** Real stems: their players (playing along with their deck's), and those still to switch to. */
+  const stemPlayers = { a: new Map<string, BufferDeck>(), b: new Map<string, BufferDeck>() }
+  let pendingStems: Array<{ deck: 'a' | 'b'; stem: 'drums' | 'vocals' | 'instrumental'; out: GainNode }> = []
 
   function plansOf(t: Transition): { a: DeckPlan; b: DeckPlan; semitones?: (t: number) => number } {
     const braked = withBrake(t, deckPlan(t, 'a'))
@@ -147,14 +159,23 @@ export async function createTransitionPreview(options: PreviewOptions): Promise<
     const zero = at - from
     const until = loop ? Math.min(loop.to, end()) : end()
     const length = Math.max(0, transition.length)
-    for (const player of [playerA, playerB]) player.stopAt(at)
+    const playersA = [playerA, ...stemPlayers.a.values()]
+    const playersB = [playerB, ...stemPlayers.b.values()]
+    for (const player of [...playersA, ...playersB]) player.stopAt(at)
     if (from < length) {
-      playerA.play(plans.a, from, Math.min(until, length), zero, plans.semitones)
-      playerA.stopAt(zero + Math.min(until, length) + 0.02)
+      for (const player of playersA) {
+        player.play(plans.a, from, Math.min(until, length), zero, plans.semitones)
+        player.stopAt(zero + Math.min(until, length) + 0.02)
+      }
     }
     const bFrom = Math.max(from, transition.bAt)
-    if (bFrom < until) playerB.play(plans.b, bFrom, until, zero)
-    if (until < end() || loop) playerB.stopAt(zero + until)
+    for (const player of playersB) {
+      if (bFrom < until) player.play(plans.b, bFrom, until, zero)
+      if (until < end() || loop) player.stopAt(zero + until)
+    }
+    // Stems that arrived take over as this pass starts.
+    for (const { deck, stem, out } of pendingStems) switchToRealStem(decks[deck], stem, out, at, 0.02)
+    pendingStems = []
     automate(zero, from)
     passes = [...passes.slice(-1), { at, zero, from }]
     cancelTimer()
@@ -197,7 +218,7 @@ export async function createTransitionPreview(options: PreviewOptions): Promise<
   function stop(fade = 0.01) {
     cancelTimer()
     const at = ctx.currentTime + fade
-    for (const player of [playerA, playerB]) player.stopAt(at)
+    for (const player of [playerA, playerB, ...stemPlayers.a.values(), ...stemPlayers.b.values()]) player.stopAt(at)
     for (const deck of [decks.a, decks.b]) {
       freezeDeck(deck, at)
       releaseEcho(deck, at, 0.1)
@@ -272,6 +293,27 @@ export async function createTransitionPreview(options: PreviewOptions): Promise<
       }
       if (playing) start(position() + lead)
     },
+    async setStems(deck, stems) {
+      const entries = Object.entries(stems) as Array<['drums' | 'vocals' | 'instrumental', PreviewSource]>
+      const loaded = await Promise.all(
+        entries.map(async ([stem, source]) => {
+          const out = new GainNode(ctx)
+          const player = await createBufferDeck(ctx, out, 'hybrid')
+          await player.load(stereo(source), source.origin, source.sampleRate)
+          return { stem, out, player }
+        }),
+      )
+      for (const { stem, out, player } of loaded) {
+        stemPlayers[deck].get(stem)?.dispose()
+        stemPlayers[deck].set(stem, player)
+        pendingStems.push({ deck, stem, out })
+      }
+      if (!playing) {
+        for (const { deck: d, stem, out } of pendingStems) switchToRealStem(decks[d], stem, out, ctx.currentTime, 0.02)
+        pendingStems = []
+      } else if (!loop) start(position() + lead)
+      // Looping: the next pass picks them up (its seam is where they switch).
+    },
     setVolume(value) {
       volume.gain.setTargetAtTime(Math.max(0, Math.min(1, value)), ctx.currentTime, 0.01)
     },
@@ -282,6 +324,7 @@ export async function createTransitionPreview(options: PreviewOptions): Promise<
       listeners.clear()
       playerA.dispose()
       playerB.dispose()
+      for (const player of [...stemPlayers.a.values(), ...stemPlayers.b.values()]) player.dispose()
       decks.a.dispose()
       decks.b.dispose()
       master.dispose()

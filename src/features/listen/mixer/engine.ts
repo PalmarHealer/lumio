@@ -42,8 +42,8 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  *   `ECHO_LOW_CUT_HZ`) on its way in and another in its feedback loop, so its repeats carry no bassline under the next
  *   track and each one is thinner than the last.
  * - The stem lanes (drums, voice, instrumental: the editor's smart filters) play through `stems` (stems.ts: a live
- *   approximation, made when first needed) only while one of them isn't 1; otherwise `direct`, exactly the input. The
- *   switch is a 5 ms crossfade, like the coloured path's.
+ *   approximation, made when first needed) only while one of them isn't 1; otherwise `direct`, exactly the input. At 1
+ *   the split gives its input again, so the paths switch at once.
  * - The reverb is a hall (a convolver with a generated impulse, `hallImpulse`) fed by a send after the deck's volume
  *   (its `reverb` lane): its tail rings on after the deck is cut. It exists only on decks whose transitions use it (made
  *   when first needed), so a deck without reverb is exactly what it was before.
@@ -252,6 +252,8 @@ export interface Stems {
   drums: AudioParam
   vocals: AudioParam
   instrumental: AudioParam
+  /** Per stem: 0 approximated, 1 from its real stem (`switchToRealStem`). */
+  real: { drums: AudioParam; vocals: AudioParam; instrumental: AudioParam }
 }
 
 const stemLanes = ['drums', 'vocals', 'instrumental'] as const
@@ -266,13 +268,36 @@ const workletsReady = new WeakSet<BaseAudioContext>()
 export function stemsOf(deck: Deck): Stems | null {
   if (deck.stems) return deck.stems
   if (!workletsReady.has(deck.ctx)) return null
-  const node = new AudioWorkletNode(deck.ctx, 'lumio-stems', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2], channelCount: 2, channelCountMode: 'explicit' })
+  const node = new AudioWorkletNode(deck.ctx, 'lumio-stems', { numberOfInputs: 4, numberOfOutputs: 1, outputChannelCount: [2], channelCount: 2, channelCountMode: 'explicit' })
   const out = new GainNode(deck.ctx, { gain: 0 })
   deck.gain.connect(node).connect(out).connect(deck.shaped)
   timelines.set(out.gain, [{ t: 0, v: 0, ramp: false }])
   const param = (name: string) => node.parameters.get(name)!
-  deck.stems = { node, out, drums: param('drums'), vocals: param('vocals'), instrumental: param('instrumental') }
+  deck.stems = {
+    node,
+    out,
+    drums: param('drums'),
+    vocals: param('vocals'),
+    instrumental: param('instrumental'),
+    real: { drums: param('realDrums'), vocals: param('realVocals'), instrumental: param('realInstrumental') },
+  }
   return deck.stems
+}
+
+/**
+ * A real stem of the deck's song (playing in step with the deck's own source) into its stem split: it takes the
+ * approximation's place from context time `time` on, crossfading over `fade` (seconds). Returns false where the deck
+ * can't have a stem split (no engine worklets in the context).
+ */
+export function switchToRealStem(deck: Deck, stem: (typeof stemLanes)[number], source: AudioNode, time = deck.ctx.currentTime, fade = 0.02) {
+  const stems = stemsOf(deck)
+  if (!stems) return false
+  source.connect(stems.node, 0, 1 + stemLanes.indexOf(stem))
+  const param = stems.real[stem]
+  param.cancelScheduledValues(time)
+  param.setValueAtTime(param.value, time)
+  param.linearRampToValueAtTime(1, time + fade)
+  return true
 }
 
 /** Whether a deck's automation uses its stem lanes (any of them away from 1). */
@@ -668,9 +693,11 @@ function scheduleStems(deck: Deck, automation: DeckAutomation, start: number, sc
   holdAt(stems.out.gain, now)
   const at = (t: number) => Math.max(now, start + t * scale)
   const span = stemSpan(automation, from)
-  if (!span) return crossTo(deck.direct.gain, stems.out.gain, now, CROSSFADE_S)
-  crossTo(stems.out.gain, deck.direct.gain, Math.max(at(from), at(span.first) - CROSSFADE_S), CROSSFADE_S)
-  if (Number.isFinite(span.last)) crossTo(deck.direct.gain, stems.out.gain, at(span.last), CROSSFADE_S)
+  // With its lanes at 1 the split gives exactly its input (to rounding), and it is always fed (its filters are warm):
+  // the paths switch at once, where the lanes leave 1 and where they are back.
+  if (!span) return crossTo(deck.direct.gain, stems.out.gain, now, 0)
+  crossTo(stems.out.gain, deck.direct.gain, at(span.first), 0)
+  if (Number.isFinite(span.last)) crossTo(deck.direct.gain, stems.out.gain, at(span.last), 0)
 }
 
 /**

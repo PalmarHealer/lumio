@@ -1,5 +1,6 @@
 import { mixOf } from './analysis.ts'
-import { autoTransition, customCount, storedFits } from './resolve.ts'
+import type { Technique } from './planner.ts'
+import { autoTransition, customCount, storedFits, techniqueOf, varietyAvoid } from './resolve.ts'
 import { estimateMixLength, sortForMix, type MixLength } from './sort.ts'
 import { pairKey, type MixStyle, type PlaylistMixer, type TrackMix, type Transition } from './types.ts'
 
@@ -10,7 +11,10 @@ import { pairKey, type MixStyle, type PlaylistMixer, type TrackMix, type Transit
  *    progress and an estimate of the shortening that firms up as pairs come in;
  * 3. the finished map and the exact length.
  * Pairs are planned spread over the playlist (every 64th first, then the ones between …), so the early estimate stands
- * for the whole playlist rather than its first songs. Between short runs the worker yields, so a newer ask (another
+ * for the whole playlist rather than its first songs. The set's variety (no special technique twice in a row, none
+ * beyond its share, see `varietyAvoid`) needs the playing order, so a last pass walks the pairs in order and plans again
+ * only those whose technique the rule rules out there, avoiding it. That gives what planning in order would: a pair
+ * whose technique isn't ruled out is planned the same with or without the others avoided (they weren't chosen). Between short runs the worker yields, so a newer ask (another
  * style, "keep custom" switched) takes over at once and the old one stops. Planned pairs are kept while the worker
  * lives (the dialog is open): a pair asked again with the same style and the same analyses isn't planned twice.
  */
@@ -108,17 +112,18 @@ async function build(request: SortRequest) {
   const transitions: Record<string, Transition> = {}
   let done = 0
   let sliceStart = performance.now()
+  const plan = (pair: (typeof pairs)[number], avoid: Technique[] = []) => {
+    const cacheKey = `${style}|${pair.key}|${mixes[pair.from] ? 1 : 0}${mixes[pair.to] ? 1 : 0}|${[...avoid].sort().join(',')}`
+    let transition = planned.get(cacheKey)
+    if (!transition) {
+      transition = autoTransition(pair.from, pair.to, mixes, style, avoid.length ? { durations, avoid } : { durations })
+      planned.set(cacheKey, transition)
+    }
+    return transition
+  }
   for (const index of spreadOrder(pairs.length)) {
     const pair = pairs[index]!
-    let transition = kept.get(pair.key)
-    if (!transition) {
-      const cacheKey = `${style}|${pair.key}|${mixes[pair.from] ? 1 : 0}${mixes[pair.to] ? 1 : 0}`
-      transition = planned.get(cacheKey)
-      if (!transition) {
-        transition = autoTransition(pair.from, pair.to, mixes, style, { durations })
-        planned.set(cacheKey, transition)
-      }
-    }
+    const transition = kept.get(pair.key) ?? plan(pair)
     transitions[pair.key] = transition
     done++
     if (known(pair.from) && known(pair.to)) {
@@ -129,6 +134,23 @@ async function build(request: SortRequest) {
     if (done < pairs.length && performance.now() - sliceStart >= SLICE_MS) {
       const shorterBy = measured > 0 && original > 0 ? Math.min(1, Math.max(0, ((saved / measured) * pairsKnown) / original)) : null
       scope.postMessage({ kind: 'progress', ask, done, pairs: pairs.length, shorterBy })
+      await yieldToMessages()
+      if (ask !== current) return
+      sliceStart = performance.now()
+    }
+  }
+  // Variety, in playing order (as `buildTransitions` keeps it): kept hand-made transitions count as plain ones.
+  const history: Array<Technique | undefined> = []
+  for (const pair of pairs) {
+    if (kept.has(pair.key)) {
+      history.push(undefined)
+      continue
+    }
+    const avoid = varietyAvoid(history)
+    const technique = techniqueOf(transitions[pair.key]!)
+    if (technique && avoid.includes(technique)) transitions[pair.key] = plan(pair, avoid)
+    history.push(techniqueOf(transitions[pair.key]!))
+    if (performance.now() - sliceStart >= SLICE_MS) {
       await yieldToMessages()
       if (ask !== current) return
       sliceStart = performance.now()

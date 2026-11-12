@@ -29,6 +29,10 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  *   turns a little around the crossovers, which the ear doesn't hear), and a band at 0 is gone completely (a real
  *   "kill"), which shelving filters can't do: a low shelf at -40 dB still lets the bass through above its corner.
  * - Band values are amplitude factors (0.5 = -6 dB), like `gain`, so automation is a plain linear ramp per keyframe.
+ * - A killed low band alone still lets 120-200 Hz through at only -19 to -6 dB (the crossover's slope): the bass's upper
+ *   harmonics and the kick's body, so two basslines seemed up at once in a bass swap. The kill high-pass (two more
+ *   Butterworth sections after the isolator) closes that: transparent at 0 Hz while the low band is at 0.1 or more, it
+ *   rises to 200 Hz as the band goes to 0 (`killFrequency`). Killed, 150 Hz is then down by 25 dB, 120 Hz by 38 dB.
  * - The filter knob (-1…1) moves a low-pass down (below 0) or a high-pass up (above 0) on a logarithmic frequency
  *   scale, with a slight resonance. At 0 both are exactly transparent: a low-pass at the Nyquist frequency and a
  *   high-pass at 0 Hz have the transfer function 1.
@@ -48,6 +52,10 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
 /** Crossover frequencies of the isolator: low < 200 Hz, mid 200–2000 Hz, high > 2000 Hz (as the analysis' bands). */
 export const LOW_CROSSOVER = 200
 export const HIGH_CROSSOVER = 2000
+
+/** Below this low-band value the kill high-pass rises (log scale from `HIGHPASS_MIN_HZ`), to this at 0. */
+const KILL_FROM = 0.1
+const KILL_HZ = 200
 
 /** The filter knob's range: the low-pass closes down to this, the high-pass rises from/to these. */
 const LOWPASS_MIN_HZ = 70
@@ -101,6 +109,8 @@ export interface Deck {
   mid: GainNode
   high: GainNode
   highpass: BiquadFilterNode
+  /** The kill high-pass (two sections; 0 Hz = transparent): see the top. */
+  kill: [BiquadFilterNode, BiquadFilterNode]
   lowpass: BiquadFilterNode
   echo: { send: GainNode; delay: DelayNode; feedback: GainNode; wet: GainNode }
   /** The hall, made when a transition first uses it (`reverbOf`); null until then. */
@@ -159,7 +169,9 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
 
   const highpass = biquad(ctx, 'highpass', 0, FILTER_RESONANCE_DB)
   const lowpass = biquad(ctx, 'lowpass', nyquist(ctx), FILTER_RESONANCE_DB)
-  sum.connect(highpass).connect(lowpass)
+  const killA = biquad(ctx, 'highpass', 0, BUTTERWORTH_Q_DB)
+  const killB = biquad(ctx, 'highpass', 0, BUTTERWORTH_Q_DB)
+  sum.connect(killA).connect(killB).connect(highpass).connect(lowpass)
 
   const dry = new GainNode(ctx)
   const coloured = new GainNode(ctx, { gain: 0 })
@@ -178,9 +190,9 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
   delay.connect(wet).connect(level)
   level.connect(destination)
 
-  const nodes: AudioNode[] = [input, brake, gain, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, highpass, lowpass, dry, coloured, post, send, delay, feedback, wet, level]
+  const nodes: AudioNode[] = [input, brake, gain, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, killA, killB, highpass, lowpass, dry, coloured, post, send, delay, feedback, wet, level]
   // What each automated param starts at (its constructor value), for the engine's own copy of its timeline.
-  for (const param of [brake.gain, gain.gain, low.gain, mid.gain, high.gain, lowpass.frequency, highpass.frequency, send.gain, feedback.gain, delay.delayTime, wet.gain, dry.gain, coloured.gain]) {
+  for (const param of [brake.gain, gain.gain, low.gain, mid.gain, high.gain, lowpass.frequency, highpass.frequency, killA.frequency, killB.frequency, send.gain, feedback.gain, delay.delayTime, wet.gain, dry.gain, coloured.gain]) {
     timelines.set(param, [{ t: 0, v: param.value, ramp: false }])
   }
   const deck: Deck = {
@@ -192,6 +204,7 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
     mid,
     high,
     highpass,
+    kill: [killA, killB],
     lowpass,
     echo: { send, delay, feedback, wet },
     reverb: null,
@@ -356,6 +369,15 @@ export function valueAt(keyframes: Keyframe[], t: number, neutral: number) {
   return keyframes[keyframes.length - 1]!.v
 }
 
+/**
+ * A curve's value just after `t`: as `valueAt`, except that a step at `t` itself (two keyframes at the same time, e.g. a
+ * kill right at the transition's start) counts as taken. Where a curve starts to be played, this is its value.
+ */
+export function valueAfter(keyframes: Keyframe[], t: number, neutral: number) {
+  for (let i = keyframes.length - 1; i >= 0; i--) if (keyframes[i]!.t === t) return keyframes[i]!.v
+  return valueAt(keyframes, t, neutral)
+}
+
 /** The filter knob (-1…1) as the two filters' cutoffs: a closing low-pass below 0, a rising high-pass above. */
 export function filterFrequencies(knob: number, sampleRate: number) {
   const v = Math.max(-1, Math.min(1, knob))
@@ -364,6 +386,12 @@ export function filterFrequencies(knob: number, sampleRate: number) {
     lowpass: v < 0 ? top * (LOWPASS_MIN_HZ / top) ** -v : top,
     highpass: v > 0 ? HIGHPASS_MIN_HZ * (HIGHPASS_MAX_HZ / HIGHPASS_MIN_HZ) ** v : 0,
   }
+}
+
+/** The kill high-pass's frequency for a low-band value: 0 Hz (transparent) from `KILL_FROM` up, `KILL_HZ` at 0. */
+export function killFrequency(low: number) {
+  if (low >= KILL_FROM) return 0
+  return HIGHPASS_MIN_HZ * (KILL_HZ / HIGHPASS_MIN_HZ) ** ((KILL_FROM - Math.max(0, low)) / KILL_FROM)
 }
 
 export const beatSeconds = (bpm?: number | null) => 60 / (bpm !== null && bpm !== undefined && Number.isFinite(bpm) && bpm > 0 ? bpm : DEFAULT_BPM)
@@ -497,7 +525,7 @@ interface ScheduleOptions {
 /** A linear curve on a param: its value at `from`, then a ramp to each later keyframe. */
 function scheduleLinear(param: AudioParam, keyframes: Keyframe[], neutral: number, start: number, scale: number, from: number, now: number) {
   const begin = Math.max(now, start + from * scale)
-  const value = valueAt(keyframes, from, neutral)
+  const value = valueAfter(keyframes, from, neutral)
   // The start value holds from now on (a deck that starts a little early is already where the curve begins).
   holdAt(param, now)
   setAt(param, now, value)
@@ -516,7 +544,7 @@ function scheduleFilter(deck: Deck, keyframes: Keyframe[], start: number, scale:
   const last = keyframes.length ? keyframes[keyframes.length - 1]!.t : 0
   const span = last - from
   const moving = keyframes.length > 1 && span > 0 && keyframes.some((keyframe) => keyframe.v !== keyframes[0]!.v)
-  const initial = filterFrequencies(valueAt(keyframes, from, 0), rate)
+  const initial = filterFrequencies(valueAfter(keyframes, from, 0), rate)
   setAt(deck.lowpass.frequency, now, initial.lowpass)
   setAt(deck.highpass.frequency, now, initial.highpass)
   if (!moving) return
@@ -534,6 +562,27 @@ function scheduleFilter(deck: Deck, keyframes: Keyframe[], start: number, scale:
   }
 }
 
+/** The kill high-pass follows the low band's curve: sampled finely (5 ms) into short ramps where it is under `KILL_FROM`. */
+function scheduleKill(deck: Deck, keyframes: Keyframe[], start: number, scale: number, from: number, now: number) {
+  const params = deck.kill.map((filter) => filter.frequency)
+  for (const param of params) holdAt(param, now)
+  const initial = killFrequency(valueAfter(keyframes, from, 1))
+  for (const param of params) setAt(param, now, initial)
+  // Linear between keyframes: under the threshold somewhere only if a keyframe is.
+  if (!keyframes.some((keyframe) => keyframe.v < KILL_FROM)) return
+  const last = keyframes[keyframes.length - 1]!.t
+  const span = last - from
+  if (!(span > 0)) return
+  const begin = Math.max(now, start + from * scale)
+  if (begin > now) for (const param of params) setAt(param, begin, initial)
+  const count = Math.max(2, Math.ceil(span * FILTER_CURVE_RATE) + 1)
+  const duration = Math.max(1e-3, start + last * scale - begin)
+  for (let i = 1; i < count; i++) {
+    const frequency = killFrequency(valueAt(keyframes, from + (span * i) / (count - 1), 1))
+    for (const param of params) rampAt(param, begin + (duration * i) / (count - 1), frequency)
+  }
+}
+
 /**
  * Plays a deck's automation: the transition starts at context time `startTime`. Can be called again at any time
  * (a pause or seek during the transition): what was scheduled before is replaced from now on.
@@ -547,6 +596,7 @@ export function scheduleAutomation(deck: Deck, automation: DeckAutomation, start
   scheduleLinear(deck.mid.gain, automation.mid, 1, startTime, scale, from, now)
   scheduleLinear(deck.high.gain, automation.high, 1, startTime, scale, from, now)
   scheduleFilter(deck, automation.filter, startTime, scale, from, now)
+  scheduleKill(deck, automation.low, startTime, scale, from, now)
   scheduleRouting(deck, automation, startTime, scale, from, now)
   // The reverb send (made only for a transition that uses it; a deck that has one closes it when the next doesn't).
   if (usesReverb(automation) || deck.reverb) {
@@ -559,7 +609,7 @@ export function scheduleAutomation(deck: Deck, automation: DeckAutomation, start
 
 /** Whether a deck's EQ or filter changes its sound at transition time `t`. */
 const colours = (automation: DeckAutomation, t: number) =>
-  valueAt(automation.low, t, 1) !== 1 || valueAt(automation.mid, t, 1) !== 1 || valueAt(automation.high, t, 1) !== 1 || valueAt(automation.filter, t, 0) !== 0
+  valueAfter(automation.low, t, 1) !== 1 || valueAfter(automation.mid, t, 1) !== 1 || valueAfter(automation.high, t, 1) !== 1 || valueAfter(automation.filter, t, 0) !== 0
 
 /**
  * When (transition time, from `from` on) a deck's EQ or filter colours it: from `first` until `last` (Infinity when it
@@ -715,6 +765,8 @@ function automatedParams(deck: Deck) {
     deck.high.gain,
     deck.lowpass.frequency,
     deck.highpass.frequency,
+    deck.kill[0].frequency,
+    deck.kill[1].frequency,
     deck.echo.send.gain,
     deck.echo.feedback.gain,
     deck.echo.delay.delayTime,
@@ -754,14 +806,17 @@ export function resetDeck(deck: Deck, time = deck.ctx.currentTime, ramp = 0) {
   if (ramp > 0) {
     const lowFrom = Math.max(LOWPASS_MIN_HZ, valueOn(deck.lowpass.frequency, time))
     const highFrom = Math.max(HIGHPASS_MIN_HZ, valueOn(deck.highpass.frequency, time))
+    const killFrom = Math.max(HIGHPASS_MIN_HZ, valueOn(deck.kill[0].frequency, time))
     for (let i = 1; i <= GLIDE_STEPS; i++) {
       const p = i / GLIDE_STEPS
       rampAt(deck.lowpass.frequency, time + ramp * p, lowFrom * (top / lowFrom) ** p)
       rampAt(deck.highpass.frequency, time + ramp * p, highFrom * (HIGHPASS_MIN_HZ / highFrom) ** p)
+      for (const filter of deck.kill) rampAt(filter.frequency, time + ramp * p, killFrom * (HIGHPASS_MIN_HZ / killFrom) ** p)
     }
   }
   setAt(deck.lowpass.frequency, end, top)
   setAt(deck.highpass.frequency, end, 0)
+  for (const filter of deck.kill) setAt(filter.frequency, end, 0)
   // Back on the dry path once neutral (a glide ends with a crossfade; an instant reset switches at once).
   routeTo(deck, end, 'dry', ramp > 0 ? CROSSFADE_S : 0)
   // The echo: nothing goes in any more, and its return stays shut until the delay line has emptied itself.

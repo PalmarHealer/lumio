@@ -13,8 +13,47 @@ import { defineMessages, useMessages } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { analysable, MixerSaveError, usePlaylistMixer, useSaveMixer, useTrackMixes } from './queries'
 import { entriesInOrder, hasSharedEntries, planMoves } from './reorder'
-import type { SortRequest, SortResult } from './sort-worker'
-import type { MixStyle } from './types'
+import type { SortMessage, SortRequest } from './sort-worker'
+import type { MixStyle, PresetId, TrackMix } from './types'
+
+/**
+ * Every transition kind gets a name wherever one is shown. `reverbOut` is on its way into the planner's presets; the
+ * union keeps its name ready, and a preset added to `PresetId` without a name here fails to compile.
+ */
+type LabelledPreset = PresetId | 'reverbOut'
+
+const PRESET_NAMES = {
+  de: {
+    auto: 'Automatisch',
+    blend: 'Langer Mix',
+    crossfade: 'Überblendung',
+    fadeOut: 'Ausblenden',
+    fadeIn: 'Einblenden',
+    bassSwap: 'Bass-Tausch',
+    filterBuild: 'Filter-Aufbau',
+    echoOut: 'Echo-Ausklang',
+    reverbOut: 'Hall-Ausklang',
+    dropSwap: 'Drop-Wechsel',
+    hardCut: 'Harter Schnitt',
+    brake: 'Bremse',
+    none: 'Direkt hintereinander',
+  } satisfies Record<LabelledPreset, string>,
+  en: {
+    auto: 'Automatic',
+    blend: 'Long blend',
+    crossfade: 'Crossfade',
+    fadeOut: 'Fade out',
+    fadeIn: 'Fade in',
+    bassSwap: 'Bass swap',
+    filterBuild: 'Filter build',
+    echoOut: 'Echo out',
+    reverbOut: 'Reverb out',
+    dropSwap: 'Drop swap',
+    hardCut: 'Hard cut',
+    brake: 'Brake',
+    none: 'Back to back',
+  } satisfies Record<LabelledPreset, string>,
+}
 
 const messages = defineMessages({
   de: {
@@ -28,7 +67,12 @@ const messages = defineMessages({
     cleanHint: 'Songs laufen ganz, sanfte Übergänge, sortiert nach Tonart, Tempo und Stimmung',
     party: 'Party',
     partyHint: 'Intros und Outros gekürzt, Einstieg auf Drop oder Refrain, Energiebogen',
-    computing: 'Wird berechnet …',
+    computing: 'Wird sortiert …',
+    building: (done: number, total: number) => `Übergänge ${done}/${total}`,
+    estimate: 'Schätzung, wird genauer, während die Übergänge entstehen',
+    kinds: 'Übergänge',
+    newAnalyses: (n: number) => (n === 1 ? '1 neue Analyse: neu berechnen' : `${n} neue Analysen: neu berechnen`),
+    preset: (id: LabelledPreset) => PRESET_NAMES.de[id],
     shorter: (percent: number) => `Playlist wird ~${percent} % kürzer`,
     sameLength: 'Die Länge bleibt fast gleich',
     lengths: (from: string, to: string) => `${from} → ${to}`,
@@ -67,7 +111,12 @@ const messages = defineMessages({
     cleanHint: 'Songs play in full, smooth transitions, sorted by key, tempo and mood',
     party: 'Party',
     partyHint: 'Intros and outros shortened, entry on the drop or chorus, energy arc',
-    computing: 'Working it out …',
+    computing: 'Sorting …',
+    building: (done: number, total: number) => `Transitions ${done}/${total}`,
+    estimate: 'Estimate, firms up as the transitions are built',
+    kinds: 'Transitions',
+    newAnalyses: (n: number) => (n === 1 ? '1 new analysis: work it out again' : `${n} new analyses: work it out again`),
+    preset: (id: LabelledPreset) => PRESET_NAMES.en[id],
     shorter: (percent: number) => `Playlist gets ~${percent} % shorter`,
     sameLength: 'The length stays about the same',
     lengths: (from: string, to: string) => `${from} → ${to}`,
@@ -181,16 +230,33 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
   const save = useSaveMixer(playlistId)
   const [style, setStyle] = useState<MixStyle>(mixer.data?.style ?? 'clean')
   const [keepCustom, setKeepCustom] = useState(false)
-  const [result, setResult] = useState<SortResult | null>(null)
+  /** The answers for the newest ask, as they come: the order first, then progress, then everything. */
+  const [ordered, setOrdered] = useState<Extract<SortMessage, { kind: 'order' }> | null>(null)
+  const [progress, setProgress] = useState<Extract<SortMessage, { kind: 'progress' }> | null>(null)
+  const [result, setResult] = useState<Extract<SortMessage, { kind: 'done' }> | null>(null)
   const [computeFailed, setComputeFailed] = useState(false)
   const applying = useRef(false)
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
   const busy = phase.kind === 'moving' || phase.kind === 'saving'
 
-  // Each opening starts from the playlist's own style.
+  const ids = useMemo(() => tracks.map((track) => track.Id ?? '').filter(analysable), [tracks])
+  const analyses = useTrackMixes(ids, { enabled: open, pollMs: POLL_MS })
+  const signature = trackSignature(tracks)
+  const duplicates = useMemo(() => hasSharedEntries(tracks.map((track) => track.PlaylistItemId)), [tracks])
+  /**
+   * The analyses the order is worked out from. Taken once they have all answered, and again only when asked: songs
+   * analysed meanwhile would otherwise start the sorting and the long build over and over while the server works.
+   */
+  const [basis, setBasis] = useState<Map<string, TrackMix | null> | null>(null)
+
+  // Each opening starts from the playlist's own style and the analyses as they are then.
   const [wasOpen, setWasOpen] = useState(open)
   if (open !== wasOpen) {
     setWasOpen(open)
+    setBasis(null)
+    setOrdered(null)
+    setProgress(null)
+    setResult(null)
     if (open) {
       setStyle(mixer.data?.style ?? 'clean')
       setKeepCustom(false)
@@ -198,24 +264,27 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
       setPhase({ kind: 'idle' })
     }
   }
+  if (open && analyses.loaded && basis === null) setBasis(analyses.mixes)
+  const newAnalyses = basis ? [...analyses.mixes.entries()].filter(([id, mix]) => mix && !basis.get(id)).length : 0
 
-  const ids = useMemo(() => tracks.map((track) => track.Id ?? '').filter(analysable), [tracks])
-  const analyses = useTrackMixes(ids, { enabled: open, pollMs: POLL_MS })
-  const signature = trackSignature(tracks)
-  const duplicates = useMemo(() => hasSharedEntries(tracks.map((track) => track.PlaylistItemId)), [tracks])
-
-  // The worker lives while the dialog is open.
+  // The worker lives while the dialog is open; closing it stops a build under way.
   const worker = useRef<Worker | null>(null)
   const ask = useRef(0)
   /** The order found for a style, these songs and these analyses, so "keep custom" only builds the transitions again. */
   const sorted = useRef<{ key: string; order: string[] } | null>(null)
+  const askedKey = useRef('')
   useEffect(() => {
     if (!open) return
     const created = new Worker(new URL('./sort-worker.ts', import.meta.url), { type: 'module' })
-    created.onmessage = (event: MessageEvent<SortResult>) => {
-      if (event.data.ask !== ask.current) return
-      setResult(event.data)
-      setComputeFailed(false)
+    created.onmessage = (event: MessageEvent<SortMessage>) => {
+      const message = event.data
+      if (message.ask !== ask.current) return
+      if (message.kind === 'order') {
+        sorted.current = { key: askedKey.current, order: message.order }
+        setOrdered(message)
+      } else if (message.kind === 'progress') setProgress(message)
+      else if (message.kind === 'done') setResult(message)
+      else setComputeFailed(true)
     }
     created.onerror = () => setComputeFailed(true)
     worker.current = created
@@ -223,41 +292,38 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
       created.terminate()
       worker.current = null
       sorted.current = null
-      setResult(null)
     }
   }, [open])
 
   const existing = mixer.data ?? null
   // What the result must have been worked out from to be applied: an answer for an older style or "keep custom" (the
   // newer one is on its way) must not be saved.
-  const sortKey = `${style}|${signature}|${[...analyses.mixes.entries()].map(([id, mix]) => (mix ? id : '')).join(',')}`
+  const sortKey = basis ? `${style}|${signature}|${[...basis.entries()].map(([id, mix]) => (mix ? id : '')).join(',')}` : ''
   const inputs = `${sortKey}|${keepCustom}|${existing?.updated ?? 0}`
   useEffect(() => {
-    if (!open || !worker.current || !analyses.loaded || tracks.length < 2 || duplicates) return
-    const key = sortKey
+    if (!open || !worker.current || !basis || tracks.length < 2 || duplicates) return
+    const sameOrder = sorted.current?.key === sortKey
     const request: SortRequest = {
       ask: ++ask.current,
       inputs,
-      tracks: tracks.map((track) => ({ id: track.Id ?? '', mix: analyses.mixes.get(track.Id ?? '') ?? null })),
+      tracks: tracks.map((track) => ({ id: track.Id ?? '', mix: basis.get(track.Id ?? '') ?? null })),
       style,
       existing,
       keepCustom,
       durations: Object.fromEntries(tracks.map((track) => [track.Id ?? '', (track.RunTimeTicks ?? 0) / 10_000_000])),
-      order: sorted.current?.key === key ? sorted.current.order : undefined,
+      order: sameOrder ? sorted.current!.order : undefined,
     }
-    const listener = (event: MessageEvent<SortResult>) => {
-      if (event.data.ask === request.ask) sorted.current = { key, order: event.data.order }
-    }
-    const current = worker.current
-    current.addEventListener('message', listener)
-    setResult((previous) => (previous && sorted.current?.key === key ? previous : null))
-    current.postMessage(request)
-    return () => current.removeEventListener('message', listener)
-  }, [open, analyses.loaded, analyses.mixes, tracks, style, keepCustom, existing, duplicates, sortKey, inputs])
+    askedKey.current = sortKey
+    if (!sameOrder) setOrdered(null)
+    setProgress(null)
+    setResult(null)
+    setComputeFailed(false)
+    worker.current.postMessage(request)
+  }, [open, basis, tracks, style, keepCustom, existing, duplicates, sortKey, inputs])
 
   const apply = async () => {
     // A second click before the dialog shows it is busy must not start a second round of moves.
-    if (!result || applying.current) return
+    if (!result || result.inputs !== inputs || applying.current) return
     applying.current = true
     try {
       await applyResult(result)
@@ -266,7 +332,7 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
     }
   }
 
-  const applyResult = async (result: SortResult) => {
+  const applyResult = async (result: Extract<SortMessage, { kind: 'done' }>) => {
     const basis = signature
     setPhase({ kind: 'moving', done: 0, total: 0 })
     const tracksKey = ['playlist-tracks', session.userId, playlistId]
@@ -330,8 +396,17 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
   }
 
   const missing = analyses.total - analyses.analysed
-  const shorterBy = result ? Math.round(result.length.shorterBy * 100) : 0
+  const shorterBy = result ? Math.round(result.length.shorterBy * 100) : progress?.shorterBy != null ? Math.round(progress.shorterBy * 100) : null
   const ready = !!result && result.inputs === inputs && !computeFailed && tracks.length >= 2 && !duplicates
+  const building = !!ordered && !result && !computeFailed
+  const builtCount = result ? (ordered?.pairs ?? 0) : (progress?.done ?? 0)
+  // The kinds of transitions built, most used first.
+  const kinds = useMemo(() => {
+    if (!result) return []
+    const counts = new Map<PresetId, number>()
+    for (const transition of Object.values(result.transitions)) counts.set(transition.preset, (counts.get(transition.preset) ?? 0) + 1)
+    return [...counts.entries()].sort((a, b) => b[1] - a[1])
+  }, [result])
   return (
     <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
       <DialogContent className="flex max-h-[calc(100svh-2rem)] flex-col gap-5 overflow-y-auto p-6 sm:max-w-lg">
@@ -370,16 +445,44 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
           ))}
         </div>
 
-        <div className="space-y-1" aria-live="polite">
+        <div className="space-y-2" aria-live="polite">
           {computeFailed ? (
             <p className="text-sm text-destructive">{t.failed}</p>
-          ) : result ? (
+          ) : ordered ? (
             <>
-              <p className="text-lg font-semibold">{shorterBy >= 1 ? t.shorter(shorterBy) : t.sameLength}</p>
-              {result.length.original > 0 && shorterBy >= 1 && (
-                <p className="text-sm text-muted-foreground tabular-nums">
-                  {t.lengths(formatRuntime(secondsToTicks(result.length.original)) ?? '', formatRuntime(secondsToTicks(result.length.mixed)) ?? '')}
-                </p>
+              {shorterBy !== null && (
+                <div>
+                  <p className="text-lg font-semibold">{shorterBy >= 1 ? t.shorter(shorterBy) : t.sameLength}</p>
+                  {result ? (
+                    result.length.original > 0 &&
+                    shorterBy >= 1 && (
+                      <p className="text-sm text-muted-foreground tabular-nums">
+                        {t.lengths(formatRuntime(secondsToTicks(result.length.original)) ?? '', formatRuntime(secondsToTicks(result.length.mixed)) ?? '')}
+                      </p>
+                    )
+                  ) : (
+                    <p className="text-sm text-muted-foreground">{t.estimate}</p>
+                  )}
+                </div>
+              )}
+              {ordered.pairs > 0 && (
+                <div className="space-y-1.5">
+                  <p className="flex items-center gap-2 text-sm tabular-nums">
+                    {building && <IconLoader2 className="size-4 animate-spin text-muted-foreground" />}
+                    {t.building(builtCount, ordered.pairs)}
+                  </p>
+                  <div
+                    className="h-1.5 overflow-hidden rounded-full bg-muted"
+                    role="progressbar"
+                    aria-label={t.kinds}
+                    aria-valuemin={0}
+                    aria-valuemax={ordered.pairs}
+                    aria-valuenow={builtCount}
+                  >
+                    <div className="h-full rounded-full bg-listen transition-[width] duration-300" style={{ width: `${(builtCount / ordered.pairs) * 100}%` }} />
+                  </div>
+                  {kinds.length > 0 && <p className="text-sm text-muted-foreground">{kinds.map(([preset, count]) => `${count}× ${t.preset(preset)}`).join(' · ')}</p>}
+                </div>
               )}
             </>
           ) : (
@@ -408,14 +511,19 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
               <div className="h-full rounded-full bg-listen transition-[width] duration-500" style={{ width: `${(analyses.analysed / analyses.total) * 100}%` }} />
             </div>
             {missing > 0 && analyses.loaded && <p className="text-sm text-muted-foreground">{t.missing(missing)}</p>}
+            {newAnalyses > 0 && (
+              <Button size="sm" variant="outline" disabled={busy} onClick={() => setBasis(analyses.mixes)}>
+                <IconRefresh /> {t.newAnalyses(newAnalyses)}
+              </Button>
+            )}
           </div>
         )}
 
-        {result && (result.replacedCustom > 0 || keepCustom) && (
+        {ordered && (ordered.replacedCustom > 0 || keepCustom) && (
           <div className="space-y-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
-            {result.replacedCustom > 0 && (
+            {ordered.replacedCustom > 0 && (
               <p className="flex items-center gap-2 text-sm font-medium">
-                <IconAlertTriangle className="size-4 shrink-0 text-amber-500" /> {t.replaced(result.replacedCustom)}
+                <IconAlertTriangle className="size-4 shrink-0 text-amber-500" /> {t.replaced(ordered.replacedCustom)}
               </p>
             )}
             <button

@@ -6,10 +6,10 @@
  */
 import { floorIndex, periodAt, prepareTrack, spanAt, type PreparedTrack } from './analysis.ts'
 import { harmonicScore } from './camelot.ts'
-import { planVariants, plannerRules as R, sampleShape } from './planner.ts'
+import { finalizeTransition, planVariants, plannerRules as R, sampleShape } from './planner.ts'
 import { valueAt } from './presets.ts'
 import { deckPosition, rateAt } from './timeline.ts'
-import type { Keyframe, MixStyle, TrackMix, Transition } from './types.ts'
+import type { DeckSegment, Keyframe, MixStyle, TrackMix, Transition } from './types.ts'
 
 export type CheckKind = 'voices' | 'basslines' | 'keyClash' | 'energyJump' | 'notReady' | 'bandBack' | 'flamRisk' | 'beatsApart' | 'lineCut'
 
@@ -346,4 +346,19 @@ export function suggestions(aMix: TrackMix | null, bMix: TrackMix | null, ids: {
     loops: [...loops(a, 'a'), ...loops(b, 'b')],
     presets,
   }
+}
+
+/**
+ * Slips a deck by `seconds` of its own track (positive: later in the song), the transition's timing kept: A's out
+ * point or B's in point moves, and the deck's loops move with it. Then made valid (`finalizeTransition`): times inside
+ * the songs, keyframes inside the transition. Run `finalizeTransition` itself after any other edit.
+ */
+export function slipDeck(t: Transition, deck: 'a' | 'b', seconds: number, aDuration: number, bDuration: number): Transition {
+  if (!Number.isFinite(seconds) || seconds === 0) return finalizeTransition(t, aDuration, bDuration)
+  const shift = (path: DeckSegment[]) => path.map((s) => ({ ...s, from: s.from + seconds, to: s.to + seconds }))
+  const moved =
+    deck === 'a'
+      ? { ...t, aOut: t.aOut + seconds, pathA: shift(t.pathA) }
+      : { ...t, bIn: t.bIn + seconds, pathB: shift(t.pathB) }
+  return finalizeTransition(moved, aDuration, bDuration)
 }

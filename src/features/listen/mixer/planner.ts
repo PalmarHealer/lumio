@@ -1836,8 +1836,13 @@ export function finalizeTransition(transition: Transition, aDuration: number, bD
         1,
       )
     const base = { gain: fix(automation.gain, 0), low: fix(automation.low, 0), mid: fix(automation.mid, 0), high: fix(automation.high, 0), filter: fix(automation.filter, -1) }
-    // The reverb send, where the transition has one (a reverb out).
-    return Array.isArray(automation.reverb) && automation.reverb.length > 0 ? { ...base, reverb: fix(automation.reverb, 0) } : base
+    // The reverb send and the stem lanes, where the transition has them (a reverb out; the editor's smart filters).
+    const extra: Partial<DeckAutomation> = {}
+    for (const key of ['reverb', 'drums', 'vocals', 'instrumental'] as const) {
+      const list = automation[key]
+      if (Array.isArray(list) && list.length > 0) extra[key] = fix(list, 0)
+    }
+    return { ...base, ...extra }
   }
   const effects = (Array.isArray(transition.effects) ? transition.effects : []).filter(
     (e) => length > 0 && Number.isFinite(e.at) && e.at >= 0 && e.at <= length,

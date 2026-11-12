@@ -2,8 +2,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { checkTransition, suggestions } from '../editor-checks.ts'
-import { planTransition } from '../planner.ts'
+import { checkTransition, slipDeck, suggestions } from '../editor-checks.ts'
+import { finalizeTransition, planTransition } from '../planner.ts'
 import { fixture } from './fixtures.ts'
 
 /** A hand-made overlap: A out at `aOut`, B in at `bIn`, both at full volume for `length` seconds, A gone at the end. */
@@ -116,4 +116,18 @@ test('suggestions: points inside the songs, loops on bars, the planner\'s varian
   }
   assert.ok(sg.presets.length > 0 && new Set(sg.presets.map((p) => p.id)).size === sg.presets.length)
   assert.deepEqual(suggestions(null, B, { from: 'A', to: 'B' }, 'clean').outPoints, [])
+})
+
+test('finalizeTransition keeps the stem lanes; slipDeck moves a deck with its loops', () => {
+  const tr = planTransition(A, B, { from: 'A', to: 'B' }, 'clean')
+  const withStems = { ...tr, b: { ...tr.b, vocals: [{ t: 0, v: 0 }, { t: tr.length, v: 1 }], drums: [{ t: 1, v: 0.5 }] } }
+  const fixed = finalizeTransition(withStems, A.duration, B.duration)
+  assert.equal(fixed.b.vocals?.length, 2)
+  assert.equal(fixed.b.drums?.length, 1)
+  const looped = { ...tr, pathB: [{ from: tr.bIn, to: tr.bIn + 4, repeat: 2 }] }
+  const slipped = slipDeck(looped, 'b', 2, A.duration, B.duration)
+  assert.ok(Math.abs(slipped.bIn - (tr.bIn + 2)) < 0.002)
+  assert.equal(slipped.pathB.length, 1, 'the loop moved with the deck')
+  assert.ok(Math.abs(slipped.pathB[0].from - slipped.bIn) < 0.002)
+  assert.equal(slipped.length, tr.length)
 })

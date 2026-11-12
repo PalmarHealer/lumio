@@ -18,6 +18,11 @@ import type { Transition } from './types.ts'
 export interface RenderTransitionOptions {
   a: AudioBuffer
   b: AudioBuffer
+  /**
+   * Track positions (seconds) of `a`'s and `b`'s first samples (default 0: whole songs). A window of a song is enough:
+   * the decks only read what they play (`trackSpan`), and silence outside.
+   */
+  origins?: { a?: number; b?: number }
   transition: Transition
   /** Seconds of A before the transition (default 8; less if A doesn't have them: then the render starts silent). */
   preRoll?: number
@@ -38,7 +43,8 @@ export interface RenderTransitionOptions {
   stems?: { a?: RenderStems; b?: RenderStems }
 }
 
-export type RenderStems = Partial<Record<'drums' | 'vocals' | 'instrumental', AudioBuffer>>
+/** Real stems of a song: whole songs, or windows with the track position of their first sample. */
+export type RenderStems = Partial<Record<'drums' | 'vocals' | 'instrumental', AudioBuffer | { buffer: AudioBuffer; origin: number }>>
 
 /** Sample-rate independent time → frame conversion used for the render's length. */
 const frames = (seconds: number, sampleRate: number) => Math.max(1, Math.round(seconds * sampleRate))
@@ -57,7 +63,7 @@ const stereo = (buffer: AudioBuffer) => [buffer.getChannelData(0), buffer.getCha
 export async function renderTransition(options: RenderTransitionOptions): Promise<AudioBuffer> {
   const { a, b } = options
   // As the player plays it ('none': back to back from A's real end, nothing else).
-  const transition = asPlayed(options.transition, a.duration)
+  const transition = asPlayed(options.transition, (options.origins?.a ?? 0) + a.duration)
   const preRoll = Math.max(0, options.preRoll ?? 8)
   const postRoll = Math.max(0, options.postRoll ?? 8)
   const sampleRate = options.sampleRate ?? a.sampleRate
@@ -102,17 +108,18 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
     createBufferDeck(ctx, deckA.input, bufferDeckKind(braked.plan, aFrom, length, tempoChangeKind), { onLimiter: (stats) => options.onDeckLimiter?.('a', stats) }),
     createBufferDeck(ctx, deckB.input, bufferDeckKind(planB, bAt, bTo, tempoChangeKind), { onLimiter: (stats) => options.onDeckLimiter?.('b', stats) }),
   ])
-  await Promise.all([playerA.load(stereo(a), 0, a.sampleRate), playerB.load(stereo(b), 0, b.sampleRate)])
+  await Promise.all([playerA.load(stereo(a), options.origins?.a ?? 0, a.sampleRate), playerB.load(stereo(b), options.origins?.b ?? 0, b.sampleRate)])
   playerA.play(braked.plan, aFrom, length, zero, braked.semitones)
   playerA.stopAt(zero + length + 0.02)
   playerB.play(planB, bAt, bTo, zero)
   // Real stems play along with their deck's source, into its stem split.
   const stemPlayers = []
   for (const [deck, stems] of [['a', options.stems?.a], ['b', options.stems?.b]] as const) {
-    for (const [stem, buffer] of Object.entries(stems ?? {}) as Array<['drums' | 'vocals' | 'instrumental', AudioBuffer]>) {
+    for (const [stem, given] of Object.entries(stems ?? {}) as Array<['drums' | 'vocals' | 'instrumental', NonNullable<RenderStems['drums']>]>) {
+      const { buffer, origin } = given instanceof AudioBuffer ? { buffer: given, origin: 0 } : given
       const out = new GainNode(ctx)
       const player = await createBufferDeck(ctx, out, deck === 'a' ? playerA.kind : playerB.kind)
-      await player.load(stereo(buffer), 0, buffer.sampleRate)
+      await player.load(stereo(buffer), origin, buffer.sampleRate)
       if (deck === 'a') {
         player.play(braked.plan, aFrom, length, zero, braked.semitones)
         player.stopAt(zero + length + 0.02)

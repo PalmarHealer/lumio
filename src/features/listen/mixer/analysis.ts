@@ -286,14 +286,17 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
       }
       return count > 0 ? sum / count : 0
     }
-    const assumedAt = (level: number) =>
+    const assumedAt = (level: number, outros = true) =>
       cleanSpans(
-        sections.filter((s) => midOver(s.start, s.end) >= level).map((s) => ({ start: Math.max(0, s.start - pad), end: Math.min(duration, s.end + pad) })),
+        sections
+          .filter((s) => (outros || s.kind !== 'outro') && midOver(s.start, s.end) >= level)
+          .map((s) => ({ start: Math.max(0, s.start - pad), end: Math.min(duration, s.end + pad) })),
         duration,
       )
     vocals = assumedAt(voiceMid)
-    // Lines not to be cut or skipped (clean): for unplaced lyrics only the clearly vocal sections, not the whole song.
-    lineSpans = mix.vocalSource === 'unplaced' ? assumedAt(ASSUMED_LINE_MID) : vocals
+    // Lines not to be cut or skipped (clean): for unplaced lyrics only the clearly vocal sections, not the whole song;
+    // and never an outro, where a clean mix may leave (assumed singing there is no line it knows of).
+    lineSpans = assumedAt(mix.vocalSource === 'unplaced' ? ASSUMED_LINE_MID : voiceMid, false)
   }
   const vocalsAssumed = !vocalsKnown && vocals.length > 0
 

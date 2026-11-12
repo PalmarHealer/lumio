@@ -1,5 +1,5 @@
 import { mixOf, type MixLookup } from './analysis.ts'
-import { finalizeTransition, planFallback, planTransition } from './planner.ts'
+import { finalizeTransition, planFallback, planTransition, techniqueOf, type Technique } from './planner.ts'
 import { deckPosition } from './timeline.ts'
 import { PRESETS } from './presets.ts'
 import { pairKey, type MixStyle, type PlaylistMixer, type Transition, type TrackMix } from './types.ts'
@@ -15,7 +15,28 @@ import { pairKey, type MixStyle, type PlaylistMixer, type Transition, type Track
 export interface ResolveOptions {
   /** Song lengths (seconds) by id, for songs without an analysis yet. */
   durations?: Readonly<Record<string, number>>
+  /** Techniques not to use for this pair (a set's variety, see `varietyAvoid`). */
+  avoid?: Technique[]
 }
+
+/** At most this share of a set's transitions may use each special technique. */
+const TECHNIQUE_SHARE: Record<Technique, number> = { dropSwap: 1 / 4, callback: 1 / 6, wordplay: 1, mashup: 1 / 4 }
+
+/**
+ * The techniques the next transition of a set should avoid, from those planned so far (in order; undefined for a plain
+ * one): never the same special technique twice in a row, and none beyond its share of the set.
+ */
+export function varietyAvoid(history: ReadonlyArray<Technique | undefined>): Technique[] {
+  const avoid = new Set<Technique>()
+  const last = history[history.length - 1]
+  if (last) avoid.add(last)
+  const count = (t: Technique) => history.filter((h) => h === t).length
+  for (const t of Object.keys(TECHNIQUE_SHARE) as Technique[]) if (count(t) + 1 > Math.max(1, (history.length + 1) * TECHNIQUE_SHARE[t])) avoid.add(t)
+  return [...avoid]
+}
+
+/** The special technique of a planned transition (undefined for plain ones and stored ones). */
+export { techniqueOf }
 
 type Transitions = Readonly<Record<string, Transition>>
 
@@ -65,7 +86,7 @@ export function storedFits(transition: unknown, fromId: string, toId: string, aD
 export function autoTransition(fromId: string, toId: string, mixes: MixLookup, style: MixStyle, opts: ResolveOptions = {}): Transition {
   const a = mixOf(mixes, fromId)
   const b = mixOf(mixes, toId)
-  if (a && b) return planTransition(a, b, { from: fromId, to: toId }, style)
+  if (a && b) return planTransition(a, b, { from: fromId, to: toId }, style, opts.avoid ? { avoid: opts.avoid } : {})
   if (a) return planTransition(a, null, { from: fromId, to: toId }, style)
   return planFallback(fromId, toId, durationOf(a, fromId, opts), style)
 }
@@ -112,6 +133,8 @@ export function buildTransitions(
   const previous = transitionsOf(existing)
   const transitions: Record<string, Transition> = {}
   let kept = 0
+  // The set's techniques so far, so it stays varied (no two drop swaps in a row, a few of each).
+  const history: Array<Technique | undefined> = []
   for (let i = 0; i + 1 < order.length; i++) {
     const from = order[i]
     const to = order[i + 1]
@@ -123,11 +146,13 @@ export function buildTransitions(
       const bDuration = durationOf(mixOf(mixes, to), to, opts)
       if (storedFits(stored, from, to, aDuration, bDuration)) {
         transitions[key] = stored
+        history.push(undefined)
         kept++
         continue
       }
     }
-    transitions[key] = autoTransition(from, to, mixes, style, opts)
+    transitions[key] = autoTransition(from, to, mixes, style, { ...opts, avoid: varietyAvoid(history) })
+    history.push(techniqueOf(transitions[key]))
   }
   return { transitions, replacedCustom: customCount(previous) - kept }
 }

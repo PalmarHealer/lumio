@@ -47,7 +47,16 @@ import type { DeckAutomation, DeckSegment, Keyframe, MixStyle, PresetId, TrackMi
 export interface PlanOptions {
   /** Use this technique (the editor's preset menu, or switching one transition's style); the planner picks where. */
   preset?: PresetId
+  /** Techniques not to use here ("sort & build" keeps a set varied: no two drop swaps in a row, a few of each). */
+  avoid?: Technique[]
 }
+
+/** The special techniques a set should vary (the rest are plain blends, echoes, fades). */
+export type Technique = 'dropSwap' | 'callback' | 'wordplay' | 'mashup'
+
+/** The special technique a planned transition uses, when the planner made it in this session (else undefined). */
+const techniques = new WeakMap<Transition, Technique>()
+export const techniqueOf = (transition: Transition): Technique | undefined => techniques.get(transition)
 
 export interface TempoMatch {
   /** Beatmatched: B plays at `rate` (relative to A) during the overlap. */
@@ -1985,7 +1994,15 @@ function planSeveral(
     if (isMashup && !mashupFits(placement, a, b, harmony)) return null
     if (placement.variant.preset === 'reverbOut' && !reverbFits(placement, a, b)) return null
     const dropSwap = placement.variant.volume === 'overlap' && placement.variant.bars === (placement.variant.pre ?? 0)
-    if (dropSwap && !placement.pb.drop && !placement.pb.chorus) return null
+    // A drop swap only where it genuinely fits (the user: "they can't always be done"): B lands on a real drop, A leaves
+    // at its boundary, not inside a line, and the energy holds or rises.
+    // (A cut inside a line only on a real drop, which masks it: the user's favourite Judas → Cannibal is one.)
+    const cutsLine = !!spanAt(a.vocals, positionA(placement, placement.stats.shape.length) - 0.05)
+    if (dropSwap && ((!placement.pb.drop && !placement.pb.chorus) || (cutsLine && !placement.pb.drop) || handoverDrop(placement, a, b) > 0.5)) return null
+    if (dropSwap && opts.avoid?.includes('dropSwap')) return null
+    if (placement.variant.callback && opts.avoid?.includes('callback')) return null
+    if ((placement.variant.volume === 'answer' || placement.variant.volume === 'jumpcut') && opts.avoid?.includes('wordplay')) return null
+    if (placement.variant.volume === 'mashup' && opts.avoid?.includes('mashup')) return null
     if (placement.variant.callback && !callbackFits(placement, a)) return null
     if (placement.beatmatched) {
       const aligned = alignPhase(placement, a, b, tempo.multiple)
@@ -2166,6 +2183,18 @@ function planSeveral(
   if (kept.length === 0) return single(finalizeTransition(backToBack(ids, style, a.duration, 0.5, tempoUsed), a.duration, b.duration))
   return kept.map(({ placement }) => {
     const transition = build(placement)
+    const v = placement.variant
+    const technique: Technique | undefined =
+      v.volume === 'overlap' && v.bars === (v.pre ?? 0)
+        ? 'dropSwap'
+        : v.callback
+          ? 'callback'
+          : v.volume === 'answer' || v.volume === 'jumpcut'
+            ? 'wordplay'
+            : v.volume === 'mashup'
+              ? 'mashup'
+              : undefined
+    if (technique) techniques.set(transition, technique)
     return { transition, label: labelOf(transition, placement) }
   })
 
@@ -2329,6 +2358,11 @@ function leadIns(tr: Transition, b: PreparedTrack): Transition {
   let pathA = lead(tr.pathA)
   let pathB = lead(tr.pathB)
   let { bAt, bIn, rateB } = tr
+  // When B's first downbeat sounds (B's lane may start a little off it after the phase fit).
+  const firstRate = tr.rateB.length > 0 ? tr.rateB[0].v : 1
+  const nearDownbeat = nearest(b.downbeats, tr.bIn)
+  const downbeat = Math.abs(nearDownbeat - tr.bIn) < 0.1 ? tr.bAt + (nearDownbeat - tr.bIn) / firstRate : tr.bAt
+  let automationA = tr.a
   let automation = tr.b
   if (tr.length > 0) {
     const i = floorIndex(b.beats, bIn + 0.1)
@@ -2348,7 +2382,22 @@ function leadIns(tr: Transition, b: PreparedTrack): Transition {
   }
   pathA = pathA.map((s) => ({ ...s, from: round(s.from), to: round(s.to) }))
   pathB = pathB.map((s) => ({ ...s, from: round(s.from), to: round(s.to) }))
-  return { ...tr, pathA, pathB, bAt, bIn, rateB, b: automation }
+  // A bass change at B's entry lands on B's first downbeat (where B's lane was placed), not a ramp or two after it: A's
+  // low is gone and B's is up exactly there (they cross over the ramp before it).
+  if (tr.length > 0) {
+    // The step (a jump between 0 and 1 within a ramp) nearest B's entry, and how far it lands from the downbeat.
+    const window = (k: Keyframe) => k.t >= tr.bAt - 3 * RAMP && k.t <= tr.bAt + 4 * RAMP
+    const off = (list: Keyframe[], rising: boolean) => {
+      const step = list.find((k, n) => n > 0 && window(k) && (rising ? k.v >= 0.99 && list[n - 1].v <= 0.01 : k.v <= 0.01 && list[n - 1].v >= 0.99))
+      return step ? step.t - downbeat : 0
+    }
+    const shiftB = off(automation.low, true)
+    const shiftA = off(automationA.low, false)
+    const move = (list: Keyframe[], by: number) => list.map((k) => (window(k) ? { ...k, t: Math.max(0, k.t - by) } : k))
+    if (Math.abs(shiftB) > 1e-4) automation = { ...automation, low: move(automation.low, shiftB) }
+    if (Math.abs(shiftA) > 1e-4) automationA = { ...automationA, low: move(automationA.low, shiftA) }
+  }
+  return { ...tr, pathA, pathB, bAt, bIn, rateB, a: automationA, b: automation }
 }
 
 /**

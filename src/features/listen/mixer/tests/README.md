@@ -14,6 +14,15 @@ type-checked with `tsconfig.node.json` (they need Node's types) and kept out of 
 - `planner.test.ts`: `planTransition`/`planVariants` scenarios (tempo gaps, half time, vocals, drops, unsure and
   garbage analyses, forced presets, attack clarity, loops, loudness, opt-in options, timing).
 - `sort.test.ts`: `sortForMix` and `buildTransitions`/`transitionFor` on a seeded synthetic library.
+- `engine.test.ts`: the engine's pure parts: curve values and steps, the kill high-pass and filter mappings, the
+  coloured span, echo and reverb tails, and what `scheduleAutomation` puts on each param (on a stand-in deck from
+  `deck-fixtures.ts`, read back from the engine's own timeline).
+- `schedule.test.ts`: deck positions against the integral of the rate, schedule points without drift, loops, B settling,
+  stretched spans and the buffer deck's kind.
+- `xcorr.test.ts`: locating a recording inside a slice, to the sample and between samples.
+
+What needs real Web Audio (rendering, the stretcher, the reverb, timing in a real-time context) is checked in a browser:
+`../checks/*.html` on the dev server.
 
 ## Real songs (not in the repository)
 

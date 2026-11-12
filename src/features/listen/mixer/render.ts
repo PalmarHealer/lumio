@@ -1,7 +1,7 @@
-import { bufferDeckKind, createBufferDeck, tempoChangeKind } from './buffer-deck'
-import { bSettled, deckPlan, withBrake } from './deck-schedule'
-import { asPlayed, createDeck, createMaster, limiterLatency, resetDeck, releaseEcho, releaseReverb, scheduleTransition, tailsEnd, type LimiterStats } from './engine'
-import type { Transition } from './types'
+import { bufferDeckKind, createBufferDeck, tempoChangeKind } from './buffer-deck.ts'
+import { bSettled, deckPlan, withBrake } from './deck-schedule.ts'
+import { asPlayed, createDeck, createMaster, limiterLatency, resetDeck, releaseEcho, releaseReverb, scheduleTransition, tailsEnd, type LimiterStats } from './engine.ts'
+import type { Transition } from './types.ts'
 
 /**
  * Renders a transition to audio, offline: the editor's preview, and demo mixes. It runs what the player runs during a
@@ -40,7 +40,7 @@ const LIMITER_LEAD_S = 0.05
 const STRETCH_LEAD_S = 0.5
 
 /** How decks whose tempo changes are played: buffer-deck.ts' setting (re-exported for the editor and demos). */
-export { setTempoChangeKind } from './buffer-deck'
+export { setTempoChangeKind } from './buffer-deck.ts'
 
 /** A buffer's channels as two (a mono file plays on both sides). */
 const stereo = (buffer: AudioBuffer) => [buffer.getChannelData(0), buffer.getChannelData(Math.min(1, buffer.numberOfChannels - 1))] as Float32Array<ArrayBuffer>[]

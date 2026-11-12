@@ -1,6 +1,6 @@
-import { brakeRateAt } from './engine'
-import { lanePosition, rateAdvance, type Lane } from './timeline'
-import type { Keyframe, Transition } from './types'
+import { brakeRateAt } from './engine.ts'
+import { lanePosition, rateAdvance, type Lane } from './timeline.ts'
+import type { Keyframe, Transition } from './types.ts'
 
 /**
  * How a time-stretching player plays one deck of a transition (v2): where the deck is in its track at each moment and

@@ -1,6 +1,6 @@
-import { deckSchedule, positionAt, rateOf, type DeckPlan } from './deck-schedule'
-import { createDeckLimiter, holdAt, rampAt, setAt, type LimiterStats } from './engine'
-import { createStretch } from './stretch'
+import { deckSchedule, positionAt, rateOf, type DeckPlan } from './deck-schedule.ts'
+import { createDeckLimiter, holdAt, rampAt, setAt, type LimiterStats } from './engine.ts'
+import { createStretch } from './stretch.ts'
 
 /**
  * A deck playing a transition from decoded audio, sample-exactly on the transition's clock: its path (loops,
@@ -154,7 +154,7 @@ export const EXACT_RATE_TOLERANCE = 0.003
 /** Which way a deck plays: exactly while its rate stays within the tolerance of 1 over the window, else `tempoChange`. */
 export function bufferDeckKind(plan: DeckPlan, from: number, to: number, tempoChange: BufferDeckKind): BufferDeckKind {
   // The curve is linear between keyframes: its furthest point from 1 is at a keyframe (or where the window starts).
-  const deviation = Math.max(Math.abs(rateOf(plan, from) - 1), ...plan.rate.filter((keyframe) => keyframe.t <= to).map((keyframe) => Math.abs(keyframe.v - 1)))
+  const deviation = Math.max(Math.abs(rateOf(plan, from) - 1), ...plan.rate.filter((keyframe) => keyframe.t >= from && keyframe.t <= to).map((keyframe) => Math.abs(keyframe.v - 1)))
   return deviation > EXACT_RATE_TOLERANCE ? tempoChange : 'exact'
 }
 

@@ -1,4 +1,4 @@
-import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './types'
+import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './types.ts'
 
 /**
  * The mixer's audio graph: one "deck" per playing track, the same for live playback (an AudioContext fed by the

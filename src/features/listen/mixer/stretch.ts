@@ -1,5 +1,5 @@
 import type { StretchNode } from 'signalsmith-stretch'
-import type { SchedulePoint } from './deck-schedule'
+import type { SchedulePoint } from './deck-schedule.ts'
 
 /**
  * A deck playing from decoded audio with time-stretching (pitch kept): Signalsmith Stretch (MIT, WASM in an

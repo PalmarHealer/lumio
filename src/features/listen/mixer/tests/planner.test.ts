@@ -183,6 +183,25 @@ test('relaxVoices is opt-in: off by default, labelled when used', () => {
   for (const v of relaxed) assert.ok(v.transition.preset !== 'blend' || v.label.startsWith('Test: Gesang darf sich kurz berühren'), v.label)
 })
 
+test('back to back is never automatic (round 2), only when picked', () => {
+  const pairs: Array<[any, any]> = [[A1, B1], [A1, B3], [A5, B5], [A6, B1], [A6b, B1], [A4, B4b], [A7, B7]]
+  for (const style of ['clean', 'party'] as const) {
+    for (const [a, b] of pairs) {
+      for (const v of planVariants(a, b, { from: 'A', to: 'B' }, style, { count: 4 })) assert.notEqual(v.transition.preset, 'none', `${style}: ${v.label}`)
+    }
+    assert.equal(planTransition(A1, B1, { from: 'A', to: 'B' }, style, { preset: 'none' }).preset, 'none')
+  }
+})
+
+test("echo out: B's bass eases in over a bar after A's goes", () => {
+  const tr = planTransition(A1, B3, { from: 'A', to: 'B' }, 'party', { preset: 'echoOut' })
+  assert.equal(tr.preset, 'echoOut')
+  const aLowGone = tr.a.low.find((k: any) => k.v <= 0.05)?.t ?? 0
+  const bLowFull = tr.b.low.find((k: any) => k.v >= 0.99)?.t ?? 0
+  const beat = 60 / tr.tempo.a
+  assert.ok(bLowFull - aLowGone >= 4 * beat - 0.05, `B's low full ${(bLowFull - aLowGone).toFixed(2)} s after A's went`)
+})
+
 test('timing: 100 plans', () => {
   const t0 = performance.now()
   for (let i = 0; i < 100; i++) planTransition(A7, B7, { from: 'A' + i, to: 'B' }, i % 2 ? 'clean' : 'party')

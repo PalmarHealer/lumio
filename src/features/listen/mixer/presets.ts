@@ -411,8 +411,9 @@ function echoOut(ctx: PresetContext): PresetShape {
       // A's low goes on the meet, so neither A nor its echoes carry a bassline under B's.
       low: [[0, 1], ...stepAt(meet, 1, 0)],
     }),
-    // B's bass comes up over its first beat (round 1: "B's bass beats come in too strong/fast").
-    b: automation(length, { gain: [[0, 0], ...stepFrom(meet, 0, 1)], low: [[meet, 0], [meet + ctx.beat, 1]] }),
+    // B's bass comes up over a bar after A's (round 1: "B's bass beats come in too strong/fast"; round 2: "grausam, man
+    // merkt den Bass-Swap"): no audible swap, B's low eases in under A's high-passed echoes.
+    b: automation(length, { gain: [[0, 0], ...stepFrom(meet, 0, 1)], low: [[meet, 0], [meet + 2 * ctx.beat, 0.35], [meet + 4 * ctx.beat, 1]] }),
     effects: [{ kind: 'echo', deck: 'a', at: 0, beats, feedback }],
     anchorA: meet,
     anchorB: meet,
@@ -768,11 +769,19 @@ function blend(ctx: PresetContext): PresetShape {
             [0, 0],
             [middle, 1],
           ]
-        : [
-            // B rises over its first bar (a quarter of a short blend) instead of jumping in.
-            [0, 0],
-            [Math.max(RAMP, Math.min(4 * ctx.beat, length / 4)), 1],
-          ]
+        : middle >= length - 1e-6
+          ? [
+              // A drop swap's run-up: B rises to half (-6 dB) over all but its last beat, and to full over that beat
+              // into its drop (round 2, Toosie Slide → As It Was: "okay, aber zu schnell laut B").
+              [0, 0],
+              [Math.max(RAMP, length - ctx.beat), 0.5],
+              [length, 1],
+            ]
+          : [
+              // B rises over its first bar (a quarter of a short blend) instead of jumping in.
+              [0, 0],
+              [Math.max(RAMP, Math.min(4 * ctx.beat, length / 4)), 1],
+            ]
   const swapAt = bassAt === 'start' || middle === 0 ? RAMP : middle
   // A DJ's bass swap is gradual: A's low goes down to half over the two bars before the phrase downbeat and is gone on
   // it, where B's low comes in (never both full: B's stays killed until then).

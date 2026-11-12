@@ -484,6 +484,9 @@ function blendFinishes(variant: Variant, clash: boolean, hold = false): Variant[
   return list
 }
 
+/** How far an echo out's prior sits under the reverb out's (round 2). */
+const ECHO_BELOW = 0.1
+
 /** The best prior any finish of a blend layout can add (so the bound stays an upper bound). */
 const BEST_FINISH = 0.05
 
@@ -528,22 +531,24 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
   // tempos can be matched and it passes every rule (its prior outweighs the score terms of a neat echo out); without a
   // match, an echo out or a filtered fade.
   // The reverb out is the softer echo out: A dissolves into B (a sparse or sung ending suits it).
+  // Round 2: echo outs were rated "schlecht" or 3 stars on four pairs (the Right Round → Beauty And A Beat one stays
+  // "gut"): an echo out comes after the blends, the reverb out and the fades (ECHO_BELOW).
   if (style === 'clean' && synced) {
     addBlends(0.9)
-    add('echoOut', 0)
+    add('echoOut', -ECHO_BELOW)
     add('reverbOut', 0.01, [4, 2])
     add('fadeOut', -0.02, [4])
   } else if (style === 'clean') {
-    add('echoOut', 0.15)
+    add('echoOut', 0.15 - ECHO_BELOW)
     add('reverbOut', 0.16, [2])
     add('fadeOut', 0.12, [4])
     add('fadeIn', 0, [2])
   } else if (synced) {
     addBlends(0.75)
-    add('echoOut', 0.05)
+    add('echoOut', 0.05 - ECHO_BELOW)
     add('reverbOut', 0.05, [4, 2])
   } else {
-    add('echoOut', 0.12)
+    add('echoOut', 0.12 - ECHO_BELOW)
     add('reverbOut', 0.12, [2])
     add('fadeOut', 0.05, [4])
   }
@@ -1954,15 +1959,90 @@ function planSeveral(
   opts: PlanOptions,
   count: number,
 ): PlanVariant[] {
-  const plans = planWith(aMix, bMix, ids, style, opts, count, false)
-  if (style !== 'party' || (opts.preset && opts.preset !== 'auto' && opts.preset !== 'blend')) return plans
-  const hasBlend = plans.some((v) => v.transition.preset === 'blend')
-  if (hasBlend && count < 2) return plans
-  const held = planWith(aMix, bMix, ids, style, opts, count, true)
-  if (!hasBlend) return held.some((v) => v.transition.preset === 'blend') ? held : plans
-  const extra = held.find((v) => heldPlans.has(v.transition))
-  if (!extra) return plans
-  return [...plans.slice(0, Math.min(plans.length, count - 1)), extra]
+  const forced = opts.preset && opts.preset !== 'auto' ? opts.preset : undefined
+  if (forced === 'none') return planWith(aMix, bMix, ids, style, opts, count, false)
+  return realTransitions(withHeld(), aMix, bMix, ids, style, opts, count)
+
+  function withHeld(): PlanVariant[] {
+    const plans = planWith(aMix, bMix, ids, style, opts, count, false)
+    if (style !== 'party' || (forced && forced !== 'blend')) return plans
+    const blends = (list: PlanVariant[]) => list.some((v) => v.transition.preset === 'blend')
+    const hasBlend = blends(plans)
+    if (hasBlend && count < 2) return plans
+    const held = planWith(aMix, bMix, ids, style, opts, count, true)
+    if (!hasBlend) {
+      if (blends(held)) return held
+      // Round 2: two songs singing nonstop (Bad Habits → Hero) blend with their voices touching for up to 1.5 bars, one
+      // of them filtered, rather than echo out (rated 3 stars against "schlecht"). Labelled like a plain blend.
+      if (opts.relaxVoices) return plans
+      const relaxed = planWith(aMix, bMix, ids, style, { ...opts, relaxVoices: RELAX_DEFAULT_BARS }, count, true)
+      return blends(relaxed) ? relaxed.map((v) => ({ ...v, label: v.label.replace(RELAX_LABEL, '') })) : plans
+    }
+    const extra = held.find((v) => heldPlans.has(v.transition))
+    if (!extra) return plans
+    return [...plans.slice(0, Math.min(plans.length, count - 1)), extra]
+  }
+}
+
+/** Voices may touch this many bars in a party blend that otherwise wouldn't exist (see `planSeveral`). */
+const RELAX_DEFAULT_BARS = 1.5
+const RELAX_LABEL = 'Test: Gesang darf sich kurz berühren · '
+
+/**
+ * Back to back is never the automatic choice (round 2: rated "schlecht" on all four pairs that got it): a pair nothing
+ * else fits gets the best of a reverb out, a fade or an echo out the rules allow, or else a short crossfade at A's end.
+ * Back to back only when picked (`preset: 'none'`).
+ */
+function realTransitions(plans: PlanVariant[], aMix: TrackMix | null, bMix: TrackMix | null, ids: { from: string; to: string }, style: MixStyle, opts: PlanOptions, count: number): PlanVariant[] {
+  const isNone = (v: PlanVariant) => v.transition.preset === 'none'
+  if (!plans.some(isNone)) return plans
+  const fallbacks: PresetId[] = style === 'party' ? ['reverbOut', 'fadeOut', 'echoOut'] : ['reverbOut', 'fadeOut', 'fadeIn', 'echoOut']
+  const real: PlanVariant[] = plans.filter((v) => !isNone(v))
+  // (Planned by party's rules, which may cut into a line at a price, where clean's would leave nothing.)
+  for (const rules of style === 'clean' ? (['clean', 'party'] as const) : (['party'] as const)) {
+    for (const preset of fallbacks) {
+      if (real.length >= count) break
+      const found = planWith(aMix, bMix, ids, rules, { ...opts, preset }, 1, false).find((v) => !isNone(v))
+      if (found && !real.some((v) => v.label === found.label)) real.push({ ...found, transition: { ...found.transition, style } })
+    }
+    if (real.length > 0) break
+  }
+  if (real.length === 0) {
+    const transition = endFade(prepareTrack(aMix), prepareTrack(bMix), ids, style)
+    if (transition) real.push({ transition, label: labelOf(transition) })
+  }
+  return real.length > 0 ? real.slice(0, count) : plans
+}
+
+/**
+ * The last resort instead of back to back: A plays on at full volume to its audible end (its lines whole), B fades in
+ * under its last two beats under an opening low-pass, from a beat of A. Null without A's grid.
+ */
+function endFade(a: PreparedTrack | null, b: PreparedTrack | null, ids: { from: string; to: string }, style: MixStyle): Transition | null {
+  if (!a || !b || a.beats.length === 0) return null
+  const latest = a.end - 2 * a.period
+  const aOut = [...a.beats].reverse().find((d) => d <= latest + 0.02)
+  if (aOut === undefined || aOut < 0) return null
+  const length = Math.min(a.duration - aOut, Math.max(2 * a.period, a.end - aOut))
+  if (!(length > 0.5)) return null
+  const bIn = Math.max(0, Math.min(b.downbeats[0] ?? 0, b.duration * 0.25))
+  const transition = plain(ids, style, 'fadeIn', {
+    aOut,
+    bIn,
+    length,
+    a: { gain: [{ t: 0, v: 1 }, { t: Math.max(0, length - 0.05), v: 1 }, { t: length, v: 0 }], low: [], mid: [], high: [], filter: [] },
+    // B under an opening low-pass (its beats muffled, they don't run against A's), its bass in as A ends.
+    b: {
+      gain: [{ t: 0, v: 0 }, { t: length, v: 1 }],
+      low: [{ t: 0, v: 0 }, { t: Math.max(0, length - 0.05), v: 0 }, { t: length, v: 1 }],
+      mid: [],
+      high: [],
+      filter: [{ t: 0, v: -0.6 }, { t: length, v: 0 }],
+    },
+    confidence: 0.4,
+    tempo: { a: tempoOf(a), b: tempoOf(b) },
+  })
+  return finalizeTransition(transition, a.duration, b.duration)
 }
 
 function planWith(
@@ -2013,10 +2093,11 @@ function planWith(
   const shapes = new Map<string, ShapeStats>()
 
   // Vocals estimated from the audio (no synced lyrics) count for less: they also catch leads and synths.
-  // Assumed vocals (nothing measured: the voice-like body sections) keep a clean mix from cutting into them like lines;
-  // party may cut them at a lower price.
+  // Assumed vocals (nothing measured: the voice-like body sections) count for little: they're often wrong (round 1,
+  // Do I Wanna Know → Cro: "the assumed singing is very wrong here"; rounds 1 and 2, Titanium → Animals: the blends
+  // that low-pass A's assumed-singing outro got 5 stars three times).
   const vocalTrust = (track: PreparedTrack) =>
-    track.vocalsAssumed ? (party ? 0.3 : 1) : !track.vocalsKnown ? 0 : track.mix.vocalSource === 'lyrics' ? 1 : 0.6
+    track.vocalsAssumed ? (party ? 0.2 : 0.25) : !track.vocalsKnown ? 0 : track.mix.vocalSource === 'lyrics' ? 1 : 0.6
   const trustA = vocalTrust(a)
   const trustB = vocalTrust(b)
 
@@ -2505,12 +2586,24 @@ function planWith(
   const kept: Array<{ placement: Placement; score: number }> = []
   // The bar a candidate has to beat: the last kept once there are `count`.
   const bar = () => (kept.length >= count ? kept[kept.length - 1] : null)
+  // Variants show more than one technique: at most half of them (and never all but one) drop swaps, so a pair whose
+  // drop swaps lead still shows its best blend (round 2: Feel So Close → Coming Back's rated blend had gone).
+  const maxSwaps = count >= 3 ? Math.floor(count / 2) : count
+  const isSwap = (p: Placement) => p.variant.volume === 'overlap' && p.variant.bars === (p.variant.pre ?? 0)
   const keep = (judged: { placement: Placement; score: number }) => {
     const kind = kindOf(judged.placement)
     const same = kept.findIndex((k) => kindOf(k.placement) === kind)
     if (same >= 0) {
       if (kept[same].score >= judged.score) return
       kept.splice(same, 1)
+    }
+    if (isSwap(judged.placement)) {
+      const swaps = kept.filter((k) => isSwap(k.placement))
+      if (swaps.length >= maxSwaps) {
+        const worst = swaps[swaps.length - 1]
+        if (worst.score >= judged.score) return
+        kept.splice(kept.indexOf(worst), 1)
+      }
     }
     kept.push(judged)
     kept.sort((x, y) => y.score - x.score)

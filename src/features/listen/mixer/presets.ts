@@ -76,8 +76,12 @@ export interface PresetContext {
   /**
    * Blend: a filter on B opening up to the swap, and on A closing after it (high- or low-pass); or A's EQ worked down
    * before the swap, highs first, then mids (its voice), bass last on the swap ('eq': making a gap for B).
+   * 'lpHold' on B: a hard low-pass (its snares, claps, hats and chops gone) from the start, with B's bass taking over
+   * there; A's mids and highs go over the second-last beat and A with them, then B's filter opens over the last beat
+   * (the user's Spotify Rock That Body → Outside: Outside low-passed in under A). Accents of both are never heard
+   * together.
    */
-  filterIn?: 'hp' | 'lp' | null
+  filterIn?: 'hp' | 'lp' | 'lpHold' | null
   filterOut?: 'hp' | 'lp' | 'eq' | null
   /**
    * Blend: the callback (the user's "interessant"): B, faded in under its opening low-pass, is muted for the bar before
@@ -714,6 +718,8 @@ function mashup(ctx: PresetContext): PresetShape {
 
 /** A band EQ'd out in a blend: about -16 dB, under the -10 dB from which a deck's hats and snares are heard to flam. */
 const EQ_OUT = 0.15
+/** The held low-pass on B ('lpHold'): about 220 Hz, its kick and bass through, its mids and accents gone. */
+const LP_HOLD = -0.8
 
 function blend(ctx: PresetContext): PresetShape {
   if (ctx.volume === 'mashup') return mashup(ctx)
@@ -837,6 +843,32 @@ function blend(ctx: PresetContext): PresetShape {
     }
     bGainPoints.splice(0, bGainPoints.length, ...curve, [gap + RAMP, 0], [middle - RAMP, 0], [middle, 1])
   }
+  if (filterIn === 'lpHold' && length >= 4 * ctx.beat) {
+    const open = length - ctx.beat
+    return {
+      preset: 'blend',
+      length,
+      a: automation(length, {
+        gain: [[0, 1], [open, 1], [Math.min(length, open + RAMP), 0]],
+        low: aLow,
+        mid: [[open - ctx.beat, 1], [open, 0]],
+        high: [[open - ctx.beat, 1], [open, 0]],
+      }),
+      b: automation(length, {
+        gain: bGainPoints,
+        low: bLow,
+        filter: [
+          [0, LP_HOLD],
+          [open, LP_HOLD],
+          [length, 0],
+        ],
+      }),
+      effects: [],
+      anchorA: 0,
+      anchorB: 0,
+      swap: middle,
+    }
+  }
   return {
     preset: 'blend',
     length,
@@ -860,9 +892,9 @@ function blend(ctx: PresetContext): PresetShape {
       mid: bMid,
       high: bHigh,
       filter:
-        filterIn && middle > 0
+        filterIn && filterIn !== 'lpHold' && middle > 0
           ? [
-              [0, knob(filterIn)],
+              [0, filterIn === 'hp' ? 0.6 : -0.6],
               [middle, 0],
             ]
           : [],

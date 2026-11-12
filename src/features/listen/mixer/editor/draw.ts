@@ -95,6 +95,12 @@ export function drawDeck(g: CanvasRenderingContext2D, axis: Axis, transition: Tr
     g.fillStyle = STUDIO.high
     g.fillRect(x, middle - total, 1, total * 2)
   }
+  // Where the left-out material is sung (a skipped intro with singing in it, a cut outro's last line).
+  g.globalAlpha = 0.45
+  g.fillStyle = STUDIO.vocal
+  for (let x = 0; x < drawing.ghost.length; x++) {
+    if (drawing.ghost[x]?.vocal && (!drawing.vocalsAssumed || x % 6 < 3)) g.fillRect(x, top + height - 5, 1, 4)
+  }
   g.globalAlpha = 1
 
   for (let x = 0; x < width; x++) {
@@ -112,6 +118,12 @@ export function drawDeck(g: CanvasRenderingContext2D, axis: Axis, transition: Tr
     const h = column.high * (inside(t) ? eqHigh : 1)
     const sum = column.low + column.mid + column.high || 1
     const total = Math.min(1, column.energy * level * ((l + m + h) / sum)) * reach
+    // Singing is marked whether or not it is heard here (a faded-out voice is still a voice to plan around).
+    if (column.vocal && (!drawing.vocalsAssumed || x % 6 < 3)) {
+      g.globalAlpha = drawing.vocalsAssumed ? 0.55 : 1
+      g.fillStyle = STUDIO.vocal
+      g.fillRect(x, top + height - 5, 1, 4)
+    }
     if (total <= 0.2) continue
     const share = l + m + h || 1
     g.globalAlpha = inside(t) ? 1 : 0.38
@@ -123,11 +135,6 @@ export function drawDeck(g: CanvasRenderingContext2D, axis: Axis, transition: Tr
     const highPart = total * (h / share)
     g.fillStyle = STUDIO.high
     g.fillRect(x, middle - highPart, 1, highPart * 2)
-    if (column.vocal && (!drawing.vocalsAssumed || x % 6 < 3)) {
-      g.globalAlpha = drawing.vocalsAssumed ? 0.55 : 1
-      g.fillStyle = STUDIO.vocal
-      g.fillRect(x, top + height - 4, 1, 3)
-    }
   }
   g.globalAlpha = 1
 

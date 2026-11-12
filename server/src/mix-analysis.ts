@@ -127,6 +127,13 @@ export interface TrackMix {
   energy: number[]
   /** Band energy per frame (0–1 each, relative to the band's loudest): low < 200 Hz, mid 200–2000 Hz, high > 2000 Hz. */
   bands: { low: number[]; mid: number[]; high: number[] }
+  /**
+   * Each band's level where its curve in `bands` is 1 (the band's loudest frame), in dB of full scale like `loudness`
+   * (the mean square of the samples in that band; one scale for every song). A frame's absolute band level is
+   * bandLoudness + 20·log10(curve value), so A's and B's lows, mids and highs can be compared. 0 for all three in
+   * analyses made before it.
+   */
+  bandLoudness: { low: number; mid: number; high: number }
   /** The song's structure, in order, covering the whole track. */
   sections: MixSection[]
   /** Drop moments (a phrase start where bass and energy jump after a build-up). */
@@ -279,7 +286,7 @@ interface ShortSpectra {
   /** Spectral flux (log magnitude rise), whole spectrum and below 200 Hz (kick and bass notes). */
   flux: Float64Array
   lowFlux: Float64Array
-  /** Power per band (low / mid / high, see the contract). */
+  /** Power per band (low / mid / high, see the contract), as summed FFT bin powers. */
   low: Float64Array
   mid: Float64Array
   high: Float64Array
@@ -288,6 +295,8 @@ interface ShortSpectra {
   /** Power in the vocal band (300–3000 Hz) of the mono mix (the stereo centre), and of the stereo sides (null: mono). */
   centre: Float64Array
   side: Float64Array | null
+  /** Turns a band's summed bin powers into the mean square of the samples in that band (Parseval, Hann window). */
+  powerScale: number
 }
 
 const TIMBRE_BANDS = 20
@@ -321,6 +330,8 @@ function shortSpectra(samples: Float32Array, rate: number, sides: Float32Array |
     timbre: new Float32Array(count * TIMBRE_COEFFS),
     centre: new Float64Array(count),
     side: sides ? new Float64Array(count) : null,
+    // The positive bins hold half of the windowed frame's energy, N·Σx²w²; Σw² is 3N/8 for a Hann window.
+    powerScale: 16 / (3 * size * size),
   }
   const window = Float64Array.from({ length: size }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / size))
   const re = new Float64Array(size)
@@ -1389,6 +1400,13 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
   }
   const energy = normalised(energyCurve)
   const bands = { low: normalised(lowCurve), mid: normalised(midCurve), high: normalised(highCurve) }
+  // Each band's level where its curve is 1 (its loudest frame), in dB of the samples' full scale like `loudness`.
+  const bandLevel = (curve: Float64Array) => {
+    let max = 0
+    for (const value of curve) max = Math.max(max, value)
+    return max > 0 ? round(10 * Math.log10(max * max * spectra.powerScale), 1) : -120
+  }
+  const bandLoudness = { low: bandLevel(lowCurve), mid: bandLevel(midCurve), high: bandLevel(highCurve) }
   // For decisions: levels relative to the loud parts of the song (its 95th percentile), so one peak doesn't skew them.
   const relative = (curve: Float64Array) => {
     const top = quantile(curve, 0.95) || 1
@@ -2081,6 +2099,7 @@ export function analyzeMix(audio: Float32Array | Float32Array[], rate: number, l
     frameRate: CURVE_RATE,
     energy,
     bands,
+    bandLoudness,
     sections,
     drops: drops.map((time) => round(time)),
     vocals: vocals.map((stretch) => ({ start: round(stretch.start, 2), end: round(stretch.end, 2) })),

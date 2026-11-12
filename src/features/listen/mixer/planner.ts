@@ -2492,7 +2492,9 @@ function leadIns(original: Transition, b: PreparedTrack, a?: PreparedTrack): Tra
     const beat = i >= 0 ? b.beats[i] : NaN
     const shift = tr.bIn - (beat - START_LEAD)
     const rate = tr.rateB.length > 0 ? tr.rateB[0].v : 1
-    if (Number.isFinite(beat) && shift > 0 && shift <= 0.1 + START_LEAD && tr.bIn - shift >= 0 && tr.bAt - shift / rate < 0) {
+    // (Only where B is heard from its lane's start on: an echo out's B stays silent until its phrase meets A.)
+    const heardAtStart = valueAt(tr.b.gain, tr.bAt + 2 * RAMP, 1) > 0.001
+    if (heardAtStart && Number.isFinite(beat) && shift > 0 && shift <= 0.1 + START_LEAD && tr.bIn - shift >= 0 && tr.bAt - shift / rate < 0) {
       // Back to A's downbeat before (so the transition still starts on one of A's).
       const need = shift / rate - tr.bAt + 0.001
       const rateA0 = tr.rateA.length > 0 ? tr.rateA[0].v : 1

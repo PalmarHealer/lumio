@@ -1572,11 +1572,45 @@ export function planTransition(
   style: MixStyle,
   opts: PlanOptions = {},
 ): Transition {
+  return planSeveral(aMix, bMix, ids, style, opts, 1)[0].transition
+}
+
+/** A plan for the review app's comparison, with a short German description of what it does. */
+export interface PlanVariant {
+  transition: Transition
+  label: string
+}
+
+/**
+ * The best few valid plans for a pair that differ in kind (layout, length or where the songs meet; not just a finish),
+ * best first, each with a short German label, e.g. "16 Takte Overlap · Bass in der Mitte · B ab 1:09".
+ */
+export function planVariants(
+  aMix: TrackMix | null,
+  bMix: TrackMix | null,
+  ids: { from: string; to: string },
+  style: MixStyle,
+  opts: PlanOptions & { count?: number } = {},
+): PlanVariant[] {
+  return planSeveral(aMix, bMix, ids, style, opts, Math.max(1, Math.round(opts.count ?? 4)))
+}
+
+function planSeveral(
+  aMix: TrackMix | null,
+  bMix: TrackMix | null,
+  ids: { from: string; to: string },
+  style: MixStyle,
+  opts: PlanOptions,
+  count: number,
+): PlanVariant[] {
+  const single = (transition: Transition): PlanVariant[] => [{ transition, label: labelOf(transition) }]
   const a = prepareTrack(aMix)
   const b = prepareTrack(bMix)
-  if (!a || !b || !a.grid || !b.grid) return safeCrossfade(a, b, ids, style)
+  if (!a || !b || !a.grid || !b.grid) return single(safeCrossfade(a, b, ids, style))
   const tempoUsed = { a: tempoOf(a), b: tempoOf(b) }
-  if (opts.preset === 'none') return finalizeTransition(backToBack(ids, style, a.duration, 0.9, tempoUsed), a.duration, b.duration)
+  const trackA = a
+  const trackB = b
+  if (opts.preset === 'none') return single(finalizeTransition(backToBack(ids, style, a.duration, 0.9, tempoUsed), a.duration, b.duration))
 
   const tempo = matchTempo(a, b)
   const harmony = harmonicScore(a, b)
@@ -1989,13 +2023,28 @@ export function planTransition(
     const score = -quiet + placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
-  let best: { placement: Placement; score: number } | null = null
+  // The best `count` judged plans that differ in kind (see `kindOf`); `best` is the last one kept, the bar to beat.
+  const kept: Array<{ placement: Placement; score: number }> = []
+  // The bar a candidate has to beat: the last kept once there are `count`.
+  const bar = () => (kept.length >= count ? kept[kept.length - 1] : null)
+  const keep = (judged: { placement: Placement; score: number }) => {
+    const kind = kindOf(judged.placement)
+    const same = kept.findIndex((k) => kindOf(k.placement) === kind)
+    if (same >= 0) {
+      if (kept[same].score >= judged.score) return
+      kept.splice(same, 1)
+    }
+    kept.push(judged)
+    kept.sort((x, y) => y.score - x.score)
+    if (kept.length > count) kept.length = count
+  }
   let judgedCount = 0
   for (const placement of placements) {
+    const best = bar()
     if (best && placement.bound <= best.score) break
     // A budget for the sampled checks (a playlist of hundreds is planned in one go): once it's spent, the best found
     // so far stands; without one yet, the search goes on.
-    if (best && judgedCount >= JUDGE_BUDGET) break
+    if (kept.length > 0 && judgedCount >= JUDGE_BUDGET * count) break
     // Clean style never skips a sung line: such a placement is out.
     if (!party && placement.sung > 0.5) continue
     // Far more risky bars heard on both decks than any finish could duck: none of its finishes will pass.
@@ -2003,33 +2052,70 @@ export function planTransition(
     // A blend's finishes, each sampled only when it could still beat the best.
     const tries = placement.variant.preset === 'blend' ? blendFinishes(placement.variant, clash) : [placement.variant]
     for (const variant of tries) {
+      const best = bar()
       if (best && placement.bound + variant.prior - placement.variant.prior - BEST_FINISH <= best.score) continue
       const candidate = variant === placement.variant ? placement : { ...placement, variant, stats: shapeFor(variant, placement.stats.beat) }
       if (candidate.stats.basses > 0.001 && candidate.variant.bassAt !== 'none') continue
       judgedCount++
       const judged = judge(candidate)
-      if (judged && (!best || judged.score > best.score)) best = judged
+      if (judged) keep(judged)
     }
   }
   // Back to back is always clean: when nothing fits (odd phrase data, songs too short for any overlap, or in clean
   // style a song that sings into its last seconds, so every overlap would cut a line).
-  if (!best) return finalizeTransition(backToBack(ids, style, a.duration, 0.5, tempoUsed), a.duration, b.duration)
+  if (kept.length === 0) return single(finalizeTransition(backToBack(ids, style, a.duration, 0.5, tempoUsed), a.duration, b.duration))
+  return kept.map(({ placement }) => {
+    const transition = build(placement)
+    return { transition, label: labelOf(transition, placement) }
+  })
 
-  const { placement } = best
+  function build(placement: Placement): Transition {
   // The louder song comes down by the loudness difference while both play (both analyses must have measured it).
-  const louder = Number.isFinite(a.mix.loudness) && Number.isFinite(b.mix.loudness) ? a.mix.loudness - b.mix.loudness : 0
+  const louder = Number.isFinite(trackA.mix.loudness) && Number.isFinite(trackB.mix.loudness) ? trackA.mix.loudness - trackB.mix.loudness : 0
   // Blends keep both decks at their volume (loudness comes from the parts chosen and their EQ, checked above).
   const shape = placement.variant.preset === 'blend' ? placement.stats.shape : matchLevels(placement.stats.shape, placement.stats.beat, louder)
   let confidence = 0.9
   if (tempo.synced && shape.length > 0) confidence *= 0.55 + 0.45 * minConfidence
   else confidence *= 0.6 + 0.3 * minConfidence
   if (placement.stats.tonal > 4 * placement.stats.beat) confidence *= 0.7 + 0.3 * harmony
-  if (!a.vocalsKnown || !b.vocalsKnown) confidence *= 0.85
+  if (!trackA.vocalsKnown || !trackB.vocalsKnown) confidence *= 0.85
   if (!tempo.synced && NEEDS_BEATMATCH.has(shape.preset)) confidence *= 0.6
   if (placement.beatmatched) confidence *= Number.isNaN(placement.clarity) ? 0.8 : 0.7 + 0.3 * placement.clarity
   confidence *= 1 - 0.03 * placement.loops
+  return finalizeTransition(toTransition(placement, shape, trackA, trackB, ids, style, confidence, tempoUsed), trackA.duration, trackB.duration)
+  }
+}
 
-  return finalizeTransition(toTransition(placement, shape, a, b, ids, style, confidence, tempoUsed), a.duration, b.duration)
+/** What makes two plans different in kind: the layout and length and where the songs meet (to 10 s), not the finish. */
+function kindOf(p: Placement) {
+  const v = p.variant
+  return `${v.preset}:${v.volume ?? ''}:${v.bars}:${Math.round(p.laneA.start / 10)}:${Math.round(p.laneB.start / 10)}`
+}
+
+const clock = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
+
+/** A short German description of a plan, as the review app shows it. */
+function labelOf(t: Transition, p?: Placement): string {
+  if (t.length <= 0) return 'Kein Übergang (nacheinander)'
+  const names: Partial<Record<PresetId, string>> = { echoOut: 'Echo-Ausklang', fadeOut: 'Ausblende', fadeIn: 'Einblende', crossfade: 'Überblendung' }
+  if (t.preset !== 'blend') return `${names[t.preset] ?? t.preset} · A ab ${clock(t.aOut)} · B ab ${clock(t.bIn)}`
+  const v = p?.variant
+  const bars = v ? v.bars : Math.round(((t.length - t.bAt) * t.tempo.a) / 240)
+  const kind =
+    v?.volume === 'answer'
+      ? 'Wortspiel'
+      : v?.volume === 'mashup'
+        ? 'Mashup'
+        : v?.volume === 'scurve'
+          ? 'S-Kurve'
+          : v?.volume === 'fade'
+            ? 'B blendet ein'
+            : v?.callback
+              ? 'Callback'
+              : 'Overlap'
+  const bass = v?.bassAt === 'none' ? 'ohne Bass-Wechsel' : v?.bassAt === 'start' ? 'Bass am Anfang' : 'Bass in der Mitte'
+  const out = v?.filterOut === 'eq' ? 'A per EQ raus' : v?.filterOut === 'hp' ? 'Hochpass raus' : v?.filterOut === 'lp' ? 'Tiefpass raus' : ''
+  return [`${bars} Takte ${kind}`, bass, out, `A ab ${clock(t.aOut)}`, `B ab ${clock(t.bIn)}`].filter(Boolean).join(' · ')
 }
 
 /**

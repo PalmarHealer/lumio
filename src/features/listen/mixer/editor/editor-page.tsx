@@ -1,5 +1,6 @@
-import { IconArrowLeft, IconArrowRight, IconDeviceFloppy, IconLoader2 } from '@tabler/icons-react'
-import { useMemo, useState } from 'react'
+import { IconArrowLeft, IconArrowRight, IconDeviceFloppy, IconLoader2, IconMaximize, IconMinimize } from '@tabler/icons-react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { Link } from '@/components/link'
@@ -27,6 +28,8 @@ const messages = defineMessages({
     forbidden: 'Nur wer die Playlist bearbeiten darf, kann Übergänge speichern.',
     conflict: 'Jemand anderes hat die Übergänge gerade geändert. Lade die Seite neu und versuch es noch einmal.',
     failed: 'Der Übergang konnte nicht gespeichert werden.',
+    fullscreen: 'Ganzer Bildschirm',
+    leaveFullscreen: 'Ganzen Bildschirm verlassen',
   },
   en: {
     title: 'Edit transition',
@@ -39,6 +42,8 @@ const messages = defineMessages({
     forbidden: 'Only those who may edit the playlist can save transitions.',
     conflict: 'Someone else just changed the transitions. Reload the page and try again.',
     failed: 'The transition could not be saved.',
+    fullscreen: 'Full screen',
+    leaveFullscreen: 'Leave full screen',
   },
 })
 
@@ -56,6 +61,21 @@ export function TransitionEditorPage() {
   const ids = useMemo(() => [from, to], [from, to])
   const analyses = useTrackMixes(ids)
   const [edited, setEdited] = useState<Transition | null>(null)
+  // The editor over the whole window (tablets: the app's side panels take much of the width). Escape leaves it.
+  const [full, setFull] = useState(false)
+  const [host] = useState(() => document.createElement('div'))
+  const slot = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    host.className = full ? 'fixed inset-0 z-[60] overflow-auto bg-background p-4 sm:p-6' : ''
+    ;(full ? document.body : slot.current)?.appendChild(host)
+  }, [full, host])
+  useEffect(() => () => host.remove(), [host])
+  useEffect(() => {
+    if (!full) return
+    const onKey = (event: KeyboardEvent) => event.key === 'Escape' && setFull(false)
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [full])
 
   const aMix = analyses.mixes.get(from) ?? null
   const bMix = analyses.mixes.get(to) ?? null
@@ -94,8 +114,8 @@ export function TransitionEditorPage() {
     )
   }
 
-  return (
-    <div className="flex flex-col gap-4 px-4 pt-16 pb-12 sm:px-8">
+  const content = (
+    <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-3">
         <Link to={`/listen/playlist/${id}`} aria-label={t.back} title={t.back} className={buttonVariants({ variant: 'ghost', size: 'icon' })}>
           <IconArrowLeft />
@@ -109,6 +129,9 @@ export function TransitionEditorPage() {
           </p>
         </div>
         <div className="ml-auto flex items-center gap-3">
+          <Button variant="ghost" size="icon" aria-label={full ? t.leaveFullscreen : t.fullscreen} title={full ? t.leaveFullscreen : t.fullscreen} aria-pressed={full} onClick={() => setFull(!full)}>
+            {full ? <IconMinimize /> : <IconMaximize />}
+          </Button>
           {edited && <span className="text-sm text-muted-foreground">{t.unsaved}</span>}
           <Button disabled={!edited || save.isPending} onClick={onSave}>
             {save.isPending ? <IconLoader2 className="animate-spin" /> : <IconDeviceFloppy />}
@@ -140,6 +163,14 @@ export function TransitionEditorPage() {
           />
         </>
       )}
+    </div>
+  )
+  // The editor renders into a box of its own that moves: into the page, or over the whole window (out of the page's
+  // stacking context, under which the app's panels would stay on top). Moving the box keeps the editor as it is (its
+  // undo history, the loaded audio), where switching between two places in the tree would start it over.
+  return (
+    <div ref={slot} className={full ? undefined : 'px-4 pt-16 pb-12 sm:px-8'}>
+      {createPortal(content, host)}
     </div>
   )
 }

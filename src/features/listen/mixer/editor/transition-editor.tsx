@@ -165,8 +165,9 @@ const messages = defineMessages({
   },
 })
 
-/** The label column beside the timeline. */
-const LABEL_W = 140
+/** The label column beside the timeline (narrower on small screens). */
+const LABEL_WIDE = 140
+const LABEL_NARROW = 84
 /** Each deck's half of the visualizer, and a lane row. */
 const DECK_H = 170
 const LANE_H = 52
@@ -181,6 +182,8 @@ const DRAG_PX = 4
 const LONG_PRESS_MS = 550
 /** The widest the timeline gets (canvas size). */
 const MAX_WIDTH = 12_000
+/** Below this many pixels a second the view starts on the transition rather than showing all of it. */
+const MIN_FIT = 25
 
 const GROUPS: Array<{ id: string; params: LaneParam[] }> = [
   { id: 'level', params: ['gain', 'low', 'mid', 'high'] },
@@ -267,7 +270,11 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
   }
 
   const span = transition.length + PRE_ROLL + POST_ROLL
-  const fit = Math.max(4, (viewport - LABEL_W - 8) / span)
+  const LABEL_W = viewport < 720 ? LABEL_NARROW : LABEL_WIDE
+  // The whole stretch with its lead-in and run-out when it fits readably; else the transition itself (scroll for more).
+  const room = viewport - LABEL_W - 8
+  const fitsWhole = room / span >= MIN_FIT
+  const fit = fitsWhole ? room / span : Math.max(4, room / (transition.length + 4))
   const pxPerSecond = Math.min(fit * zoom, MAX_WIDTH / span)
   const axis: Axis = useMemo(() => ({ from: -PRE_ROLL, to: transition.length + POST_ROLL, pxPerSecond }), [transition.length, pxPerSecond])
   const width = axisWidth(axis)
@@ -343,19 +350,24 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     // The planner's good spots: where A can go out (on A, at the top) and B come in (on B, at the bottom).
     const spots = (points: SuggestedPoint[], positions: ReadonlyArray<number | null>, top: boolean) => {
       g.font = '600 11px system-ui, sans-serif'
-      for (const point of points.slice(0, 6)) {
-        for (const time of marksInTime(axis, positions, [point.at])) {
-          const x = Math.round(xOf(axis, time))
-          const y = top ? 6 : DECK_H * 2 - 6
-          g.fillStyle = STUDIO.highCurve
-          g.beginPath()
-          g.moveTo(x - 5, y)
-          g.lineTo(x + 5, y)
-          g.lineTo(x, top ? y + 7 : y - 7)
-          g.fill()
-          g.fillStyle = 'rgba(250,204,21,0.85)'
-          g.fillText(point.label, x + 7, top ? y + 9 : y - 2)
-        }
+      // The best six spots, left to right; a label only where the one before leaves room (the marks always show).
+      const marks = points
+        .slice(0, 6)
+        .flatMap((point) => marksInTime(axis, positions, [point.at]).map((time) => ({ x: Math.round(xOf(axis, time)), label: point.label })))
+        .sort((p, q) => p.x - q.x)
+      let free = -Infinity
+      const y = top ? 6 : DECK_H * 2 - 6
+      for (const { x, label } of marks) {
+        g.fillStyle = STUDIO.highCurve
+        g.beginPath()
+        g.moveTo(x - 5, y)
+        g.lineTo(x + 5, y)
+        g.lineTo(x, top ? y + 7 : y - 7)
+        g.fill()
+        if (x + 7 < free) continue
+        g.fillStyle = 'rgba(250,204,21,0.85)'
+        g.fillText(label, x + 7, top ? y + 9 : y - 2)
+        free = x + 7 + g.measureText(label).width + 8
       }
     }
     if (suggestions) {
@@ -526,6 +538,13 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     onChange?.(next)
     setSelected(null)
   }
+
+  // When the view starts on the transition (a narrow screen), it is scrolled there.
+  useEffect(() => {
+    if (!fitsWhole && scroller.current) scroller.current.scrollLeft = Math.max(0, xOf(axis, -2))
+    // Only when the way the view fits changes, not on every zoom or edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitsWhole])
 
   const toOverlap = () => {
     const element = scroller.current
@@ -703,8 +722,8 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
                 type="button"
                 onClick={() => setCollapsed({ ...collapsed, [group.id]: !collapsed[group.id] })}
                 aria-expanded={!collapsed[group.id]}
-                className="sticky left-0 flex h-8 items-center gap-1.5 px-3 text-xs font-semibold uppercase tracking-wide outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                style={{ color: STUDIO.label }}
+                className="sticky left-0 z-10 flex h-8 items-center gap-1.5 px-3 text-xs font-semibold uppercase tracking-wide outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                style={{ color: STUDIO.label, background: STUDIO.surface, width: LABEL_W }}
               >
                 {collapsed[group.id] ? <IconChevronRight className="size-4" /> : <IconChevronDown className="size-4" />}
                 {t.group(group.id)}

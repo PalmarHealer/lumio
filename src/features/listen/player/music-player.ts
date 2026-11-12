@@ -23,7 +23,7 @@ import { downloadedAudioUrl, downloadId, isDownloaded, setDownloadQuality, setDo
 import { DIRECT_FORMATS } from './quality'
 import { setSleepHandler, sleepsAfterTrack, stopsAfterTrack } from './sleep-timer'
 import type { Transition } from '../mixer/types'
-import { asPlayed, createDeck, createMaster, freezeDeck, handoverPoint, rampAt, releaseEcho, releaseReverb, resetDeck, reverbTailEnd, scheduleTransition, type Deck, type Master } from '../mixer/engine'
+import { asPlayed, createDeck, createMaster, freezeDeck, handoverPoint, rampAt, releaseEcho, releaseReverb, resetDeck, scheduleTransition, tailsEnd, ECHO_TAIL_S, type Deck, type Master } from '../mixer/engine'
 import { bSettled, deckPlan, positionAt, rateOf, timeOfAdvance, trackSpan, withBrake, type DeckPlan } from '../mixer/deck-schedule'
 import { bufferDeckKind, tempoChangeKind, type BufferDeckKind } from '../mixer/buffer-deck'
 import { mono } from '../mixer/xcorr'
@@ -1196,8 +1196,7 @@ const RESCUE_AFTER_S = 1.5
 /** A deck that keeps playing glides back to neutral over this long; one that leaves fades out over this long. */
 const SETTLE_S = 0.05
 const RETIRE_S = 0.03
-/** How long an echo may ring on after its deck has gone (after a transition), or after one was called off. */
-const ECHO_TAIL_S = 6
+/** How long an echo may ring on after one was called off (after a transition: the engine's `ECHO_TAIL_S`). */
 const ABORT_TAIL_S = 0.5
 /** Buffered: A is located in its slice this long before the cue (recording, matching, the stretcher's lead). */
 const BUFFER_ARM_S = 5
@@ -1266,7 +1265,7 @@ interface Running {
   handoverLead: number
   /** When B plays straight at its own tempo again (transition time). */
   settled: number
-  /** Until when the limiter acts (transition time): B settled, and any reverb tail rung out. */
+  /** Until when the limiter acts (transition time): B settled, and any echo or reverb tail rung out. */
   limited: number
   /** A is gone; B is still on its buffer until it hands back. */
   trailing: boolean
@@ -1814,7 +1813,7 @@ function startRunning(p: Plan, a: HTMLAudioElement, b: HTMLAudioElement, zero: n
     sides,
     handoverLead: 0,
     settled: bSettled(transition),
-    limited: Math.max(bSettled(transition), reverbTailEnd(transition) ?? -Infinity),
+    limited: Math.max(bSettled(transition), tailsEnd(transition) ?? -Infinity),
     trailing: false,
   }
   running = r
@@ -2000,7 +1999,7 @@ async function handBack(r: Running) {
     if (running !== r) return
     running = null
     closeSides(r)
-    // (Still on while a reverb tail rings.)
+    // (Still on while an echo or reverb tail rings.)
     master?.engage(false, Math.max(ctx.currentTime, r.start + r.limited))
     mixerTick()
   })
@@ -2046,7 +2045,8 @@ function abortRunning() {
   elementGain(keep).gain.value = 1
   const deck = decks.get(keep)
   if (deck) safely(() => resetDeck(deck, deck.ctx.currentTime, SETTLE_S))
-  if (deck) master?.engage(false, deck.ctx.currentTime + Math.max(SETTLE_S, decks.get(gone)?.reverb ? ABORT_TAIL_S : 0))
+  // (On while what the gone deck echoes or reverberates fades out.)
+  if (deck) master?.engage(false, deck.ctx.currentTime + Math.max(SETTLE_S, ABORT_TAIL_S))
   planSoon()
 }
 

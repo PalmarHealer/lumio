@@ -163,3 +163,47 @@ export async function checkReverb(kind: 'tone' | 'noise' = 'noise', sampleRate =
   const rtOk = kind === 'tone' || (Math.abs(measured - REVERB_RT60_S) < 0.3 && measuredHigh < measured)
   return { ...report, pass: rtOk && click < 1.5 && peak <= 1 }
 }
+
+export interface EchoTailReport {
+  sampleRate: number
+  /** Samples above full scale, and the peak, after A is gone (B loud alone plus A's echo ringing). */
+  over: number
+  peak: number
+  pass: boolean
+}
+
+/**
+ * The echo out's tail must stay under the limiter: two loud noise decks, an echo on A (1 beat, feedback 0.7, about
+ * 10 s to −60 dB, faded within 6 s), B playing on at full level. Without the limiter after `length`, B and the tail
+ * add up past full scale.
+ */
+export async function checkEchoTail(sampleRate = 48000): Promise<EchoTailReport> {
+  const loud = (seed: number) => {
+    const buffer = new AudioBuffer({ numberOfChannels: 2, length: sampleRate * 40, sampleRate })
+    let state = seed
+    for (let c = 0; c < 2; c++) {
+      const data = new Float32Array(buffer.length)
+      for (let i = 0; i < data.length; i++) data[i] = 0.7 * (((state = (state * 16807) % 2147483647) / 2147483647) * 2 - 1)
+      buffer.copyToChannel(data, c)
+    }
+    return buffer
+  }
+  const echo: Transition = {
+    ...transition(false),
+    bAt: 0,
+    length: 4,
+    effects: [{ kind: 'echo', deck: 'a', at: 2, beats: 1, feedback: 0.7 }],
+  }
+  const out = await renderTransition({ a: loud(7), b: loud(11), transition: echo, preRoll: 2, postRoll: 8, sampleRate })
+  let over = 0
+  let peak = 0
+  for (let c = 0; c < out.numberOfChannels; c++) {
+    const data = out.getChannelData(c)
+    for (let i = Math.round((2 + 4) * sampleRate); i < data.length; i++) {
+      const value = Math.abs(data[i]!)
+      peak = Math.max(peak, value)
+      if (value > 1) over++
+    }
+  }
+  return { sampleRate, over, peak, pass: over === 0 }
+}

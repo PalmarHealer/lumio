@@ -298,6 +298,33 @@ export function reverbTailEnd(transition: Transition): number | null {
   return end
 }
 
+/** How long an echo may ring on after its deck has gone (its return fades out over this; `releaseEcho`). */
+export const ECHO_TAIL_S = 6
+
+/**
+ * Until when (transition time) a transition's echo may still ring, or null without one: A's echo is fed until A is cut
+ * at `length` and then decays by its feedback per repeat, down to -60 dB, but at most for `tail` (its return fades out
+ * over that). B's echo is shut at `length` (B goes back to neutral).
+ */
+export function echoTailEnd(transition: Transition, tail = ECHO_TAIL_S): number | null {
+  let end: number | null = null
+  for (const effect of transition.effects) {
+    if (effect.kind !== 'echo') continue
+    const delay = Math.min(MAX_DELAY_S, Math.max(0.01, effect.beats * beatSeconds(transition.tempo[effect.deck])))
+    const feedback = Math.max(0, Math.min(0.95, effect.feedback))
+    const repeats = feedback > 0 ? Math.log(1e-3) / Math.log(feedback) : 1
+    const rings = effect.deck === 'a' ? Math.min(tail, delay * Math.ceil(repeats + 1)) : 0
+    end = Math.max(end ?? -Infinity, Math.max(transition.length, effect.at) + rings)
+  }
+  return end
+}
+
+/** Until when (transition time) anything of a transition still rings after it (echo, reverb), or null. */
+export function tailsEnd(transition: Transition, echoTail = ECHO_TAIL_S): number | null {
+  const ends = [echoTailEnd(transition, echoTail), reverbTailEnd(transition)].filter((end): end is number => end !== null)
+  return ends.length ? Math.max(...ends) : null
+}
+
 /**
  * Lets a deck's reverb ring out after the deck has gone: its send closes; the tail rings on (at most `tail` seconds:
  * shorter, it fades out within them). Returns when it has died away (context time); `time` without a reverb.
@@ -701,7 +728,7 @@ function automatedParams(deck: Deck) {
  * Lets a deck's echo ring out after the deck has gone: its send closes (nothing new goes in) and the tail fades within
  * `tail` seconds. Returns when it has died away (context time).
  */
-export function releaseEcho(deck: Deck, time = deck.ctx.currentTime, tail = 6) {
+export function releaseEcho(deck: Deck, time = deck.ctx.currentTime, tail = ECHO_TAIL_S) {
   const { send, wet } = deck.echo
   holdAt(send.gain, time)
   rampAt(send.gain, time + DECLICK_S, 0)

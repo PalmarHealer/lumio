@@ -1,6 +1,6 @@
 import { bufferDeckKind, createBufferDeck, tempoChangeKind } from './buffer-deck'
 import { bSettled, deckPlan, withBrake } from './deck-schedule'
-import { asPlayed, createDeck, createMaster, limiterLatency, resetDeck, releaseEcho, releaseReverb, reverbTailEnd, scheduleTransition, type LimiterStats } from './engine'
+import { asPlayed, createDeck, createMaster, limiterLatency, resetDeck, releaseEcho, releaseReverb, scheduleTransition, tailsEnd, type LimiterStats } from './engine'
 import type { Transition } from './types'
 
 /**
@@ -86,9 +86,9 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   releaseReverb(deckA, zero + length)
   resetDeck(deckB, zero + length, 0.05)
   // The limiter acts while the decks overlap, while B is still stretched (stretched audio can peak higher than the
-  // track itself; at rate 1 the stretcher passes B through exactly again) and while a reverb tail rings.
+  // track itself; at rate 1 the stretcher passes B through exactly again) and while an echo or reverb tail rings.
   master.engage(true, Math.max(0, zero - LIMITER_LEAD_S))
-  master.engage(false, zero + Math.max(length, bSettled(transition), reverbTailEnd(transition) ?? -Infinity) + 0.05)
+  master.engage(false, zero + Math.max(length, bSettled(transition), tailsEnd(transition) ?? -Infinity) + 0.05)
 
   // The stretchers' changes travel by message: all must have arrived before rendering runs past them.
   await Promise.all([playerA.settled(), playerB.settled()])

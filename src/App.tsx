@@ -44,6 +44,7 @@ import { DisplayPage } from '@/features/admin/display-page'
 import { MetadataPage } from '@/features/admin/metadata-page'
 import { PluginSettingsPage } from '@/features/admin/plugin-settings-page'
 import { StatsPage } from '@/features/admin/stats-page'
+import { StemWorkersPage } from '@/features/admin/stem-workers-page'
 import { BrandingEffects } from '@/features/admin/branding'
 import { BrandingPage } from '@/features/admin/branding-page'
 import { PluginRoutePage } from '@/features/admin/plugin-route-page'
@@ -123,6 +124,7 @@ function settingsRoutes() {
       <Route path="metadata" element={<MetadataPage />} />
       <Route path="plugin/:id" element={<PluginSettingsPage />} />
       <Route path="stats" element={<StatsPage />} />
+      <Route path="stem-workers" element={<StemWorkersPage />} />
     </Route>
   )
 }

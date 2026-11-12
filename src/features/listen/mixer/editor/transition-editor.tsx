@@ -4,6 +4,10 @@ import {
   IconChevronDown,
   IconChevronRight,
   IconFocusCentered,
+  IconLoader2,
+  IconPlayerPauseFilled,
+  IconPlayerPlayFilled,
+  IconRepeat,
   IconMagnet,
   IconZoomIn,
   IconZoomOut,
@@ -26,6 +30,8 @@ import {
   moveBStart,
   moveKey,
   overlapBars,
+  POST_ROLL,
+  PRE_ROLL,
   removeKey,
   setLength,
   slipDeck,
@@ -38,6 +44,7 @@ import {
   type LaneParam,
 } from './timeline-math'
 import { useHistory } from './use-history'
+import type { PreviewControls } from './use-preview'
 
 const GROUP_NAMES: Record<'de' | 'en', Record<string, string>> = {
   de: { level: 'Pegel & EQ', effects: 'Filter & Hall', tempo: 'Tempo', stems: 'Smarte Filter' },
@@ -73,6 +80,11 @@ const PARAM_NAMES: Record<'de' | 'en', Record<LaneParam, string>> = {
 
 const messages = defineMessages({
   de: {
+    play: 'Abspielen',
+    pause: 'Pausieren',
+    loop: 'Übergang in Schleife',
+    audioLoading: 'Audio wird geladen',
+    audioFailed: 'Audio nicht verfügbar',
     undo: 'Rückgängig',
     redo: 'Wiederholen',
     snap: 'Am Takt einrasten',
@@ -86,6 +98,11 @@ const messages = defineMessages({
     deleteKey: 'Punkt löschen',
   },
   en: {
+    play: 'Play',
+    pause: 'Pause',
+    loop: 'Loop the transition',
+    audioLoading: 'Loading audio',
+    audioFailed: 'Audio unavailable',
     undo: 'Undo',
     redo: 'Redo',
     snap: 'Snap to the beat',
@@ -105,9 +122,6 @@ const LABEL_W = 140
 /** Each deck's half of the visualizer, and a lane row. */
 const DECK_H = 170
 const LANE_H = 52
-/** Seconds shown before the transition and after it. */
-const PRE_ROLL = 8
-const POST_ROLL = 8
 /** Handles: drawn 16–18 px wide, grabbed within 14 px (a 28 px target). */
 const GRAB_PX = 14
 /** Pointer travel before a press counts as a drag rather than a click. */
@@ -135,10 +149,10 @@ export interface TransitionEditorProps {
   bDuration: number
   /** Reports the transition as edited (each finished gesture). */
   onChange?: (transition: Transition) => void
-  /** Reports the playhead (transition time) when the user sets it. */
-  onSeek?: (t: number) => void
-  /** The playhead as playback moves it (transition time); the editor's own clicks set it too. */
-  position?: number
+  /** Reports every change, also while dragging (the preview follows it). */
+  onLive?: (transition: Transition) => void
+  /** Playback (the preview of the transition as edited); without it the playhead only moves on clicks. */
+  preview?: PreviewControls
 }
 
 type Gesture =
@@ -153,7 +167,7 @@ type Gesture =
  * bar grid, the overlap as a card with its bar count) and automation lanes below it, one row per parameter and deck, in
  * collapsible groups. A click anywhere sets the playhead; no gesture needs a double click.
  */
-export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuration, bDuration, onChange, onSeek, position }: TransitionEditorProps) {
+export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuration, bDuration, onChange, onLive, preview }: TransitionEditorProps) {
   const t = useMessages(messages)
   const history = useHistory(initial)
   const transition = history.value
@@ -175,7 +189,18 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
   }, [])
 
   // Playback moves the playhead; a click here moves it at once.
-  const shownPlayhead = position ?? playhead
+  const shownPlayhead = preview?.status === 'ready' ? preview.position : playhead
+  const [looping, setLooping] = useState(false)
+
+  useEffect(() => onLive?.(transition), [transition, onLive])
+  // The loop is the transition with a little on either side; it follows edits of its length.
+  const loopFrom = Math.min(0, transition.bAt) - 2
+  const loopTo = transition.length + 2
+  const setLoop = preview?.setLoop
+  const previewReady = preview?.status === 'ready'
+  useEffect(() => {
+    if (previewReady) setLoop?.(looping ? { from: loopFrom, to: loopTo } : null)
+  }, [looping, loopFrom, loopTo, setLoop, previewReady])
   const finalize = (next: Transition) => finalizeTransition(next, aDuration, bDuration)
   const commit = (before: Transition, after: Transition) => {
     const done = finalize(after)
@@ -220,10 +245,16 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     return mix?.bpm ? 60 / mix.bpm : 0.5
   }
 
-  const seek = (time: number) => {
+  const seek = (time: number, scrubbing = false) => {
     const clamped = Math.min(axis.to, Math.max(axis.from, time))
     setPlayhead(clamped)
-    onSeek?.(clamped)
+    if (scrubbing) preview?.scrub(clamped)
+    else preview?.seek(clamped)
+  }
+  const togglePlay = () => {
+    if (!preview || preview.status !== 'ready') return
+    if (preview.playing) preview.pause()
+    else preview.play(shownPlayhead >= axis.to - 0.05 ? axis.from : undefined)
   }
 
   // ---- the visualizer ----
@@ -351,7 +382,7 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     const current = gesture.current
     if (!current) return
     const { x, y } = local(event)
-    if (current.kind === 'scrub') return seek(tOf(axis, x))
+    if (current.kind === 'scrub') return seek(tOf(axis, x), true)
     if (current.kind !== 'key') return
     if (!current.moved && Math.hypot(x - current.x, y - current.y) <= DRAG_PX) return
     if (!current.moved) window.clearTimeout(current.timer)
@@ -381,7 +412,10 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
       if (target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return
-      if ((event.key === 'Delete' || event.key === 'Backspace') && selected) {
+      if (event.key === ' ' && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault()
+        togglePlay()
+      } else if ((event.key === 'Delete' || event.key === 'Backspace') && selected) {
         event.preventDefault()
         deleteKey(selected.deck, selected.param, selected.index)
       } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
@@ -408,6 +442,20 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
   return (
     <div className="flex min-h-0 flex-col gap-3">
       <div className="flex flex-wrap items-center gap-1">
+        <Button
+          size="icon"
+          className="mr-1 rounded-full"
+          aria-label={preview?.playing ? t.pause : t.play}
+          title={preview?.status === 'failed' ? t.audioFailed : preview?.playing ? t.pause : t.play}
+          disabled={preview?.status !== 'ready'}
+          onClick={togglePlay}
+        >
+          {preview?.status === 'loading' ? <IconLoader2 className="animate-spin" /> : preview?.playing ? <IconPlayerPauseFilled /> : <IconPlayerPlayFilled />}
+        </Button>
+        <Button variant={looping ? 'secondary' : 'ghost'} size="icon" aria-label={t.loop} title={t.loop} aria-pressed={looping} disabled={preview?.status !== 'ready'} onClick={() => setLooping(!looping)}>
+          <IconRepeat />
+        </Button>
+        <span className="mx-1 h-6 w-px bg-border" />
         <Button variant="ghost" size="icon" aria-label={t.undo} title={t.undo} disabled={!history.canUndo} onClick={history.undo}>
           <IconArrowBackUp />
         </Button>
@@ -427,7 +475,10 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
         <Button variant="ghost" size="sm" onClick={toOverlap}>
           <IconFocusCentered /> {t.toOverlap}
         </Button>
-        <span className="ml-auto text-sm text-muted-foreground tabular-nums">{clock(shownPlayhead)}</span>
+        <span className="ml-auto text-sm text-muted-foreground tabular-nums">
+          {preview?.status === 'loading' ? `${t.audioLoading} · ` : preview?.status === 'failed' ? `${t.audioFailed} · ` : ''}
+          {clock(shownPlayhead)}
+        </span>
       </div>
 
       <div ref={scroller} className="relative overflow-x-auto overflow-y-hidden rounded-xl" style={{ background: STUDIO.surface }}>
@@ -456,6 +507,18 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
                 onPointerUp={onVisualizerUp}
                 onPointerCancel={() => (gesture.current = null)}
               />
+              {/* Play, in the middle of the transition (as in the reference). */}
+              {preview?.status === 'ready' && (
+                <button
+                  type="button"
+                  aria-label={preview.playing ? t.pause : t.play}
+                  onClick={togglePlay}
+                  className="absolute grid size-11 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-black/65 text-white outline-none backdrop-blur hover:bg-black/80 focus-visible:ring-2 focus-visible:ring-ring"
+                  style={{ left: (xOf(axis, 0) + xOf(axis, transition.length)) / 2, top: DECK_H }}
+                >
+                  {preview.playing ? <IconPlayerPauseFilled className="size-5" /> : <IconPlayerPlayFilled className="size-5 translate-x-px" />}
+                </button>
+              )}
               {bars > 0 && (
                 <span
                   className="pointer-events-none absolute -translate-x-1/2 rounded-md bg-black/70 px-2 py-0.5 text-xs font-semibold text-white tabular-nums"

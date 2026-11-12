@@ -12,6 +12,7 @@ import { MixerSaveError, usePlaylistMixer, useSaveMixer, useTrackMixes } from '.
 import { transitionFor } from '../resolve'
 import { pairKey, type Transition } from '../types'
 import { TransitionEditor } from './transition-editor'
+import { useTransitionPreview } from './use-preview'
 
 const messages = defineMessages({
   de: {
@@ -70,6 +71,10 @@ export function TransitionEditorPage() {
     [ready],
   )
 
+  // What is being edited right now (also mid-drag), for the preview.
+  const [live, setLive] = useState<Transition | null>(null)
+  const preview = useTransitionPreview({ fromId: from, toId: to, transition: live ?? initial, aDuration, bDuration })
+
   const onSave = () => {
     if (!edited) return
     const transition: Transition = { ...edited, custom: true }
@@ -126,6 +131,8 @@ export function TransitionEditorPage() {
             aDuration={aDuration}
             bDuration={bDuration}
             onChange={setEdited}
+            onLive={setLive}
+            preview={preview}
           />
         </>
       )}

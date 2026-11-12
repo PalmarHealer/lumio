@@ -38,6 +38,10 @@ export const LANES: Record<LaneParam, LaneSpec> = {
 
 // ---- the axis ----
 
+/** Seconds shown (and played) before the transition and after it. */
+export const PRE_ROLL = 8
+export const POST_ROLL = 8
+
 export interface Axis {
   /** Transition time at x = 0 and seconds per pixel. */
   from: number

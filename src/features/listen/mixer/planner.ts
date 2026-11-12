@@ -161,6 +161,41 @@ interface Anchor {
   chorus: boolean
 }
 
+/**
+ * Wordplay spots: A's late lines and B's early lines that share a content word (a title word weighs most). A's spot is
+ * the first downbeat after its line ends, B's the last downbeat before its line starts (within a bar of it), so B's line
+ * answers right after A's. The pair's bonus rides on A's spot.
+ */
+function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{ pa: Anchor; pb: Anchor }> {
+  const linesA = Array.isArray(a.mix.lines) && a.mix.vocalSource === 'lyrics' ? a.mix.lines : []
+  const linesB = Array.isArray(b.mix.lines) && b.mix.vocalSource === 'lyrics' ? b.mix.lines : []
+  if (linesA.length === 0 || linesB.length === 0) return []
+  const titles = new Set([...(a.mix.titleWords ?? []), ...(b.mix.titleWords ?? [])])
+  const pairs: Array<{ pa: Anchor; pb: Anchor; weight: number }> = []
+  for (const la of linesA) {
+    if (!(la.time >= a.duration * (style === 'party' ? 0.45 : 0.6)) || !(la.end < a.duration - 8 * a.period)) continue
+    const iA = Math.max(0, floorIndex(a.downbeats, la.end - 0.05) + 1)
+    const ta = a.downbeats[iA]
+    if (ta === undefined || ta - la.end > 2 * a.period) continue
+    for (const lb of linesB) {
+      if (!(lb.time <= b.duration * 0.6)) continue
+      const shared = la.words.filter((w) => lb.words.includes(w))
+      if (shared.length === 0) continue
+      const tb = b.downbeats[floorIndex(b.downbeats, lb.time - 0.1)]
+      if (tb === undefined || lb.time - tb > 4 * b.period) continue
+      const weight = shared.some((w) => titles.has(w)) ? WORDPLAY_TITLE : WORDPLAY_WORD
+      pairs.push({ pa: { t: ta, bonus: weight, drop: false, chorus: false }, pb: { t: tb, bonus: 0, drop: false, chorus: false }, weight })
+    }
+  }
+  // The strongest few (a title word first, then the latest line of A).
+  pairs.sort((x, y) => y.weight - x.weight || y.pa.t - x.pa.t)
+  return pairs.slice(0, 24)
+}
+
+/** Bonus for a wordplay pair answering with a title word, or with another content word. */
+const WORDPLAY_TITLE = 1
+const WORDPLAY_WORD = 0.1
+
 /** Adds a spot; one already there (within half a second) keeps the higher bonus and gains the other's kind. */
 function addAnchor(list: Anchor[], t: number, bonus: number, kind?: 'drop' | 'chorus') {
   if (!Number.isFinite(t)) return
@@ -273,7 +308,7 @@ interface Variant {
   filter: boolean
   midSwap: boolean
   /** Blend: volume shape, where the bass changes deck, the filters in on B and out on A (see the blend preset). */
-  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup'
+  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer'
   bassAt?: 'start' | 'middle' | 'none'
   filterIn?: 'hp' | 'lp' | null
   filterOut?: 'hp' | 'lp' | 'eq' | null
@@ -297,7 +332,7 @@ const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwa
  * 24 and 8; 4 bars and the seamless S-curve over 2 as the fallback. Which EQ and
  * filter it gets is chosen per placement (`blendFinishes`).
  */
-const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
+const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
   // B's event lands on A's boundary after `pre` bars of B under A; A plays on, thinned, for `post` bars to its next
   // section, where it leaves. Pop: 4-bar phrases, 8-bar blends; dance music: 8 + 8 or more.
   // Preferred in that order (the user: "you can really take more time"): 16 bars, then 32, then 8; 4 bars and the
@@ -315,6 +350,9 @@ const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup'; p
   // The mashup: only where its conditions hold (see `mashupFits`), and then it's the one to have.
   { volume: 'mashup', pre: 12, post: 4, prior: 0.15, party: true, clean: true },
   { volume: 'mashup', pre: 28, post: 4, prior: 0.12, party: true, clean: true },
+  // Wordplay (the user's "der ist krank"): B's line answers A's with the same word, a quick 4-bar handover; only placed
+  // on a pair of lines sharing a word (`wordPairs`), whose anchors carry the bonus.
+  { volume: 'answer', pre: 2, post: 2, prior: -0.2, party: true, clean: true },
 ]
 
 /**
@@ -325,6 +363,7 @@ function blendFinishes(variant: Variant, clash: boolean): Variant[] {
   // The bass changes deck on the swap (A's boundary): 'start' when B's event opens the blend.
   const at: NonNullable<Variant['bassAt']> = (variant.pre ?? 0) === 0 ? 'start' : 'middle'
   if (variant.volume === 'scurve') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: clash }]
+  if (variant.volume === 'answer') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: clash, prior: variant.prior + BEST_FINISH }]
   if (variant.volume === 'mashup') return clash ? [] : [{ ...variant, bassAt: 'middle', filterIn: 'lp', filterOut: 'hp', midSwap: false, prior: variant.prior + BEST_FINISH }]
   const finishes: Array<[NonNullable<Variant['bassAt']>, Variant['filterIn'], Variant['filterOut'], number]> = [
     // The user's Spotify favourites mostly take a filter out on A (high-pass), in on B as well, or a low-pass pair.
@@ -1478,6 +1517,7 @@ export function planTransition(
   if (tailBars.length === 0 || tailBars[tailBars.length - 1] > a.duration + 4 * a.period) tailBars.length = 0
   const outs = outAnchors(a, style)
   const ins = inAnchors(b, style)
+  const words = wordPairs(a, b, style)
   const party = style === 'party'
   const placements: Placement[] = []
   const shapes = new Map<string, ShapeStats>()
@@ -1594,6 +1634,26 @@ export function planTransition(
         const i = floorIndex(track.downbeats, t + 0.05)
         const k = i + bars
         return i >= 0 && Math.abs(track.downbeats[i] - t) <= 0.05 && k >= 0 && k < track.downbeats.length ? track.downbeats[k] : NaN
+      }
+      if (variant.volume === 'answer') {
+        // Wordplay: A's bar right after its line and B's bar right before its answering line meet on the swap; straight
+        // material, `pre` bars before and `post` after it on both decks (bars, not phrases: lines don't keep to them).
+        for (const { pa, pb } of words) {
+          const iA = floorIndex(a.downbeats, pa.t + 0.05)
+          const iB = floorIndex(b.downbeats, pb.t + 0.05)
+          const startA = a.downbeats[iA - pre]
+          const endA = a.downbeats[iA + post]
+          const startB = b.downbeats[iB - preB]
+          const endB = b.downbeats[iB + postB]
+          if (startA === undefined || endA === undefined || startB === undefined || endB === undefined) continue
+          const stats = shapeFor(variant, (endA - startA) / (4 * variant.bars))
+          const length = stats.shape.length
+          const rate = (endB - startB) / length
+          if (!rateOk(rate)) continue
+          const base = { stats, variant, laneA: { start: startA, path: [] }, laneB: { start: startB, path: [] }, bStart: PHASE_SLACK, rate, beatmatched: true, clarity: NaN, loops: 0, slack: PHASE_SLACK, pa, pb }
+          placements.push({ ...base, ...scoreBound(base) })
+        }
+        continue
       }
       // B's material per number of bars after the swap (the play-outs below have their own).
       const lanesBFor = new Map<number, Array<{ pb: Anchor; options: LaneOption[] }>>()

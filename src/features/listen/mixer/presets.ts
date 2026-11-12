@@ -69,7 +69,7 @@ export interface PresetContext {
    * both at full volume, one singing over the other's instrumental; the bass hands over gradually on the swap, late,
    * and A leaves under a rising high-pass over the last fifth).
    */
-  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup'
+  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer'
   /** Blend: where the bass changes deck (start, middle) or 'none' (one of the two parts has no bass of its own). */
   bassAt?: 'start' | 'middle' | 'none'
   /**
@@ -519,6 +519,37 @@ export function matchLevels(shape: PresetShape, beat: number, difference: number
  * Needs B beatmatched; the planner loops bars of either song so neither runs into singing or a drop meanwhile.
  */
 /**
+ * The wordplay handover (the user's "der ist krank"): B's beat fades in over the first half under A (its mids and
+ * highs down, so no voice of B's is heard yet), A plays in full and is cut on the middle, where the bass and the
+ * rest of B change over; B's answering line starts just after.
+ */
+function answer(ctx: PresetContext): PresetShape {
+  const bars = Math.max(2, ctx.bars)
+  const length = bars * 4 * ctx.beat
+  const middle = Math.min(length - ctx.beat, Math.max(ctx.beat, (ctx.swapBar ?? bars / 2) * 4 * ctx.beat))
+  return {
+    preset: 'blend',
+    length,
+    a: automation(length, { gain: [[0, 1], ...stepAt(middle, 1, 0)], low: [[0, 1], ...stepAt(middle, 1, 0)] }),
+    b: automation(length, {
+      gain: [
+        [0, 0],
+        [middle, 1],
+      ],
+      low: [[0, 0], ...stepFrom(middle, 0, 1)],
+      // B's voice (and chords) stay down until A is gone: what fades in under A is B's beat; its answering line comes
+      // in whole on the middle.
+      mid: [[0, 0.1], ...stepFrom(middle, 0.1, 1)],
+      high: [[0, 0.15], ...stepFrom(middle, 0.15, 1)],
+    }),
+    effects: [],
+    anchorA: 0,
+    anchorB: 0,
+    swap: middle,
+  }
+}
+
+/**
  * The mashup (the user's "eher Mashup-Mixing"): B comes in on an S-curve under a low-pass opening over the first fifth,
  * then both play at full volume (B's voice over A's instrumental part, or the other way round); A's low goes down over
  * the 2 bars before the swap and B's comes up over the 2 bars after it (never two basslines); A leaves under a
@@ -571,6 +602,7 @@ const EQ_OUT = 0.15
 
 function blend(ctx: PresetContext): PresetShape {
   if (ctx.volume === 'mashup') return mashup(ctx)
+  if (ctx.volume === 'answer') return answer(ctx)
   const bars = Math.max(1, ctx.bars)
   const length = bars * 4 * ctx.beat
   // The swap: on the bar the planner lines up with A's section boundary (0 = the start).

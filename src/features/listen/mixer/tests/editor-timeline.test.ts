@@ -4,6 +4,7 @@ import { test } from 'node:test'
 import {
   addKey,
   deckTrack,
+  editDiff,
   hasLoop,
   laneKeys,
   laneValue,
@@ -126,4 +127,13 @@ test('loops: a stretch is played twice and taken out again', () => {
   assert.equal(hasLoop(looped, loop), true)
   assert.deepEqual(toggleLoop(looped, loop).pathB, [])
   assert.equal(loopReachable(t, { deck: 'a', from: 90, to: 94 }), false)
+})
+
+test('the edit diff names what changed, deck lanes included', () => {
+  const t = transition()
+  const edited = { ...withLaneKeys(t, 'b', 'gain', [{ t: 2, v: 0.5 }]), aOut: 101, custom: true }
+  const diff = editDiff(t, edited)
+  assert.deepEqual(Object.keys(diff).sort(), ['aOut', 'b.gain'])
+  assert.deepEqual(diff['b.gain'], { before: [], after: [{ t: 2, v: 0.5 }] })
+  assert.deepEqual(editDiff(t, t), {})
 })

@@ -3,7 +3,7 @@ import { useAuthedSession } from '@/features/auth/session'
 import { jellyfin } from '@/lib/jellyfin'
 import { music } from '../../player/music-player'
 import { createTransitionPreview, type PreviewSource, type TransitionPreview } from '../preview'
-import { laneReach, rateAdvance } from '../timeline'
+import { deckPlan, trackSpan } from '../deck-schedule'
 import type { Transition } from '../types'
 import { loadDeckAudio, sourceEnd } from './audio'
 import { POST_ROLL, PRE_ROLL } from './timeline-math'
@@ -11,12 +11,11 @@ import { POST_ROLL, PRE_ROLL } from './timeline-math'
 /** Extra audio read past what the transition reaches now, so small edits don't need more. */
 const MARGIN_S = 20
 
-/** How far into each song the transition (with its pre- and post-roll) reaches. */
+/** How far into each song the transition (with its pre- and post-roll; loops, paths and rates included) reaches. */
 function reach(transition: Transition) {
-  const end = transition.length + POST_ROLL
   return {
-    a: laneReach({ start: transition.aOut, path: transition.pathA ?? [] }, rateAdvance(transition.rateA ?? [], 0, end)),
-    b: laneReach({ start: transition.bIn, path: transition.pathB ?? [] }, rateAdvance(transition.rateB ?? [], transition.bAt, end)),
+    a: trackSpan(deckPlan(transition, 'a'), -PRE_ROLL, transition.length + 0.1).to + 1,
+    b: trackSpan(deckPlan(transition, 'b'), transition.bAt, transition.length + POST_ROLL).to + 1,
   }
 }
 

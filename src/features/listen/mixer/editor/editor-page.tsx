@@ -7,11 +7,14 @@ import { Link } from '@/components/link'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useItem } from '@/features/items/queries'
+import { closeListenPanel, openListenPanel, setListenLayout, useListenLayout, useListenPanel } from '../../player/panel'
 import { ticksToSeconds } from '@/lib/format'
 import { defineMessages, useMessages } from '@/lib/i18n'
-import { MixerSaveError, usePlaylistMixer, useSaveMixer, useTrackMixes } from '../queries'
+import { ENGINE_VERSION } from '../baked'
+import { MixerSaveError, usePlaylistMixer, useSaveMixer, useStableLumioFetch, useTrackMixes } from '../queries'
 import { transitionFor } from '../resolve'
 import { pairKey, type Transition } from '../types'
+import { editDiff } from './timeline-math'
 import { TransitionEditor } from './transition-editor'
 import { useSuggestions } from './use-assist'
 import { useTransitionPreview } from './use-preview'
@@ -61,6 +64,22 @@ export function TransitionEditorPage() {
   const ids = useMemo(() => [from, to], [from, to])
   const analyses = useTrackMixes(ids)
   const [edited, setEdited] = useState<Transition | null>(null)
+  // The editor gets the width: the "Läuft gerade" panel folds and the library sidebar narrows while it is open, and
+  // both come back as they were when leaving it.
+  const panel = useListenPanel()
+  const layout = useListenLayout()
+  useEffect(() => {
+    const panelWasOpen = panel.open
+    const sidebarWasOpen = !layout.collapsed
+    if (panelWasOpen) closeListenPanel()
+    if (sidebarWasOpen) setListenLayout({ collapsed: true })
+    return () => {
+      if (panelWasOpen) openListenPanel()
+      if (sidebarWasOpen) setListenLayout({ collapsed: false })
+    }
+    // Once, when the editor opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   // The editor over the whole window (tablets: the app's side panels take much of the width). Escape leaves it.
   const [full, setFull] = useState(false)
   const [host] = useState(() => document.createElement('div'))
@@ -98,6 +117,28 @@ export function TransitionEditorPage() {
 
   const suggestions = useSuggestions(aMix, bMix, { from, to }, mixer.data?.style ?? 'clean')
 
+  // Where the edit started (for the training data): the stored or automatic plan, until another start is picked.
+  const [start, setStart] = useState<{ variant: string | null; plan: Transition } | null>(null)
+  const origin = start ?? (initial ? { variant: mixer.data?.transitions?.[pairKey(from, to)] ? 'stored' : 'auto', plan: initial } : null)
+  const lumioFetch = useStableLumioFetch()
+
+  /** What the person made, with what it started from: training data for the planner (best effort, never in the way). */
+  const recordTraining = (final: Transition) => {
+    if (!origin) return
+    const body = {
+      playlistId: id,
+      pair: pairKey(from, to),
+      start: origin.variant === null ? null : { variant: origin.variant, plan: origin.plan },
+      final,
+      diff: editDiff(origin.plan, final),
+      versions: { a: aMix?.v ?? null, b: bMix?.v ?? null },
+      engine: ENGINE_VERSION,
+      planner: null,
+      style: mixer.data?.style ?? 'clean',
+    }
+    void lumioFetch('/music/mix/training', { method: 'POST', body: JSON.stringify(body) }).catch(() => undefined)
+  }
+
   const onSave = () => {
     if (!edited) return
     const transition: Transition = { ...edited, custom: true }
@@ -105,6 +146,7 @@ export function TransitionEditorPage() {
       { transitions: { ...(mixer.data?.transitions ?? {}), [pairKey(from, to)]: transition } },
       {
         onSuccess: () => {
+          recordTraining(transition)
           setEdited(null)
           toast.success(t.saved)
         },
@@ -160,6 +202,7 @@ export function TransitionEditorPage() {
             onLive={setLive}
             preview={preview}
             suggestions={suggestions}
+            onStart={setStart}
           />
         </>
       )}

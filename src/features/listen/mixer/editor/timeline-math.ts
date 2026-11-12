@@ -270,3 +270,27 @@ export function toggleLoop(transition: Transition, loop: LoopSpot): Transition {
     : [...(loop.from - start > 0.01 ? [{ from: start, to: loop.from, repeat: 1 }] : []), { from: loop.from, to: loop.to, repeat: 2 }]
   return loop.deck === 'a' ? { ...transition, pathA: path } : { ...transition, pathB: path }
 }
+
+/**
+ * What was changed between where an edit started and what was saved, field by field (deck lanes as `a.gain`, …), for
+ * the training data: the changed fields with their values before and after.
+ */
+export function editDiff(start: Transition, final: Transition): Record<string, { before: unknown; after: unknown }> {
+  const diff: Record<string, { before: unknown; after: unknown }> = {}
+  const same = (x: unknown, y: unknown) => JSON.stringify(x ?? null) === JSON.stringify(y ?? null)
+  const keys = new Set([...Object.keys(start), ...Object.keys(final)].filter((key) => key !== 'a' && key !== 'b' && key !== 'custom'))
+  for (const key of keys) {
+    const before = (start as unknown as Record<string, unknown>)[key]
+    const after = (final as unknown as Record<string, unknown>)[key]
+    if (!same(before, after)) diff[key] = { before, after }
+  }
+  for (const deck of ['a', 'b'] as const) {
+    const lanes = new Set([...Object.keys(start[deck] ?? {}), ...Object.keys(final[deck] ?? {})])
+    for (const lane of lanes) {
+      const before = (start[deck] as unknown as Record<string, unknown>)[lane]
+      const after = (final[deck] as unknown as Record<string, unknown>)[lane]
+      if (!same(before, after)) diff[`${deck}.${lane}`] = { before, after }
+    }
+  }
+  return diff
+}

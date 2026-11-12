@@ -59,8 +59,8 @@ import { useChecks } from './use-assist'
 import type { PreviewControls } from './use-preview'
 
 const GROUP_NAMES: Record<'de' | 'en', Record<string, string>> = {
-  de: { level: 'Pegel & EQ', effects: 'Filter & Hall', tempo: 'Tempo', stems: 'Smarte Filter' },
-  en: { level: 'Level & EQ', effects: 'Filter & reverb', tempo: 'Tempo', stems: 'Smart filters' },
+  de: { level: 'Pegel & EQ', effects: 'Filter & Hall', tempo: 'Tempo', stems: 'Smarte Filter · Näherung' },
+  en: { level: 'Level & EQ', effects: 'Filter & reverb', tempo: 'Tempo', stems: 'Smart filters · approximation' },
 }
 
 const PARAM_NAMES: Record<'de' | 'en', Record<LaneParam, string>> = {
@@ -72,9 +72,10 @@ const PARAM_NAMES: Record<'de' | 'en', Record<LaneParam, string>> = {
     filter: 'Filter',
     reverb: 'Hall',
     rate: 'Tempo',
-    drums: 'Drums',
-    vocals: 'Stimme',
-    instrumental: 'Instrumental',
+    // Approximated live (no separated stems yet): what the split really does, not what it would like to be.
+    drums: 'Drums (Näherung)',
+    vocals: 'Mitte (Stimme)',
+    instrumental: 'Rest',
   },
   en: {
     gain: 'Volume',
@@ -84,9 +85,9 @@ const PARAM_NAMES: Record<'de' | 'en', Record<LaneParam, string>> = {
     filter: 'Filter',
     reverb: 'Reverb',
     rate: 'Tempo',
-    drums: 'Drums',
-    vocals: 'Voice',
-    instrumental: 'Instrumental',
+    drums: 'Drums (approx.)',
+    vocals: 'Centre (voice)',
+    instrumental: 'Rest',
   },
 }
 
@@ -220,6 +221,8 @@ export interface TransitionEditorProps {
   preview?: PreviewControls
   /** The planner's suggestions for the pair (starting points, out and in points), once worked out. */
   suggestions?: Suggestions | null
+  /** Reports a new starting point (a suggestion's id, 'initial', or null for blank) with its plan. */
+  onStart?: (start: { variant: string | null; plan: Transition }) => void
 }
 
 type Gesture =
@@ -234,7 +237,7 @@ type Gesture =
  * bar grid, the overlap as a card with its bar count) and automation lanes below it, one row per parameter and deck, in
  * collapsible groups. A click anywhere sets the playhead; no gesture needs a double click.
  */
-export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuration, bDuration, onChange, onLive, preview, suggestions }: TransitionEditorProps) {
+export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuration, bDuration, onChange, onLive, preview, suggestions, onStart }: TransitionEditorProps) {
   const t = useMessages(messages)
   const history = useHistory(initial)
   const transition = history.value
@@ -586,8 +589,9 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
   }
 
   /** Starts over from another transition (a suggestion, blank, the original): one undoable step. */
-  const startFrom = (start: Transition) => {
+  const startFrom = (start: Transition, variant: string | null) => {
     const next = finalize({ ...start, custom: true })
+    onStart?.({ variant, plan: next })
     history.replace(next)
     onChange?.(next)
     setSelected(null)
@@ -654,10 +658,10 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
           <DropdownMenuContent align="start" className="w-96">
             <DropdownMenuGroup>
               <DropdownMenuLabel>{t.startsHint}</DropdownMenuLabel>
-              <DropdownMenuItem onClick={() => startFrom(initial)}>
+              <DropdownMenuItem onClick={() => startFrom(initial, 'initial')}>
                 <IconRestore /> {t.startInitial}
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => startFrom(blank(transition))}>
+              <DropdownMenuItem onClick={() => startFrom(blank(transition), null)}>
                 <IconSquare /> {t.startBlank}
               </DropdownMenuItem>
             </DropdownMenuGroup>
@@ -670,7 +674,7 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
               <DropdownMenuItem disabled>{t.startsNone}</DropdownMenuItem>
             ) : (
               suggestions.presets.map((preset) => (
-                <DropdownMenuItem key={preset.id} onClick={() => startFrom(preset.transition)}>
+                <DropdownMenuItem key={preset.id} onClick={() => startFrom(preset.transition, preset.id)}>
                   <IconSparkles /> <span className="whitespace-normal">{preset.label}</span>
                 </DropdownMenuItem>
               ))

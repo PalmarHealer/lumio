@@ -44,6 +44,13 @@ import type { DeckAutomation, DeckSegment, Keyframe, MixStyle, PresetId, TrackMi
  * it: during the overlap transition time = A's advance / A's rate, after the glide that comes before.
  */
 
+/**
+ * The planner's version, stored with every saved transition (training data) so a plan can be traced to the rules that
+ * made it. Bumped whenever the plans for the same songs change (a rule, a threshold, a new technique); not for
+ * refactors. 5 = round 2 learnings + the 6 dB energy-rise rule + the held low-pass (78dd75e and before).
+ */
+export const PLANNER_VERSION = 5
+
 export interface PlanOptions {
   /** Use this technique (the editor's preset menu, or switching one transition's style); the planner picks where. */
   preset?: PresetId

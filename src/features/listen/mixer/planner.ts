@@ -181,12 +181,12 @@ interface Anchor {
  * the first downbeat after its line ends, B's the last downbeat before its line starts (within a bar of it), so B's line
  * answers right after A's. The pair's bonus rides on A's spot.
  */
-function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{ pa: Anchor; pb: Anchor; title: boolean }> {
+function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{ pa: Anchor; pb: Anchor; title: boolean; onWord: boolean }> {
   const linesA = Array.isArray(a.mix.lines) && a.mix.vocalSource === 'lyrics' ? a.mix.lines : []
   const linesB = Array.isArray(b.mix.lines) && b.mix.vocalSource === 'lyrics' ? b.mix.lines : []
   if (linesA.length === 0 || linesB.length === 0) return []
   const titles = new Set([...(a.mix.titleWords ?? []), ...(b.mix.titleWords ?? [])])
-  const pairs: Array<{ pa: Anchor; pb: Anchor; weight: number; title: boolean }> = []
+  const pairs: Array<{ pa: Anchor; pb: Anchor; weight: number; title: boolean; onWord: boolean }> = []
   for (const la of linesA) {
     if (!(la.time >= a.duration * (style === 'party' ? 0.45 : 0.6)) || !(la.end < a.duration - 8 * a.period)) continue
     const iA = Math.max(0, floorIndex(a.downbeats, la.end - 0.05) + 1)
@@ -202,7 +202,20 @@ function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{
       const title = shared.some((w) => titles.has(w))
       if (!title && shared.length < 2) continue
       const weight = title ? WORDPLAY_TITLE : WORDPLAY_WORD
-      pairs.push({ pa: { t: ta, bonus: weight, drop: false, chorus: false }, pb: { t: tb, bonus: 0, drop: false, chorus: false }, weight, title })
+      // With word timing: B delivers the word in A's place (the user: "'heartless' must come from the NEW song"): A is cut
+      // on the beat its word would start on, B's same word starts right there. Both words must sit alike on their beats.
+      const word = shared.find((w) => titles.has(w)) ?? shared[0]
+      const atA = wordStart(la, word)
+      const atB = wordStart(lb, word)
+      if (atA !== null && atB !== null) {
+        const ba = a.beats[nearestIndex(a.beats, atA)]
+        const bb = b.beats[nearestIndex(b.beats, atB)]
+        if (ba !== undefined && bb !== undefined && Math.abs(atA - ba) <= 0.12 && Math.abs(atA - ba - (atB - bb)) <= 0.06 && atA >= a.duration * (style === 'party' ? 0.45 : 0.6)) {
+          pairs.push({ pa: { t: ba, bonus: weight + WORDPLAY_ON_WORD, drop: false, chorus: false }, pb: { t: bb, bonus: 0, drop: false, chorus: false }, weight: weight + WORDPLAY_ON_WORD, title, onWord: true })
+          continue
+        }
+      }
+      pairs.push({ pa: { t: ta, bonus: weight, drop: false, chorus: false }, pb: { t: tb, bonus: 0, drop: false, chorus: false }, weight, title, onWord: false })
     }
   }
   // The strongest few (a title word first, then the latest line of A).
@@ -212,6 +225,25 @@ function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{
 
 /** Bonus for a drop swap landing on B's drop (half on a chorus). */
 const DROP_SWAP_BONUS = 0.5
+
+/** When a line's words are timed (`wordTimes`, in the order of `words`): where `word` starts in it, else null. */
+function wordStart(line: { time: number; words: number[] }, word: number): number | null {
+  const times: unknown = (line as { wordTimes?: unknown }).wordTimes
+  if (!Array.isArray(times) || times.length !== line.words.length) return null
+  const k = line.words.indexOf(word)
+  const t = k >= 0 ? times[k] : undefined
+  return typeof t === 'number' && Number.isFinite(t) ? t : null
+}
+
+/** Index of the time in a sorted list nearest to t (-1 for an empty list). */
+function nearestIndex(list: number[], t: number) {
+  const i = floorIndex(list, t)
+  if (i < 0) return list.length > 0 ? 0 : -1
+  return i + 1 < list.length && list[i + 1] - t < t - list[i] ? i + 1 : i
+}
+
+/** Extra for a wordplay that replaces A's word with B's (timed words), over one that answers after A's line. */
+const WORDPLAY_ON_WORD = 0.3
 
 /** Bonus for a wordplay pair answering with a title word, or with another content word. */
 const WORDPLAY_TITLE = 1
@@ -1953,14 +1985,17 @@ function planSeveral(
       if (variant.volume === 'answer' || variant.volume === 'jumpcut') {
         // Wordplay: A's bar right after its line and B's bar right before its answering line meet on the swap; straight
         // material, `pre` bars before and `post` after it on both decks (bars, not phrases: lines don't keep to them).
-        for (const { pa, pb, title } of words) {
+        for (const { pa, pb, title, onWord } of words) {
           if (variant.volume === 'jumpcut' && !title) continue
-          const iA = floorIndex(a.downbeats, pa.t + 0.05)
-          const iB = floorIndex(b.downbeats, pb.t + 0.05)
-          const startA = a.downbeats[iA - pre]
-          const endA = a.downbeats[iA + post]
-          const startB = b.downbeats[iB - preB]
-          const endB = b.downbeats[iB + postB]
+          // On a timed word the swap is the beat the words start on (any beat, counted in beats); else the bars.
+          const grid = (track: PreparedTrack) => (onWord ? track.beats : track.downbeats)
+          const unit = onWord ? 4 : 1
+          const iA = floorIndex(grid(a), pa.t + 0.05)
+          const iB = floorIndex(grid(b), pb.t + 0.05)
+          const startA = grid(a)[iA - pre * unit]
+          const endA = grid(a)[iA + post * unit]
+          const startB = grid(b)[iB - preB * unit]
+          const endB = grid(b)[iB + postB * unit]
           if (startA === undefined || endA === undefined || startB === undefined || endB === undefined) continue
           const stats = shapeFor(variant, (endA - startA) / (4 * variant.bars))
           const length = stats.shape.length

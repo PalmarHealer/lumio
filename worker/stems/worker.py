@@ -20,6 +20,7 @@ Limit a fallback's CPU with the container (docker --cpus / compose cpus); it run
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -48,7 +49,19 @@ def request(method, path, body=None, content_type=None, timeout=600):
         return response.status, response.read()
 
 
+def gpu_present():
+    """Whether the container got an NVIDIA GPU (the toolkit mounts nvidia-smi and the device nodes)."""
+    try:
+        return subprocess.run(['nvidia-smi', '-L'], capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def load_model():
+    if PROVIDER == 'cuda' and not gpu_present():
+        # onnxruntime-gpu crashes (rather than failing) when asked for CUDA without a GPU in the container.
+        sys.exit('CUDA requested but no NVIDIA GPU in this container: run it with the GPU (compose device reservation, '
+                 'docker --gpus all) and the NVIDIA Container Toolkit, or set PROVIDER=cpu')
     options = ort.SessionOptions()
     if THREADS:
         options.intra_op_num_threads = THREADS

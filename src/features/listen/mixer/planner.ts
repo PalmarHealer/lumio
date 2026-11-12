@@ -112,6 +112,8 @@ const MAX_OVER_DB_OVERLAP = 3
 const HOLE_DB = -6
 /** Both decks together this far below the louder song's loud level: near silence (a hole a fade must not leave). */
 const DEEP_HOLE_DB = -15
+/** A blend's quietest bar below this (against the loud level) costs. */
+const DIP_DB = -10.5
 /**
  * Swing (where the off-beat 16ths fall) further apart than this: a swung and a straight groove flam wherever both are
  * loud, so such a pair hands over with little both-loud time (a bass swap handover, the short S-curve). Not lower: the
@@ -893,7 +895,8 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   let busy = 0
   let hole = 0
   let run = 0
-  if (length <= 0 || dt <= 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0, hole: 0 }
+  const levels: number[] = []
+  if (length <= 0 || dt <= 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0, hole: 0, dip: 0 }
   const { passA, passB } = stats
   // Two basslines, at every sample (the moments around a swap matter): checked first, it rejects.
   for (let i = 0; i < stats.gainA.length; i++) {
@@ -903,7 +906,7 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     if (atB === null) continue
     if (passA.low[i] * a.bandsAt(positionA(p, t)).low > 0.5 && passB.low[i] * b.bandsAt(atB).low > 0.5) basses += dt
   }
-  if (basses > 0) return { over: -Infinity, mean: 0, basses, busy: 0, hole: 0 }
+  if (basses > 0) return { over: -Infinity, mean: 0, basses, busy: 0, hole: 0, dip: 0 }
   const step = Math.max(1, Math.round(0.1 / dt))
   for (let i = 0; i < stats.gainA.length; i += step) {
     const t = i * dt
@@ -923,6 +926,7 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
       sum += (pa * pa + pb * pb) / reference
     }
     over.push(worst)
+    levels.push(sum / 3)
     total += sum / 3
     samples++
     // A stretch where both together sit far below the louder song's loud level: a hole.
@@ -932,9 +936,21 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     } else run = 0
     busy += Math.min(1, (eA.mid + eA.high + eB.mid + eB.high) / 4)
   }
-  if (samples === 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0, hole: 0 }
+  if (samples === 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0, hole: 0, dip: 0 }
   over.sort((x, y) => x - y)
-  return { over: over[Math.floor(over.length * 0.95)], mean: 10 * Math.log10(Math.max(total / samples, 1e-9)), basses, busy: busy / samples, hole }
+  // The quietest bar (mean power over any bar's worth of samples) against the loud level.
+  const perBar = Math.max(1, Math.round((4 * stats.beat) / (step * dt)))
+  let dip = 0
+  if (levels.length >= perBar) {
+    let windowSum = 0
+    dip = Infinity
+    for (let i = 0; i < levels.length; i++) {
+      windowSum += levels[i]
+      if (i >= perBar) windowSum -= levels[i - perBar]
+      if (i >= perBar - 1) dip = Math.min(dip, 10 * Math.log10(Math.max(windowSum / perBar, 1e-9)))
+    }
+  }
+  return { over: over[Math.floor(over.length * 0.95)], mean: 10 * Math.log10(Math.max(total / samples, 1e-9)), basses, busy: busy / samples, hole, dip }
 }
 
 /** Whether a track at `pos` is inside one of its measured sung lines, more than 0.15 s after its start. */
@@ -2179,11 +2195,14 @@ function planSeveral(
     const isMashup = placement.variant.volume === 'mashup'
     if (isMashup && !mashupFits(placement, a, b, harmony)) return null
     if (placement.variant.preset === 'reverbOut' && !reverbFits(placement, a, b)) return null
-    // A party wordplay hands over to B at full energy (round 1: How Deep Is Your Love → Wake Me Up, "B had no drop").
-    if (party && (placement.variant.volume === 'answer' || placement.variant.volume === 'jumpcut')) {
+    // A party wordplay hands over to B at full energy (round 1: How Deep Is Your Love → Wake Me Up, "B had no drop":
+    // B at 66–78 % of its body there). The handover may drop by 3 dB, as in a clean set: the user's own Heartless jump
+    // cut (B's "heartless" at 0:58) drops 1.6 dB.
+    const wordplay = placement.variant.volume === 'answer' || placement.variant.volume === 'jumpcut'
+    if (party && wordplay) {
       const atB = positionB(placement, placement.stats.shape.swap) ?? placement.laneB.start
       const bodyB = b.energyBetween(b.introEnd, b.outroStart > b.introEnd ? b.outroStart : b.end)
-      if (handoverDrop(placement, a, b) > 1.5 || b.energyBetween(atB, atB + 8 * b.period) < 0.85 * bodyB) return null
+      if (handoverDrop(placement, a, b) > 3 || b.energyBetween(atB, atB + 8 * b.period) < 0.85 * bodyB) return null
     }
     const dropSwap = placement.variant.volume === 'overlap' && placement.variant.bars === (placement.variant.pre ?? 0)
     const isTail = placement.variant.volume === 'tail'
@@ -2268,6 +2287,10 @@ function planSeveral(
       if (placement.variant.preset !== 'blend' && energy.hole > 4 * stats.beat) return null
       if (placement.variant.preset === 'blend') {
         energyTerm = 0.05 * Math.max(0, HOLE_DB - energy.mean)
+        // A bar that sinks far below the loud level costs (Titanium → Animals with the bass handed over at the start: A's
+        // bass gone under B's thin intro, the quietest bar at -13 dB against -10 dB at most for the blends the user
+        // rated 4 and 5).
+        energyTerm += 0.1 * Math.max(0, DIP_DB - energy.dip)
         // Busy parts (mids and highs up) take a filter, thin ones blend open; long blends suit thin parts, the short
         // seamless one dense parts.
         const filtered = placement.variant.filterIn || placement.variant.filterOut ? 1 : 0
@@ -2283,9 +2306,12 @@ function planSeveral(
     // B is never entered inside one of its lines (round 1: God's Plan → Hello cut "Hello" off "Hello from the other
     // side"); A leaving right after it began a new line sets up words that never come (Rock That Body → Outside: "I
     // wanna rock" starts, then fades) and costs.
-    // (relaxVoices, test: allowed while B is filtered where it becomes audible.)
+    // (relaxVoices, test: allowed while B is filtered where it becomes audible. A wordplay enters B on its word, its
+    // earlier words muted: exempt. A drop swap's pre-roll is a filtered tease under A: B is checked where it takes
+    // over, on its drop.)
     const bFiltered = relax && Math.abs(valueAt(stats.shape.b.filter, stats.bHere, 0)) >= RELAX_FILTERED
-    if (!bFiltered && entersMidLine(b, positionB(placement, stats.bHere) ?? placement.laneB.start)) return null
+    const bEnters = positionB(placement, dropSwap ? stats.shape.swap : stats.bHere) ?? placement.laneB.start
+    if (!bFiltered && !wordplay && entersMidLine(b, bEnters)) return null
     const startedLine = lineStartedBefore(a, positionA(placement, stats.aGone), 2)
     // The short S-curve may let one voice end as the other starts (a quarter second at most, about where two voices are
     // heard as two); otherwise never voice over voice.
@@ -2345,7 +2371,6 @@ function planSeveral(
     const quiet = party && placement.variant.preset === 'blend' && placement.variant.bassAt === 'none' && !placement.pb.drop && !placement.pb.chorus ? 0.15 : 0
     // B jumping up at the handover after being held thin ("B suddenly gets loud") costs.
     // (Not on the wordplay cuts, which switch at once by design.)
-    const wordplay = placement.variant.volume === 'answer' || placement.variant.volume === 'jumpcut'
     const jump = wordplay ? 0 : Math.max(0, handoverJump(placement, b) - 4)
     const score = -quiet - 0.08 * jump - (startedLine ? 0.25 : 0) + placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }

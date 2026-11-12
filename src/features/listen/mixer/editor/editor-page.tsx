@@ -12,6 +12,7 @@ import { MixerSaveError, usePlaylistMixer, useSaveMixer, useTrackMixes } from '.
 import { transitionFor } from '../resolve'
 import { pairKey, type Transition } from '../types'
 import { TransitionEditor } from './transition-editor'
+import { useSuggestions } from './use-assist'
 import { useTransitionPreview } from './use-preview'
 
 const messages = defineMessages({
@@ -75,6 +76,8 @@ export function TransitionEditorPage() {
   const [live, setLive] = useState<Transition | null>(null)
   const preview = useTransitionPreview({ fromId: from, toId: to, transition: live ?? initial, aDuration, bDuration })
 
+  const suggestions = useSuggestions(aMix, bMix, { from, to }, mixer.data?.style ?? 'clean')
+
   const onSave = () => {
     if (!edited) return
     const transition: Transition = { ...edited, custom: true }
@@ -133,6 +136,7 @@ export function TransitionEditorPage() {
             onChange={setEdited}
             onLive={setLive}
             preview={preview}
+            suggestions={suggestions}
           />
         </>
       )}

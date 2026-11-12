@@ -3,7 +3,11 @@ import {
   IconArrowForwardUp,
   IconChevronDown,
   IconChevronRight,
+  IconAlertTriangle,
   IconFocusCentered,
+  IconRestore,
+  IconSparkles,
+  IconSquare,
   IconLoader2,
   IconPlayerPauseFilled,
   IconPlayerPlayFilled,
@@ -14,8 +18,10 @@ import {
 } from '@tabler/icons-react'
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { Button } from '@/components/ui/button'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { defineMessages, useMessages } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
+import type { CheckIssue, CheckKind, SuggestedPoint, Suggestions } from '../editor-checks'
 import { finalizeTransition } from '../planner'
 import type { TrackMix, Transition } from '../types'
 import { drawCard, drawDeck, drawLane, laneValueAtY, laneY, LANE_COLOR, prepareCanvas, STUDIO } from './draw'
@@ -44,6 +50,7 @@ import {
   type LaneParam,
 } from './timeline-math'
 import { useHistory } from './use-history'
+import { useChecks } from './use-assist'
 import type { PreviewControls } from './use-preview'
 
 const GROUP_NAMES: Record<'de' | 'en', Record<string, string>> = {
@@ -78,6 +85,31 @@ const PARAM_NAMES: Record<'de' | 'en', Record<LaneParam, string>> = {
   },
 }
 
+const CHECK_NAMES: Record<'de' | 'en', Record<CheckKind, string>> = {
+  de: {
+    voices: 'Zwei Stimmen',
+    basslines: 'Zwei Basslines',
+    keyClash: 'Tonarten reiben',
+    energyJump: 'Energiesprung',
+    notReady: 'B nicht ganz da',
+    bandBack: 'A kommt zurück',
+    flamRisk: 'Beats flammen',
+    beatsApart: 'Beats laufen weg',
+    lineCut: 'Zeile abgeschnitten',
+  },
+  en: {
+    voices: 'Two voices',
+    basslines: 'Two basslines',
+    keyClash: 'Keys clash',
+    energyJump: 'Energy jump',
+    notReady: 'B not fully in',
+    bandBack: 'A comes back',
+    flamRisk: 'Beats flam',
+    beatsApart: 'Beats drift',
+    lineCut: 'Line cut off',
+  },
+}
+
 const messages = defineMessages({
   de: {
     play: 'Abspielen',
@@ -85,6 +117,14 @@ const messages = defineMessages({
     loop: 'Übergang in Schleife',
     audioLoading: 'Audio wird geladen',
     audioFailed: 'Audio nicht verfügbar',
+    starts: 'Vorschläge',
+    startsHint: 'Neu anfangen mit …',
+    startInitial: 'Ausgangspunkt (wie gespeichert oder automatisch)',
+    startBlank: 'Leer (beide Songs unverändert)',
+    startsLoading: 'Vorschläge werden berechnet …',
+    startsNone: 'Ohne Analyse keine Vorschläge',
+    hints: 'Hinweise',
+    check: (kind: CheckKind) => CHECK_NAMES.de[kind],
     undo: 'Rückgängig',
     redo: 'Wiederholen',
     snap: 'Am Takt einrasten',
@@ -103,6 +143,14 @@ const messages = defineMessages({
     loop: 'Loop the transition',
     audioLoading: 'Loading audio',
     audioFailed: 'Audio unavailable',
+    starts: 'Suggestions',
+    startsHint: 'Start over with …',
+    startInitial: 'Starting point (as saved, or automatic)',
+    startBlank: 'Blank (both songs as they are)',
+    startsLoading: 'Working out suggestions …',
+    startsNone: 'No suggestions without an analysis',
+    hints: 'Hints',
+    check: (kind: CheckKind) => CHECK_NAMES.en[kind],
     undo: 'Undo',
     redo: 'Redo',
     snap: 'Snap to the beat',
@@ -122,6 +170,9 @@ const LABEL_W = 140
 /** Each deck's half of the visualizer, and a lane row. */
 const DECK_H = 170
 const LANE_H = 52
+/** The checks' row. */
+const HINTS_H = 28
+const HINT_ROW_H = 22
 /** Handles: drawn 16–18 px wide, grabbed within 14 px (a 28 px target). */
 const GRAB_PX = 14
 /** Pointer travel before a press counts as a drag rather than a click. */
@@ -153,6 +204,8 @@ export interface TransitionEditorProps {
   onLive?: (transition: Transition) => void
   /** Playback (the preview of the transition as edited); without it the playhead only moves on clicks. */
   preview?: PreviewControls
+  /** The planner's suggestions for the pair (starting points, out and in points), once worked out. */
+  suggestions?: Suggestions | null
 }
 
 type Gesture =
@@ -167,7 +220,7 @@ type Gesture =
  * bar grid, the overlap as a card with its bar count) and automation lanes below it, one row per parameter and deck, in
  * collapsible groups. A click anywhere sets the playhead; no gesture needs a double click.
  */
-export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuration, bDuration, onChange, onLive, preview }: TransitionEditorProps) {
+export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuration, bDuration, onChange, onLive, preview, suggestions }: TransitionEditorProps) {
   const t = useMessages(messages)
   const history = useHistory(initial)
   const transition = history.value
@@ -191,6 +244,11 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
   // Playback moves the playhead; a click here moves it at once.
   const shownPlayhead = preview?.status === 'ready' ? preview.position : playhead
   const [looping, setLooping] = useState(false)
+  const issues = useChecks(transition, aMix, bMix)
+  // The kinds found, warnings first.
+  const issueKinds = [...new Set([...issues].sort((x, y) => (x.severity === y.severity ? 0 : x.severity === 'warn' ? -1 : 1)).map((issue) => issue.kind))]
+  /** The hint picked on the timeline (its message shows under it). */
+  const [hint, setHint] = useState<CheckIssue | null>(null)
 
   useEffect(() => onLive?.(transition), [transition, onLive])
   // The loop is the transition with a little on either side; it follows edits of its length.
@@ -222,6 +280,7 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
       const downbeats = mix ? marksInTime(axis, positions, mix.downbeats) : []
       return {
         deck,
+        positions,
         columns: deckColumns(mix, positions),
         ghost: deckColumns(mix, deckTrack(transition, deck, axis, true)),
         beats: mix ? marksInTime(axis, positions, mix.beats) : [],
@@ -281,7 +340,31 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     }
     handle(xOf(axis, transition.bAt), DECK_H + 4, DECK_H - 8)
     handle(xOf(axis, transition.length), 4, DECK_H - 8)
-  }, [axis, transition, decks, width])
+    // The planner's good spots: where A can go out (on A, at the top) and B come in (on B, at the bottom).
+    const spots = (points: SuggestedPoint[], positions: ReadonlyArray<number | null>, top: boolean) => {
+      g.font = '600 11px system-ui, sans-serif'
+      for (const point of points.slice(0, 6)) {
+        for (const time of marksInTime(axis, positions, [point.at])) {
+          const x = Math.round(xOf(axis, time))
+          const y = top ? 6 : DECK_H * 2 - 6
+          g.fillStyle = STUDIO.highCurve
+          g.beginPath()
+          g.moveTo(x - 5, y)
+          g.lineTo(x + 5, y)
+          g.lineTo(x, top ? y + 7 : y - 7)
+          g.fill()
+          g.fillStyle = 'rgba(250,204,21,0.85)'
+          g.fillText(point.label, x + 7, top ? y + 9 : y - 2)
+        }
+      }
+    }
+    if (suggestions) {
+      // A as if it played on past its end.
+      spots(suggestions.outPoints, deckTrack({ ...transition, length: Infinity }, 'a', axis), true)
+      // B as if it had been playing all along (its material where it is now), so in points before its entry show too.
+      spots(suggestions.inPoints, deckTrack({ ...transition, bAt: axis.from, bIn: transition.bIn + (axis.from - transition.bAt) }, 'b', axis), false)
+    }
+  }, [axis, transition, decks, width, suggestions])
 
   const local = (event: ReactPointerEvent<HTMLElement>) => {
     const box = event.currentTarget.getBoundingClientRect()
@@ -312,6 +395,11 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
       if (snapOn && !event.altKey) {
         const step = beatOf(slip.deck) * (event.shiftKey ? 4 : 1)
         delta = Math.round(delta / step) * step
+        // A good spot of the planner's wins when it is close: A going out there, B coming in there.
+        const points = slip.deck === 'a' ? suggestions?.outPoints : suggestions?.inPoints
+        const anchor = slip.deck === 'a' ? slip.start.aOut : slip.start.bIn
+        const near = points?.find((point) => Math.abs(point.at - (anchor - (x - slip.x) / axis.pxPerSecond)) * axis.pxPerSecond <= 12)
+        if (near) delta = near.at - anchor
       }
       history.set(slipDeck(slip.start, slip.deck, delta))
     }
@@ -431,6 +519,14 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     return () => window.removeEventListener('keydown', onKey)
   })
 
+  /** Starts over from another transition (a suggestion, blank, the original): one undoable step. */
+  const startFrom = (start: Transition) => {
+    const next = finalize({ ...start, custom: true })
+    history.replace(next)
+    onChange?.(next)
+    setSelected(null)
+  }
+
   const toOverlap = () => {
     const element = scroller.current
     if (element) element.scrollTo({ left: Math.max(0, xOf(axis, 0) - 40), behavior: 'smooth' })
@@ -475,6 +571,36 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
         <Button variant="ghost" size="sm" onClick={toOverlap}>
           <IconFocusCentered /> {t.toOverlap}
         </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="ghost" size="sm" />}>
+            <IconSparkles /> {t.starts}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="w-96">
+            <DropdownMenuGroup>
+              <DropdownMenuLabel>{t.startsHint}</DropdownMenuLabel>
+              <DropdownMenuItem onClick={() => startFrom(initial)}>
+                <IconRestore /> {t.startInitial}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => startFrom(blank(transition))}>
+                <IconSquare /> {t.startBlank}
+              </DropdownMenuItem>
+            </DropdownMenuGroup>
+            <DropdownMenuSeparator />
+            {suggestions === undefined || suggestions === null ? (
+              <DropdownMenuItem disabled>
+                <IconLoader2 className="animate-spin" /> {t.startsLoading}
+              </DropdownMenuItem>
+            ) : suggestions.presets.length === 0 ? (
+              <DropdownMenuItem disabled>{t.startsNone}</DropdownMenuItem>
+            ) : (
+              suggestions.presets.map((preset) => (
+                <DropdownMenuItem key={preset.id} onClick={() => startFrom(preset.transition)}>
+                  <IconSparkles /> <span className="whitespace-normal">{preset.label}</span>
+                </DropdownMenuItem>
+              ))
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
         <span className="ml-auto text-sm text-muted-foreground tabular-nums">
           {preview?.status === 'loading' ? `${t.audioLoading} · ` : preview?.status === 'failed' ? `${t.audioFailed} · ` : ''}
           {clock(shownPlayhead)}
@@ -530,6 +656,46 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
             </div>
           </div>
 
+          {/* The planner's checks, one row per kind, where they apply: a click jumps there and says what it is. */}
+          <div className="flex border-t border-white/5">
+            <div className="sticky left-0 z-10 flex shrink-0 items-center gap-2 px-3 text-xs font-semibold uppercase tracking-wide" style={{ width: LABEL_W, height: HINTS_H, background: STUDIO.surface, color: STUDIO.label }}>
+              {t.hints}
+              <span className={cn('rounded px-1.5 py-0.5 tabular-nums normal-case', issues.some((issue) => issue.severity === 'warn') ? 'bg-amber-500/20 text-amber-300' : 'bg-white/10')}>
+                {issues.length}
+              </span>
+            </div>
+            <div style={{ width, height: HINTS_H }} />
+          </div>
+          {issueKinds.map((kind) => (
+            <div key={kind} className="flex">
+              <div className="sticky left-0 z-10 flex shrink-0 items-center px-3 text-xs" style={{ width: LABEL_W, height: HINT_ROW_H, background: STUDIO.surface, color: STUDIO.label }}>
+                <span className="truncate">{t.check(kind)}</span>
+              </div>
+              <div className="relative" style={{ width, height: HINT_ROW_H }}>
+                {issues
+                  .filter((issue) => issue.kind === kind)
+                  .map((issue, i) => (
+                    <button
+                      key={`${issue.from}-${i}`}
+                      type="button"
+                      title={issue.message}
+                      aria-label={issue.message}
+                      onClick={() => {
+                        setHint(issue)
+                        seek(issue.from)
+                      }}
+                      className={cn(
+                        'absolute top-1 h-3.5 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        issue.severity === 'warn' ? 'bg-amber-400/80 hover:bg-amber-300' : 'bg-sky-400/60 hover:bg-sky-300',
+                        hint === issue && 'ring-2 ring-white',
+                      )}
+                      style={{ left: xOf(axis, issue.from), width: Math.max(8, xOf(axis, issue.to) - xOf(axis, issue.from)) }}
+                    />
+                  ))}
+              </div>
+            </div>
+          ))}
+
           {/* The lanes. */}
           {GROUPS.map((group) => (
             <div key={group.id}>
@@ -573,7 +739,13 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
           <div className="pointer-events-none absolute inset-y-0 w-0.5 bg-listen" style={{ left: LABEL_W + xOf(axis, shownPlayhead) - 1 }} />
         </div>
       </div>
-      <p className="text-xs text-muted-foreground">{t.hint}</p>
+      {hint ? (
+        <p className={cn('flex items-center gap-2 text-sm', hint.severity === 'warn' ? 'text-amber-500' : 'text-sky-500')}>
+          <IconAlertTriangle className="size-4 shrink-0" /> {clock(hint.from)}: {hint.message}
+        </p>
+      ) : (
+        <p className="text-xs text-muted-foreground">{t.hint}</p>
+      )}
     </div>
   )
 }
@@ -605,6 +777,12 @@ function LaneCanvas({
     drawLane(g, axis, transition, deck, param, width, LANE_H, selected)
   }, [axis, width, transition, deck, param, selected])
   return <canvas ref={canvas} style={{ width, height: LANE_H, touchAction: 'none' }} className={cn('block cursor-crosshair')} {...handlers} />
+}
+
+/** The same timing with no automation, effects or tempo changes: both songs as they are, to build from scratch. */
+function blank(transition: Transition): Transition {
+  const still = () => ({ gain: [], low: [], mid: [], high: [], filter: [] })
+  return { ...transition, a: still(), b: still(), effects: [], rateA: [], rateB: [] }
 }
 
 /** Transition time as "−0:04,2" / "0:12,8". */

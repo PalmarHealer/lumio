@@ -530,7 +530,12 @@ function estimateTempo(envelope: Float64Array, frameRate: number): Tempo {
   if (!local.length) return { period: (60 * frameRate) / 120, strength: 0, stability: 0 }
   for (let lag = 0; lag < lags; lag++) total[lag] = total[lag]! / local.length
 
-  const pick = (acf: Float64Array) => {
+  const atOf = (acf: Float64Array) => (lag: number) => {
+    const i = Math.floor(lag)
+    const f = lag - i
+    return i + 1 < acf.length ? acf[i]! * (1 - f) + acf[i + 1]! * f : NaN
+  }
+  const pick = (acf: Float64Array, found?: Array<{ period: number; score: number; value: number }>) => {
     const at = (lag: number) => {
       const i = Math.floor(lag)
       const f = lag - i
@@ -551,10 +556,25 @@ function estimateTempo(envelope: Float64Array, frameRate: number): Tempo {
       const multiples = (value + at(period * 2) / 2 + at(period * 3) / 3 + at(period * 4) / 4) / (1 + 1 / 2 + 1 / 3 + 1 / 4)
       const score = (multiples + 0.5 * (period / 2 >= 2 ? at(period / 2) : 0)) * Math.exp(-0.5 * Math.log2(bpm / TEMPO_CENTRE) ** 2)
       if (score > best.score) best = { period, score, value }
+      found?.push({ period, score, value })
     }
     return best
   }
-  const global = pick(total)
+  const found: Array<{ period: number; score: number; value: number }> = []
+  let global = pick(total, found)
+  // A dotted or triplet pulse (2/3 or 3/2 of the beat) can score almost as well as the beat. Where one comes close
+  // (within 15 % of the winner), the one whose quarter period (the beat's 16ths) is periodic in the onsets wins: a
+  // real beat divides in two and four (hats, 16th figures), a dotted pulse's quarter falls between them. It takes a
+  // clear lead (1.5 times, at least 0.08) to switch.
+  const at = atOf(total)
+  const sixteenths = (period: number) => {
+    const value = at(period / 4)
+    return Number.isNaN(value) || period / 4 < 2 ? 0 : value
+  }
+  const rival = found
+    .filter((entry) => [2 / 3, 3 / 2].some((ratio) => Math.abs(entry.period / (global.period * ratio) - 1) < 0.04) && entry.score >= 0.85 * global.score)
+    .sort((a, b) => b.score - a.score)[0]
+  if (rival && sixteenths(rival.period) >= 0.08 && sixteenths(rival.period) > 1.5 * sixteenths(global.period)) global = rival
   // How many windows hear the same tempo (or its half or double): low for free time, rubato and tempo changes.
   let agree = 0
   for (const acf of local) {

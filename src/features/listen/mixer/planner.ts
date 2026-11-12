@@ -2439,6 +2439,7 @@ function toTransition(
       confidence,
     },
     b,
+    a,
   )
 }
 
@@ -2482,7 +2483,7 @@ const START_LEAD = 0.04
  * start on or just after one of its beats, starts START_LEAD before that beat, its fade-in and EQ start moved along
  * (its bass stays where it meets A's).
  */
-function leadIns(original: Transition, b: PreparedTrack): Transition {
+function leadIns(original: Transition, b: PreparedTrack, a?: PreparedTrack): Transition {
   // B must never start after its beat: when it would and the transition starts too late to begin B earlier (B right
   // at its start, no glide before it), the transition begins earlier, A playing on for that much more before.
   let tr = original
@@ -2491,7 +2492,14 @@ function leadIns(original: Transition, b: PreparedTrack): Transition {
     const beat = i >= 0 ? b.beats[i] : NaN
     const shift = tr.bIn - (beat - START_LEAD)
     const rate = tr.rateB.length > 0 ? tr.rateB[0].v : 1
-    if (Number.isFinite(beat) && shift > 0 && shift <= 0.1 + START_LEAD && tr.bIn - shift >= 0 && tr.bAt - shift / rate < 0) tr = padStart(tr, shift / rate - tr.bAt + 0.001)
+    if (Number.isFinite(beat) && shift > 0 && shift <= 0.1 + START_LEAD && tr.bIn - shift >= 0 && tr.bAt - shift / rate < 0) {
+      // Back to A's downbeat before (so the transition still starts on one of A's).
+      const need = shift / rate - tr.bAt + 0.001
+      const rateA0 = tr.rateA.length > 0 ? tr.rateA[0].v : 1
+      const k = a ? floorIndex(a.downbeats, tr.aOut - need * rateA0 + 1e-6) : -1
+      const pad = a && k >= 0 ? (tr.aOut - a.downbeats[k]) / rateA0 : need
+      tr = padStart(tr, pad)
+    }
   }
   const lead = (path: DeckSegment[]): DeckSegment[] => {
     if (!path.some((segment) => segment.repeat > 1)) return path

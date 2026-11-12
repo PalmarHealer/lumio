@@ -1,6 +1,6 @@
 import { bufferDeckKind, createBufferDeck, tempoChangeKind } from './buffer-deck.ts'
 import { bSettled, deckPlan, withBrake } from './deck-schedule.ts'
-import { asPlayed, createDeck, createMaster, limiterLatency, resetDeck, releaseEcho, releaseReverb, scheduleTransition, tailsEnd, type LimiterStats } from './engine.ts'
+import { asPlayed, createDeck, createMaster, limiterLatency, loadEngineWorklets, resetDeck, releaseEcho, releaseReverb, scheduleTransition, tailsEnd, type LimiterStats } from './engine.ts'
 import type { Transition } from './types.ts'
 
 /**
@@ -29,6 +29,11 @@ export interface RenderTransitionOptions {
   onLimiter?: (stats: LimiterStats) => void
   /** The same for each deck's own limiter (on its stretched sound, see buffer-deck.ts). */
   onDeckLimiter?: (deck: 'a' | 'b', stats: LimiterStats) => void
+  /**
+   * The decks apart, without the master: four channels, deck A's output on 0–1 and deck B's on 2–3, each after its
+   * automation, effects and tails, before any level and the limiter (a baked clip, see baked.ts).
+   */
+  parts?: boolean
 }
 
 /** Sample-rate independent time → frame conversion used for the render's length. */
@@ -54,13 +59,31 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   const sampleRate = options.sampleRate ?? a.sampleRate
   const length = Math.max(0, transition.length)
   const total = preRoll + length + postRoll
-  const latency = limiterLatency(sampleRate)
+  const parts = !!options.parts
+  const latency = parts ? 0 : limiterLatency(sampleRate)
   const lead = frames(STRETCH_LEAD_S, sampleRate)
   const wanted = frames(total, sampleRate)
-  const ctx = new OfflineAudioContext({ numberOfChannels: 2, length: lead + wanted + latency, sampleRate })
-  const master = await createMaster(ctx, ctx.destination, { onStats: options.onLimiter })
-  const deckA = createDeck(ctx, master.input)
-  const deckB = createDeck(ctx, master.input)
+  const ctx = new OfflineAudioContext({ numberOfChannels: parts ? 4 : 2, length: lead + wanted + latency, sampleRate })
+  let master: Awaited<ReturnType<typeof createMaster>> | null = null
+  let outA: AudioNode
+  let outB: AudioNode
+  if (parts) {
+    await loadEngineWorklets(ctx)
+    const merger = new ChannelMergerNode(ctx, { numberOfInputs: 4 })
+    merger.connect(ctx.destination)
+    const [splitA, splitB] = [0, 2].map((first) => {
+      const split = new ChannelSplitterNode(ctx, { numberOfOutputs: 2 })
+      split.connect(merger, 0, first)
+      split.connect(merger, 1, first + 1)
+      return split
+    })
+    ;[outA, outB] = [splitA!, splitB!]
+  } else {
+    master = await createMaster(ctx, ctx.destination, { onStats: options.onLimiter })
+    outA = outB = master.input
+  }
+  const deckA = createDeck(ctx, outA)
+  const deckB = createDeck(ctx, outB)
   // Context time of transition time 0.
   const zero = lead / sampleRate + preRoll
   // A: straight into the transition, then its path at its rate (and a brake, if any), gone at `length`. (It starts
@@ -87,8 +110,8 @@ export async function renderTransition(options: RenderTransitionOptions): Promis
   resetDeck(deckB, zero + length, 0.05)
   // The limiter acts while the decks overlap, while B is still stretched (stretched audio can peak higher than the
   // track itself; at rate 1 the stretcher passes B through exactly again) and while an echo or reverb tail rings.
-  master.engage(true, Math.max(0, zero - LIMITER_LEAD_S))
-  master.engage(false, zero + Math.max(length, bSettled(transition), tailsEnd(transition) ?? -Infinity) + 0.05)
+  master?.engage(true, Math.max(0, zero - LIMITER_LEAD_S))
+  master?.engage(false, zero + Math.max(length, bSettled(transition), tailsEnd(transition) ?? -Infinity) + 0.05)
 
   // The stretchers' changes travel by message: all must have arrived before rendering runs past them.
   await Promise.all([playerA.settled(), playerB.settled()])

@@ -89,7 +89,9 @@ export class Stems {
   private readonly quotaBytes: number
   private readonly ttl: number
   private readonly jobs = new Map<string, StemJob>()
-  private readonly waiters: Array<{ role: WorkerRole; worker?: StemJob['worker']; give: (job: StemJob | null) => void }> = []
+  private readonly waiters: Array<{ role: WorkerRole; worker?: StemJob['worker']; signal?: AbortSignal; give: (job: StemJob | null) => void }> = []
+  /** Each window's meta.json is read and written under its own lock (preheat, receive, release and sweep overlap). */
+  private readonly locks = new Map<string, Promise<unknown>>()
   private primarySeen = 0
 
   constructor(dataDir: string, quotaMb = Number(process.env.STEMS_QUOTA_MB ?? 20_000), ttlHours = Number(process.env.STEMS_TTL_HOURS ?? 72)) {
@@ -115,6 +117,19 @@ export class Stems {
     await writeFile(this.path(meta.item, meta.window.id, 'meta.json'), JSON.stringify(meta))
   }
 
+  /** Runs `work` for this window after any earlier work on it has finished. */
+  private locked<T>(item: string, window: string, work: () => Promise<T>): Promise<T> {
+    const key = `${item}/${window}`
+    const previous = this.locks.get(key) ?? Promise.resolve()
+    const next = previous.then(work, work)
+    const settled = next.catch(() => {})
+    this.locks.set(key, settled)
+    void settled.then(() => {
+      if (this.locks.get(key) === settled) this.locks.delete(key)
+    })
+    return next
+  }
+
   private jobFor(item: string, window: string) {
     for (const job of this.jobs.values()) if (job.item === item && job.window.id === window) return job
     return null
@@ -129,9 +144,12 @@ export class Stems {
     let ready = 0
     for (const { item, window } of wanted) {
       if (!ITEM.test(item)) continue
-      const meta = (await this.meta(item, window.id)) ?? { item, window, holders: [], created: Date.now(), stems: [] }
-      if (!meta.holders.includes(playlistId)) meta.holders.push(playlistId)
-      await this.writeMeta(meta)
+      const meta = await this.locked(item, window.id, async () => {
+        const kept = (await this.meta(item, window.id)) ?? { item, window, holders: [], created: Date.now(), stems: [] }
+        if (!kept.holders.includes(playlistId)) kept.holders.push(playlistId)
+        await this.writeMeta(kept)
+        return kept
+      })
       if (meta.stems.length === STEMS.length) {
         ready++
         continue
@@ -158,14 +176,18 @@ export class Stems {
     for (const item of await readdir(this.dir).catch(() => [] as string[])) {
       if (!ITEM.test(item)) continue
       for (const window of await readdir(join(this.dir, item)).catch(() => [] as string[])) {
-        const meta = await this.meta(item, window)
-        if (!meta || !meta.holders.includes(playlistId)) continue
-        meta.holders = meta.holders.filter((holder) => holder !== playlistId)
-        if (meta.holders.length) {
-          await this.writeMeta(meta)
-          continue
-        }
-        await rm(this.path(item, window), { recursive: true, force: true })
+        const gone = await this.locked(item, window, async () => {
+          const meta = await this.meta(item, window)
+          if (!meta || !meta.holders.includes(playlistId)) return false
+          meta.holders = meta.holders.filter((holder) => holder !== playlistId)
+          if (meta.holders.length) {
+            await this.writeMeta(meta)
+            return false
+          }
+          await rm(this.path(item, window), { recursive: true, force: true })
+          return true
+        })
+        if (!gone) continue
         const job = this.jobFor(item, window)
         if (job) this.jobs.delete(job.id)
         deleted++
@@ -209,6 +231,8 @@ export class Stems {
   }
 
   private offer(job: StemJob) {
+    // A waiter whose request has gone (the worker hung up) never gets a job.
+    for (let i = this.waiters.length - 1; i >= 0; i--) if (this.waiters[i]!.signal?.aborted) this.waiters.splice(i, 1)
     const at = this.waiters.findIndex((waiter) => waiter.role === 'primary' || this.fallbackMay(job))
     if (at < 0) return
     const [waiter] = this.waiters.splice(at, 1)
@@ -228,8 +252,12 @@ export class Stems {
     job.leasedUntil = Date.now() + LEASE_MS
   }
 
-  /** The next job for a worker, waiting up to `waitMs` for one (long-poll); null when none came. */
-  next(waitMs: number, role: WorkerRole = 'primary', worker?: StemJob['worker']): Promise<StemJob | null> {
+  /**
+   * The next job for a worker, waiting up to `waitMs` for one (long-poll); null when none came or `signal` (its request
+   * closing) fired first.
+   */
+  next(waitMs: number, role: WorkerRole = 'primary', worker?: StemJob['worker'], signal?: AbortSignal): Promise<StemJob | null> {
+    if (signal?.aborted) return Promise.resolve(null)
     this.seen(role)
     const now = Date.now()
     for (const job of this.jobs.values()) {
@@ -247,19 +275,25 @@ export class Stems {
       return Promise.resolve(queued)
     }
     return new Promise((resolve) => {
-      const waiter = {
-        role,
-        worker,
-        give: (job: StemJob | null) => {
-          clearTimeout(timer)
-          resolve(job)
-        },
-      }
-      const timer = setTimeout(() => {
+      const leave = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', leave)
         const at = this.waiters.indexOf(waiter)
         if (at >= 0) this.waiters.splice(at, 1)
         resolve(null)
-      }, waitMs)
+      }
+      const waiter = {
+        role,
+        worker,
+        signal,
+        give: (job: StemJob | null) => {
+          clearTimeout(timer)
+          signal?.removeEventListener('abort', leave)
+          resolve(job)
+        },
+      }
+      const timer = setTimeout(leave, waitMs)
+      signal?.addEventListener('abort', leave)
       this.waiters.push(waiter)
     })
   }
@@ -273,25 +307,33 @@ export class Stems {
     return [...this.jobs.values()].filter((job) => job.state === 'running' && job.worker?.id === workerId)
   }
 
+  /** A job leased to a worker that couldn't take it after all goes back into the queue (not counted as an attempt). */
+  giveBack(job: StemJob) {
+    if (job.state !== 'running') return
+    job.state = 'queued'
+    job.attempts = Math.max(0, job.attempts - 1)
+    job.worker = undefined
+    this.offer(job)
+  }
+
   /** A worker was revoked or deleted: what it held goes back into the queue (not counted as an attempt). */
   dropWorker(workerId: string) {
-    for (const job of this.heldBy(workerId)) {
-      job.state = 'queued'
-      job.attempts = Math.max(0, job.attempts - 1)
-      job.worker = undefined
-      this.offer(job)
-    }
+    for (const job of this.heldBy(workerId)) this.giveBack(job)
   }
 
   /** Keeps one stem a worker uploaded (FLAC); when all four are in, the window is ready and the job done. */
   async receive(job: StemJob, stem: Stem, flac: Buffer): Promise<{ error?: string; done?: boolean }> {
     if (flac.toString('ascii', 0, 4) !== 'fLaC') return { error: 'FLAC expected' }
-    const meta = await this.meta(job.item, job.window.id)
+    const meta = await this.locked(job.item, job.window.id, async () => {
+      const kept = await this.meta(job.item, job.window.id)
+      if (!kept) return null
+      await writeFile(this.path(job.item, job.window.id, `${stem}.flac`), flac)
+      if (!kept.stems.includes(stem)) kept.stems.push(stem)
+      await this.writeMeta(kept)
+      return kept
+    })
     if (!meta) return { error: 'Released meanwhile' }
-    await writeFile(this.path(job.item, job.window.id, `${stem}.flac`), flac)
     job.received.add(stem)
-    if (!meta.stems.includes(stem)) meta.stems.push(stem)
-    await this.writeMeta(meta)
     if (meta.stems.length === STEMS.length) {
       this.jobs.delete(job.id)
       void this.sweep()
@@ -311,7 +353,7 @@ export class Stems {
 
   /** Frees stems unused for longer than the TTL, then the least recently used over the quota. */
   async sweep() {
-    const entries: Array<{ path: string; size: number; used: number }> = []
+    const entries: Array<{ path: string; item: string; window: string; size: number; used: number }> = []
     for (const item of await readdir(this.dir).catch(() => [] as string[])) {
       for (const window of await readdir(join(this.dir, item)).catch(() => [] as string[])) {
         let size = 0
@@ -322,14 +364,14 @@ export class Stems {
           size += info.size
           if (file === 'meta.json') used = info.mtimeMs
         }
-        entries.push({ path: this.path(item, window), size, used })
+        entries.push({ path: this.path(item, window), item, window, size, used })
       }
     }
     const now = Date.now()
     let total = 0
     const kept: typeof entries = []
     for (const entry of entries) {
-      if (now - entry.used > this.ttl) await rm(entry.path, { recursive: true, force: true })
+      if (now - entry.used > this.ttl) await this.locked(entry.item, entry.window, () => rm(entry.path, { recursive: true, force: true }))
       else {
         kept.push(entry)
         total += entry.size
@@ -338,7 +380,7 @@ export class Stems {
     kept.sort((a, b) => a.used - b.used)
     for (const entry of kept) {
       if (total <= this.quotaBytes) break
-      await rm(entry.path, { recursive: true, force: true })
+      await this.locked(entry.item, entry.window, () => rm(entry.path, { recursive: true, force: true }))
       total -= entry.size
     }
   }
@@ -355,20 +397,68 @@ export async function windowAudio(jellyfinUrl: string, token: string, item: stri
   return transcodedWindow(jellyfinUrl, token, item, window, signal)
 }
 
-async function decodedWindow(jellyfinUrl: string, token: string, item: string, window: StemWindow, signal: AbortSignal): Promise<Buffer | null> {
-  const response = await fetch(`${jellyfinUrl}/Audio/${item}/stream?static=true`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal })
-  if (!response.ok || !response.body) return null
-  const file = join(tmpdir(), `lumio-stem-${randomUUID()}`)
-  try {
-    // Streamed to a temporary file (an original may be large), decoded from there.
-    await pipeline(Readable.fromWeb(response.body as import('node:stream/web').ReadableStream), createWriteStream(file))
-    // -ss after -i decodes from the start and drops exactly up to the window: sample-accurate for every format.
-    const cut = window.end ? ['-ss', String(window.start), '-t', String(window.end - window.start)] : []
-    const wav = await ffmpeg(['-i', file, ...cut, '-map', '0:a:0', '-ac', '2', '-ar', '44100', '-c:a', 'pcm_s16le', '-f', 'wav', 'pipe:1'])
-    return wav.length > 44 ? fixWavSizes(wav) : null
-  } finally {
-    await rm(file, { force: true })
+/**
+ * Originals fetched for windows, kept a while: a song's windows (2-8 per playlist) then download it once. Each entry
+ * is the temporary file (or its download in progress) and when it was last used; dropped ORIGINAL_TTL after that, and
+ * the least recently used beyond ORIGINALS_MAX bytes.
+ */
+const originals = new Map<string, { file: Promise<string | null>; used: number; size: number }>()
+const ORIGINAL_TTL = 30 * 60_000
+const ORIGINALS_MAX = Number(process.env.STEMS_ORIGINALS_MB ?? 4096) * 1024 * 1024
+
+async function dropOriginal(item: string) {
+  const entry = originals.get(item)
+  originals.delete(item)
+  const file = await entry?.file.catch(() => null)
+  if (file) await rm(file, { force: true })
+}
+
+/** Forgets originals unused for ORIGINAL_TTL, then the least recently used over ORIGINALS_MAX. */
+export async function sweepOriginals() {
+  const now = Date.now()
+  for (const [item, entry] of [...originals]) if (now - entry.used > ORIGINAL_TTL) await dropOriginal(item)
+  let total = [...originals.values()].reduce((sum, entry) => sum + entry.size, 0)
+  for (const [item, entry] of [...originals].sort((a, b) => a[1].used - b[1].used)) {
+    if (total <= ORIGINALS_MAX) break
+    total -= entry.size
+    await dropOriginal(item)
   }
+}
+
+/** The song's original file (Jellyfin's static stream), downloaded once and shared by its windows; null on failure. */
+function original(jellyfinUrl: string, token: string, item: string): Promise<string | null> {
+  const kept = originals.get(item)
+  if (kept) {
+    kept.used = Date.now()
+    return kept.file
+  }
+  const entry = { used: Date.now(), size: 0, file: Promise.resolve<string | null>(null) }
+  entry.file = (async () => {
+    // Not tied to the asking worker's request: other windows of the song share this download.
+    const response = await fetch(`${jellyfinUrl}/Audio/${item}/stream?static=true`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal: AbortSignal.timeout(10 * 60_000) })
+    if (!response.ok || !response.body) throw new Error(`Jellyfin ${response.status}`)
+    const file = join(tmpdir(), `lumio-original-${item}-${randomUUID()}`)
+    // Streamed to a temporary file (an original may be large).
+    await pipeline(Readable.fromWeb(response.body as import('node:stream/web').ReadableStream), createWriteStream(file))
+    entry.size = (await stat(file)).size
+    return file
+  })()
+  originals.set(item, entry)
+  // A failed download isn't kept: the next window tries again.
+  entry.file.catch(() => {
+    if (originals.get(item) === entry) originals.delete(item)
+  })
+  void sweepOriginals()
+  return entry.file.catch(() => null)
+}
+
+async function decodedWindow(jellyfinUrl: string, token: string, item: string, window: StemWindow, signal: AbortSignal): Promise<Buffer | null> {
+  const file = await original(jellyfinUrl, token, item)
+  if (!file || signal.aborted) return null
+  // -ss after -i decodes from the start and drops exactly up to the window: sample-accurate for every format.
+  const cut = window.end ? ['-ss', String(window.start), '-t', String(window.end - window.start)] : []
+  const wav = await ffmpeg(['-i', file, ...cut, '-map', '0:a:0', '-ac', '2', '-ar', '44100', '-c:a', 'pcm_s16le', '-f', 'wav', 'pipe:1'])
+  return wav.length > 44 ? fixWavSizes(wav) : null
 }
 
 /** ffmpeg writing WAV to a pipe can't go back to fill in the sizes: set them from the data's actual length. */

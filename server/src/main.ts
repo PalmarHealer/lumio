@@ -16,7 +16,7 @@ import { SOUND_VERSION } from './sound-analysis.ts'
 import { MIX_VERSION } from './mix-analysis.ts'
 import { JellyfinError, analyzeTrack, parsePlaylistMixer, type BakedLookup, type MixTrack } from './mix.ts'
 import { BAKED_PART_LIMIT, BakedClips, isBakedKey, serveFile, type BakedMeta } from './baked.ts'
-import { STEMS, STEM_UPLOAD_LIMIT, Stems, windowAudio, windowOf, type Stem, type StemWindow } from './stems.ts'
+import { STEMS, STEM_UPLOAD_LIMIT, Stems, sweepOriginals, windowAudio, windowOf, type Stem, type StemWindow } from './stems.ts'
 import { StemWorkers } from './stem-workers.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
@@ -198,6 +198,7 @@ const stems = new Stems(DATA_DIR)
 /** The separation workers and their sign-in (see stem-workers.ts). */
 const stemWorkers = new StemWorkers(store)
 setInterval(() => void stems.sweep().catch((error) => console.warn('Stems sweep:', error)), 3600_000).unref()
+setInterval(() => void sweepOriginals().catch((error) => console.warn('Originals sweep:', error)), 300_000).unref()
 
 /** Whether someone may see a library item (Jellyfin answers it for them); remembered for ten minutes. */
 const itemAccess = new Map<string, number>()
@@ -1413,7 +1414,14 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     const role = worker.id ? worker.role : url.searchParams.get('role') === 'fallback' ? 'fallback' : 'primary'
     if (path === '/music/stems/jobs/next' && request.method === 'GET') {
       const wait = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000
-      const job = await stems.next(wait, role, { id: worker.id, name: worker.name })
+      // A worker that hangs up while waiting must not be handed a job (it would sit leased for 20 minutes).
+      const gone = new AbortController()
+      response.on('close', () => !response.writableFinished && gone.abort())
+      const job = await stems.next(wait, role, { id: worker.id, name: worker.name }, gone.signal)
+      if (job && gone.signal.aborted) {
+        stems.giveBack(job)
+        return
+      }
       return job ? send(response, 200, { id: job.id, item: job.item, window: job.window, stems: STEMS, role }) : send(response, 204)
     }
     const jobPath = path.match(/^\/music\/stems\/jobs\/([0-9a-f-]{36})\/(audio|fail|vocals|drums|bass|other)$/)

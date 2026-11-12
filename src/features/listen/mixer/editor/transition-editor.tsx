@@ -5,6 +5,7 @@ import {
   IconChevronRight,
   IconAlertTriangle,
   IconFocusCentered,
+  IconPlus,
   IconRestore,
   IconSparkles,
   IconSquare,
@@ -128,6 +129,8 @@ const messages = defineMessages({
     startsLoading: 'Vorschläge werden berechnet …',
     startsNone: 'Ohne Analyse keine Vorschläge',
     hints: 'Hinweise',
+    addPoint: 'Punkt',
+    addPointHint: (lane: string, deck: string) => `Punkt auf „${lane} ${deck}“ an der Abspielposition (Taste K)`,
     loops: 'Loops:',
     check: (kind: CheckKind) => CHECK_NAMES.de[kind],
     undo: 'Rückgängig',
@@ -139,7 +142,7 @@ const messages = defineMessages({
     bars: (n: number) => (n === 1 ? '1 Takt' : `${n} Takte`),
     group: (id: string) => GROUP_NAMES.de[id] ?? id,
     param: (param: LaneParam) => PARAM_NAMES.de[param],
-    hint: 'Klick setzt die Abspielposition. Auf eine Kurve klicken fügt einen Punkt hinzu, ziehen verschiebt ihn, Entf oder Rechtsklick löscht ihn.',
+    hint: 'Klick setzt die Abspielposition. Auf eine Kurve klicken (oder K) fügt einen Punkt hinzu, ziehen verschiebt ihn, Entf, Rechtsklick oder langes Drücken löscht ihn. Leertaste spielt ab.',
     deleteKey: 'Punkt löschen',
   },
   en: {
@@ -155,6 +158,8 @@ const messages = defineMessages({
     startsLoading: 'Working out suggestions …',
     startsNone: 'No suggestions without an analysis',
     hints: 'Hints',
+    addPoint: 'Point',
+    addPointHint: (lane: string, deck: string) => `Point on "${lane} ${deck}" at the playhead (key K)`,
     loops: 'Loops:',
     check: (kind: CheckKind) => CHECK_NAMES.en[kind],
     undo: 'Undo',
@@ -166,7 +171,7 @@ const messages = defineMessages({
     bars: (n: number) => (n === 1 ? '1 bar' : `${n} bars`),
     group: (id: string) => GROUP_NAMES.en[id] ?? id,
     param: (param: LaneParam) => PARAM_NAMES.en[param],
-    hint: 'A click sets the playhead. Click a curve to add a point, drag to move it, Delete or right-click removes it.',
+    hint: 'A click sets the playhead. Click a curve (or press K) to add a point, drag to move it, Delete, right-click or a long press removes it. Space plays.',
     deleteKey: 'Delete point',
   },
 })
@@ -237,6 +242,8 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
   const [zoom, setZoom] = useState(1)
   const [snapOn, setSnapOn] = useState(true)
   const [selected, setSelected] = useState<{ deck: Deck; param: LaneParam; index: number } | null>(null)
+  /** The lane last worked in: "+ Punkt" (and the K key) adds there, at the playhead. */
+  const [activeLane, setActiveLane] = useState<{ deck: Deck; param: LaneParam }>({ deck: 'a', param: 'gain' })
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ effects: true, tempo: true, stems: true })
   const scroller = useRef<HTMLDivElement>(null)
   const [viewport, setViewport] = useState(1000)
@@ -473,6 +480,7 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
 
   const onLaneDown = (event: ReactPointerEvent<HTMLCanvasElement>, deck: Deck, param: LaneParam) => {
     if (event.button !== 0) return
+    setActiveLane({ deck, param })
     const { x, y } = local(event)
     event.currentTarget.setPointerCapture(event.pointerId)
     const time = tOf(axis, x)
@@ -539,6 +547,9 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
       if (event.key === ' ' && !event.ctrlKey && !event.metaKey) {
         event.preventDefault()
         togglePlay()
+      } else if (event.key.toLowerCase() === 'k' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        event.preventDefault()
+        addAtPlayhead()
       } else if ((event.key === 'Delete' || event.key === 'Backspace') && selected) {
         event.preventDefault()
         deleteKey(selected.deck, selected.param, selected.index)
@@ -561,6 +572,18 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     const span = loop.deck === 'a' ? transition.length : transition.length - transition.bAt + POST_ROLL
     return hasLoop(transition, loop) || (loopReachable(transition, loop) && loop.from <= start + span)
   }).filter((loop, i, list) => list.slice(0, i).filter((other) => other.deck === loop.deck).length < 4)
+
+  /** A point on the active lane at the playhead, on its curve (dragging it then changes the sound). */
+  const addAtPlayhead = () => {
+    const { deck, param } = activeLane
+    const time = Math.min(transition.length, Math.max(0, shownPlayhead))
+    const added = addKey(laneKeys(transition, deck, param), param, time, laneValue(transition, deck, param, time), { from: 0, to: transition.length })
+    commit(transition, withLaneKeys(transition, deck, param, added.keys))
+    setSelected({ deck, param, index: added.index })
+    // The group of that lane opens, so the new point shows.
+    const group = GROUPS.find((entry) => entry.params.includes(param))
+    if (group && collapsed[group.id]) setCollapsed({ ...collapsed, [group.id]: false })
+  }
 
   /** Starts over from another transition (a suggestion, blank, the original): one undoable step. */
   const startFrom = (start: Transition) => {
@@ -620,6 +643,9 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
         </Button>
         <Button variant="ghost" size="sm" onClick={toOverlap}>
           <IconFocusCentered /> {t.toOverlap}
+        </Button>
+        <Button variant="ghost" size="sm" title={t.addPointHint(t.param(activeLane.param), activeLane.deck.toUpperCase())} onClick={addAtPlayhead}>
+          <IconPlus /> {t.addPoint}
         </Button>
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button variant="ghost" size="sm" />}>
@@ -790,7 +816,10 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
                 .filter((row) => row.group === group.id)
                 .map((row) => (
                   <div key={`${row.param}-${row.deck}`} className="flex border-t border-white/5">
-                    <div className="sticky left-0 z-10 flex shrink-0 items-center gap-2 px-3 text-xs" style={{ width: LABEL_W, height: LANE_H, background: STUDIO.surface, color: STUDIO.label }}>
+                    <div
+                      className="sticky left-0 z-10 flex shrink-0 items-center gap-2 px-3 text-xs"
+                      style={{ width: LABEL_W, height: LANE_H, background: activeLane.deck === row.deck && activeLane.param === row.param ? '#262626' : STUDIO.surface, color: STUDIO.label }}
+                    >
                       <span className="size-2.5 shrink-0 rounded-full" style={{ background: LANE_COLOR[row.param] }} />
                       <span className="truncate">{t.param(row.param)}</span>
                       <span className="ml-auto font-bold opacity-70">{row.deck.toUpperCase()}</span>

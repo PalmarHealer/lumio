@@ -111,6 +111,14 @@ export interface TrackMix {
    * before it.
    */
   bandLoudness?: { low: number; mid: number; high: number }
+  /**
+   * What kind of music it is, so a sort can keep like with like (a piano ballad after rap is a jump):
+   * `percussive`, the share of the sound in short attacks rather than sustained tones (0–1, harmonic/percussive split
+   * of the spectrum); `onsetRate`, clear attacks a second; `brightness`, the spectral centroid (Hz, of the audio as
+   * analysed, 11 kHz sampling); `timbre`, the song's mean of 12 cepstral coefficients of its log band energies (the
+   * spectrum's shape, compare by distance). Missing in analyses made before it.
+   */
+  character?: { percussive: number; onsetRate: number; brightness: number; timbre: number[] }
   /** The song's structure, in order, covering the whole track. */
   sections: MixSection[]
   /** Drop moments (a phrase start where bass and energy jump after a build-up). */

@@ -165,12 +165,21 @@ function blendable(a: Features, b: Features) {
 
 /**
  * 0–1: how alike the two songs are in kind (a DJ keeps a set's vibe: rap → piano ballad → indie rock isn't a path):
- * intensity (loudness, tempo, drops, density) and timbre (spectral tilt), tempo cluster aside (tempoScore has it).
+ * intensity (loudness, tempo, drops, density), spectral tilt and the music's character (percussiveness, onset rate,
+ * timbre); the tempo cluster aside (tempoScore has it).
  */
 function vibeScore(a: Features, b: Features) {
   const intensity = Math.abs(a.intensity - b.intensity)
   const tilt = Number.isFinite(a.tilt) && Number.isFinite(b.tilt) ? Math.abs(a.tilt - b.tilt) / 12 : 0.3
-  return 1 - clamp(1.6 * intensity + 0.5 * tilt)
+  // The music's kind (`character`): how percussive (a ballad .2, the rest .3–.7), how busy, the spectrum's shape.
+  const ca = a.track.mix.character
+  const cb = b.track.mix.character
+  let kind = 0.3
+  if (ca && cb && ca.onsetRate > 0 && cb.onsetRate > 0) {
+    const timbre = ca.timbre.length === cb.timbre.length && ca.timbre.length > 0 ? Math.sqrt(ca.timbre.reduce((sum, x, i) => sum + (x - cb.timbre[i]) ** 2, 0)) : 0
+    kind = 3 * Math.abs(ca.percussive - cb.percussive) + 0.8 * Math.abs(Math.log(ca.onsetRate / cb.onsetRate)) + 0.15 * timbre
+  }
+  return 1 - clamp(1.2 * intensity + 0.3 * tilt + 0.8 * kind)
 }
 
 function scoreFeatures(a: Features, b: Features, style: MixStyle, useRank: boolean) {
@@ -413,6 +422,12 @@ function orderAnalysed(list: Features[], style: MixStyle, maxWork: number): numb
  * The playlist in mixing order (track ids). Songs without a usable analysis stay at their index; the others are
  * ordered into the remaining places.
  */
+/** A ballad by its character: little percussion and few attacks (the tuned set's ballads .17–.30 and under 1.1/s). */
+function isBallad(track: PreparedTrack) {
+  const c = track.mix.character
+  return !!c && c.percussive < 0.31 && c.onsetRate > 0 && c.onsetRate < 1.1
+}
+
 export function sortForMix(tracks: Array<{ id: string; mix: TrackMix | null }>, style: MixStyle, opts: SortOptions = {}): string[] {
   const analysed: Array<{ index: number; features: Features }> = []
   const fixed = new Set<number>()
@@ -421,11 +436,16 @@ export function sortForMix(tracks: Array<{ id: string; mix: TrackMix | null }>, 
     if (track?.grid) analysed.push({ index, features: features(track) })
     else fixed.add(index)
   })
-  const order = orderAnalysed(
+  let order = orderAnalysed(
     analysed.map((entry) => entry.features),
     style,
     opts.maxWork ?? DEFAULT_WORK,
   )
+  // Party: ballads (little percussion, few attacks) close the set instead of opening it or sitting between rap tracks.
+  if (style === 'party') {
+    const ballad = (k: number) => isBallad(analysed[k].features.track)
+    order = [...order.filter((k) => !ballad(k)), ...order.filter(ballad)]
+  }
   const result: string[] = []
   let next = 0
   for (let index = 0; index < tracks.length; index++) {

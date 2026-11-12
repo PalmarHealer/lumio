@@ -37,7 +37,9 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  *   scale, with a slight resonance. At 0 both are exactly transparent: a low-pass at the Nyquist frequency and a
  *   high-pass at 0 Hz have the transfer function 1.
  * - The echo is a tempo-synced delay with feedback, fed by a send that opens at the effect's moment; its tail rings on
- *   after the deck's volume is gone ("echo out").
+ *   after the deck's volume is gone ("echo out"). Like a club mixer's echo it is low-cut: a high-pass (12 dB/octave at
+ *   `ECHO_LOW_CUT_HZ`) on its way in and another in its feedback loop, so its repeats carry no bassline under the next
+ *   track and each one is thinner than the last.
  * - The reverb is a hall (a convolver with a generated impulse, `hallImpulse`) fed by a send after the deck's volume
  *   (its `reverb` lane): its tail rings on after the deck is cut. It exists only on decks whose transitions use it (made
  *   when first needed), so a deck without reverb is exactly what it was before.
@@ -69,6 +71,8 @@ const BUTTERWORTH_Q_DB = 20 * Math.log10(Math.SQRT1_2)
 const FILTER_CURVE_RATE = 200
 /** Steps of a filter's glide back to open (on the log scale). */
 const GLIDE_STEPS = 12
+/** The echo's low cut (see the top). */
+const ECHO_LOW_CUT_HZ = 200
 /** Longest echo delay a deck allows (seconds). */
 const MAX_DELAY_S = 4
 /** A tempo that isn't a usable number counts as this (the contract already sends 120 for unknown ones). */
@@ -185,12 +189,14 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
   const delay = new DelayNode(ctx, { maxDelayTime: MAX_DELAY_S, delayTime: 0.5 })
   const feedback = new GainNode(ctx, { gain: 0 })
   const wet = new GainNode(ctx)
-  post.connect(send).connect(delay)
-  delay.connect(feedback).connect(delay)
+  const sendCut = biquad(ctx, 'highpass', ECHO_LOW_CUT_HZ, BUTTERWORTH_Q_DB)
+  const loopCut = biquad(ctx, 'highpass', ECHO_LOW_CUT_HZ, BUTTERWORTH_Q_DB)
+  post.connect(send).connect(sendCut).connect(delay)
+  delay.connect(feedback).connect(loopCut).connect(delay)
   delay.connect(wet).connect(level)
   level.connect(destination)
 
-  const nodes: AudioNode[] = [input, brake, gain, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, killA, killB, highpass, lowpass, dry, coloured, post, send, delay, feedback, wet, level]
+  const nodes: AudioNode[] = [input, brake, gain, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, killA, killB, highpass, lowpass, dry, coloured, post, send, sendCut, delay, feedback, loopCut, wet, level]
   // What each automated param starts at (its constructor value), for the engine's own copy of its timeline.
   for (const param of [brake.gain, gain.gain, low.gain, mid.gain, high.gain, lowpass.frequency, highpass.frequency, killA.frequency, killB.frequency, send.gain, feedback.gain, delay.delayTime, wet.gain, dry.gain, coloured.gain]) {
     timelines.set(param, [{ t: 0, v: param.value, ramp: false }])

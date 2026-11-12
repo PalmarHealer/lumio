@@ -312,6 +312,8 @@ interface Variant {
   bassAt?: 'start' | 'middle' | 'none'
   filterIn?: 'hp' | 'lp' | null
   filterOut?: 'hp' | 'lp' | 'eq' | null
+  /** Blend: the callback finish (B muted for the bar before the swap, A's element heard alone; see `callbackFits`). */
+  callback?: boolean
   /** Blend: bars of B played under A before B's event lands on A's boundary (the swap); the rest come after. */
   pre?: number
   /**
@@ -374,7 +376,11 @@ function blendFinishes(variant: Variant, clash: boolean): Variant[] {
     [at, null, 'eq', 0.03],
     ['none', null, null, 0],
   ]
-  return finishes.map(([bassAt, filterIn, filterOut, prior]) => ({ ...variant, bassAt, filterIn, filterOut, midSwap: clash, prior: variant.prior + prior }))
+  const list: Variant[] = finishes.map(([bassAt, filterIn, filterOut, prior]) => ({ ...variant, bassAt, filterIn, filterOut, midSwap: clash, prior: variant.prior + prior }))
+  // The callback: B under an opening low-pass, muted for the bar before the swap, back with its bass on it; A out under
+  // a closing low-pass. Placed only where A has something to hear alone there and B returns on an event (`callbackFits`).
+  if (variant.volume === 'overlap' && (variant.pre ?? 0) >= 4) list.unshift({ ...variant, bassAt: 'middle', filterIn: 'lp', filterOut: 'lp', midSwap: clash, callback: true, prior: variant.prior - 0.05 })
+  return list
 }
 
 /** The best prior any finish of a blend layout can add (so the bound stays an upper bound). */
@@ -1014,6 +1020,22 @@ function mashupFits(p: Placement, a: PreparedTrack, b: PreparedTrack, harmony: n
   return (singsA >= 2 && singsB <= 0.25) || (singsB >= 2 && singsA <= 0.25)
 }
 
+/**
+ * Whether a callback fits: B returns on an event (its drop or chorus is the anchor it lands on), and A has something
+ * to be heard alone in the bar before the swap: a sung line ending there or a mid-band hit standing out.
+ */
+function callbackFits(p: Placement, a: PreparedTrack) {
+  if (!p.pb.drop && !p.pb.chorus) return false
+  const swap = p.stats.shape.swap
+  const from = positionA(p, swap - 4 * p.stats.beat)
+  const to = positionA(p, swap)
+  // A sung line that ends in that bar or just before it (measured lines: an assumed span ends anywhere), or a hit
+  // standing out in the mids.
+  if (a.vocalsKnown && a.vocals.some((span) => span.end > from - 2 * p.stats.beat && span.end <= to)) return true
+  for (let t = from; t < to; t += 0.1) if (a.bandsAt(t).mid >= 1.2) return true
+  return false
+}
+
 /** A song's accent spread (seconds); 0 when unknown. */
 function spreadOf(mix: TrackMix) {
   const value: unknown = mix.accentSpread
@@ -1534,7 +1556,7 @@ export function planTransition(
     // Half time: B's bar spans two of A's, so the swap goes on an even bar of A.
     const rawSwap = variant.pre ?? variant.bars * variant.swapFraction
     const swapBar = tempo.synced && tempo.multiple === 2 ? 2 * Math.round(rawSwap / 2) : Math.round(rawSwap)
-    const key = `${variant.preset}:${variant.bars}:${variant.pre}:${swapBar}:${variant.preRollBars}:${variant.filter}:${variant.midSwap}:${variant.volume}:${variant.bassAt}:${variant.filterIn}:${variant.filterOut}:${variant.meet}:${beat.toFixed(5)}`
+    const key = `${variant.preset}:${variant.bars}:${variant.pre}:${swapBar}:${variant.preRollBars}:${variant.filter}:${variant.midSwap}:${variant.volume}:${variant.bassAt}:${variant.filterIn}:${variant.filterOut}:${variant.callback}:${variant.meet}:${beat.toFixed(5)}`
     let stats = shapes.get(key)
     if (!stats) {
       const shape = presetShape(variant.preset, {
@@ -1549,6 +1571,7 @@ export function planTransition(
         bassAt: variant.bassAt,
         filterIn: variant.filterIn,
         filterOut: variant.filterOut,
+        callback: variant.callback,
       })
       stats = shapeStats(shape, variant.meet, beat)
       shapes.set(key, stats)
@@ -1774,6 +1797,7 @@ export function planTransition(
     let placement = start
     const isMashup = placement.variant.volume === 'mashup'
     if (isMashup && !mashupFits(placement, a, b, harmony)) return null
+    if (placement.variant.callback && !callbackFits(placement, a)) return null
     if (placement.beatmatched) {
       const aligned = alignPhase(placement, a, b, tempo.multiple)
       // Grids that disagree by more than a few tens of milliseconds where they meet aren't to be trusted with a beatmatch

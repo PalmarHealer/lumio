@@ -78,6 +78,11 @@ export interface PresetContext {
    */
   filterIn?: 'hp' | 'lp' | null
   filterOut?: 'hp' | 'lp' | 'eq' | null
+  /**
+   * Blend: the callback (the user's "interessant"): B, faded in under its opening low-pass, is muted for the bar before
+   * the swap so A's element there is heard alone once more, and returns in full with its bass on the swap.
+   */
+  callback?: boolean
   /** Echo out: delay in beats and feedback (defaults 1 beat, 0.5). */
   echoBeats?: number
   echoFeedback?: number
@@ -701,6 +706,16 @@ function blend(ctx: PresetContext): PresetShape {
       ? bBand
       : []
   const knob = (kind: 'hp' | 'lp' | 'eq') => (kind === 'hp' ? 0.6 : -0.6)
+  if (ctx.callback && middle >= 8 * ctx.beat) {
+    // B in on an S-curve up to the bar before the swap, muted through that bar, back in full on the swap.
+    const gap = middle - 4 * ctx.beat
+    const curve: Point[] = []
+    for (let i = 0; i <= 8; i++) {
+      const x = i / 8
+      curve.push([gap * x, x * x * (3 - 2 * x)])
+    }
+    bGainPoints.splice(0, bGainPoints.length, ...curve, [gap + RAMP, 0], [middle - RAMP, 0], [middle, 1])
+  }
   return {
     preset: 'blend',
     length,

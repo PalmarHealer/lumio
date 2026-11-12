@@ -72,14 +72,16 @@ export function wavInfo(bytes: Buffer): { channels: number; rate: number; bits: 
   return 'No audio data'
 }
 
-/** Runs ffmpeg with these arguments, `input` piped in (or none); rejects when it fails or isn't there. */
-function ffmpeg(args: string[], input?: Buffer): Promise<void> {
+/** Runs ffmpeg with these arguments, `input` piped in (or none); resolves with what it wrote to stdout. */
+export function ffmpeg(args: string[], input?: Buffer): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.env.FFMPEG ?? 'ffmpeg', ['-nostdin', '-loglevel', 'error', '-y', ...args], { stdio: [input ? 'pipe' : 'ignore', 'ignore', 'pipe'] })
+    const child = spawn(process.env.FFMPEG ?? 'ffmpeg', ['-nostdin', '-loglevel', 'error', '-y', ...args], { stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe'] })
     let errors = ''
+    const out: Buffer[] = []
+    child.stdout?.on('data', (chunk: Buffer) => out.push(chunk))
     child.stderr?.on('data', (chunk: Buffer) => (errors = (errors + chunk.toString()).slice(-2000)))
     child.on('error', reject)
-    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg ${code}: ${errors.trim()}`))))
+    child.on('close', (code) => (code === 0 ? resolve(Buffer.concat(out)) : reject(new Error(`ffmpeg ${code}: ${errors.trim()}`))))
     if (input) child.stdin!.end(input)
   })
 }

@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto'
+import { createWriteStream } from 'node:fs'
 import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { join } from 'node:path'
+import { ffmpeg, hasFfmpeg } from './baked.ts'
 
 /**
  * Stems for the editor's smart filters ("Mix-Modus", Tier B): entering it pre-heats a playlist, i.e. asks for each
@@ -320,11 +325,42 @@ export class Stems {
 }
 
 /**
- * Streams a window of a song as WAV (stereo, 44.1 kHz, 16-bit) from Jellyfin's transcoding stream: read from the
- * song's start and cut sample-accurately (Jellyfin's own seek isn't sample-exact), so the stems line up with the song.
- * Returns the WAV, or null when Jellyfin fails.
+ * A window of a song as WAV (stereo, 44.1 kHz, 16-bit), cut sample-accurately so the stems line up with the song.
+ * With ffmpeg: the song's original file (Jellyfin's static stream: no transcode, no throttling) decoded here from the
+ * window's start. Without: Jellyfin's WAV transcode read from the song's start and cut (slow for late windows, as
+ * Jellyfin may throttle a transcode to playing speed). Null when Jellyfin fails.
  */
 export async function windowAudio(jellyfinUrl: string, token: string, item: string, window: StemWindow, signal: AbortSignal): Promise<Buffer | null> {
+  if (await hasFfmpeg()) return decodedWindow(jellyfinUrl, token, item, window, signal)
+  return transcodedWindow(jellyfinUrl, token, item, window, signal)
+}
+
+async function decodedWindow(jellyfinUrl: string, token: string, item: string, window: StemWindow, signal: AbortSignal): Promise<Buffer | null> {
+  const response = await fetch(`${jellyfinUrl}/Audio/${item}/stream?static=true`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal })
+  if (!response.ok || !response.body) return null
+  const file = join(tmpdir(), `lumio-stem-${randomUUID()}`)
+  try {
+    // Streamed to a temporary file (an original may be large), decoded from there.
+    await pipeline(Readable.fromWeb(response.body as import('node:stream/web').ReadableStream), createWriteStream(file))
+    // -ss after -i decodes from the start and drops exactly up to the window: sample-accurate for every format.
+    const cut = window.end ? ['-ss', String(window.start), '-t', String(window.end - window.start)] : []
+    const wav = await ffmpeg(['-i', file, ...cut, '-map', '0:a:0', '-ac', '2', '-ar', '44100', '-c:a', 'pcm_s16le', '-f', 'wav', 'pipe:1'])
+    return wav.length > 44 ? fixWavSizes(wav) : null
+  } finally {
+    await rm(file, { force: true })
+  }
+}
+
+/** ffmpeg writing WAV to a pipe can't go back to fill in the sizes: set them from the data's actual length. */
+function fixWavSizes(wav: Buffer) {
+  const at = wav.indexOf('data')
+  if (at < 0) return wav
+  wav.writeUInt32LE(wav.length - 8, 4)
+  wav.writeUInt32LE(wav.length - at - 8, at + 4)
+  return wav
+}
+
+async function transcodedWindow(jellyfinUrl: string, token: string, item: string, window: StemWindow, signal: AbortSignal): Promise<Buffer | null> {
   const rate = 44_100
   const params = new URLSearchParams({ AudioCodec: 'pcm_s16le', AudioSampleRate: String(rate), AudioChannels: '2', MaxAudioChannels: '2' })
   const response = await fetch(`${jellyfinUrl}/Audio/${item}/stream.wav?${params}`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal })

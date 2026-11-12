@@ -60,6 +60,8 @@ export interface DeckDrawing {
   bars: number[]
   /** Phrase starts (transition time), drawn stronger. */
   phrases: number[]
+  /** Singing only estimated (lyrics that couldn't be placed, or from the audio): underlined dashed and fainter. */
+  vocalsAssumed?: boolean
 }
 
 /**
@@ -121,7 +123,8 @@ export function drawDeck(g: CanvasRenderingContext2D, axis: Axis, transition: Tr
     const highPart = total * (h / share)
     g.fillStyle = STUDIO.high
     g.fillRect(x, middle - highPart, 1, highPart * 2)
-    if (column.vocal) {
+    if (column.vocal && (!drawing.vocalsAssumed || x % 6 < 3)) {
+      g.globalAlpha = drawing.vocalsAssumed ? 0.55 : 1
       g.fillStyle = STUDIO.vocal
       g.fillRect(x, top + height - 4, 1, 3)
     }

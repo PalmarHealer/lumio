@@ -364,8 +364,8 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
     g.fillStyle = STUDIO.surface
     g.fillRect(0, 0, width, DECK_H * 2)
     drawCard(g, axis, transition, DECK_H * 2)
-    drawDeck(g, axis, transition, { deck: 'a', columns: decks.a.columns, ghost: decks.a.ghost, bars: decks.a.bars, phrases: decks.a.phrases }, 0, DECK_H)
-    drawDeck(g, axis, transition, { deck: 'b', columns: decks.b.columns, ghost: decks.b.ghost, bars: decks.b.bars, phrases: decks.b.phrases }, DECK_H, DECK_H)
+    drawDeck(g, axis, transition, { deck: 'a', columns: decks.a.columns, ghost: decks.a.ghost, bars: decks.a.bars, phrases: decks.a.phrases, vocalsAssumed: aMix?.vocalSource !== 'lyrics' }, 0, DECK_H)
+    drawDeck(g, axis, transition, { deck: 'b', columns: decks.b.columns, ghost: decks.b.ghost, bars: decks.b.bars, phrases: decks.b.phrases, vocalsAssumed: bMix?.vocalSource !== 'lyrics' }, DECK_H, DECK_H)
     // B's entry and A's end, as handles.
     const handle = (x: number, top: number, height: number) => {
       g.fillStyle = 'rgba(255,255,255,0.85)'
@@ -407,7 +407,7 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
       // B as if it had been playing all along (its material where it is now), so in points before its entry show too.
       spots(suggestions.inPoints, deckTrack({ ...transition, bAt: axis.from, bIn: transition.bIn + (axis.from - transition.bAt) }, 'b', axis), false)
     }
-  }, [axis, transition, decks, width, suggestions])
+  }, [axis, transition, decks, width, suggestions, aMix, bMix])
 
   const local = (event: ReactPointerEvent<HTMLElement>) => {
     const box = event.currentTarget.getBoundingClientRect()

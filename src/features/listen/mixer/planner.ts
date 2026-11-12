@@ -928,6 +928,18 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   return { over: over[Math.floor(over.length * 0.95)], mean: 10 * Math.log10(Math.max(total / samples, 1e-9)), basses, busy: busy / samples, hole }
 }
 
+/** Whether a track at `pos` is inside one of its measured sung lines, more than 0.15 s after its start. */
+function entersMidLine(track: PreparedTrack, pos: number) {
+  const lines = Array.isArray(track.mix.lines) && track.mix.vocalSource === 'lyrics' ? track.mix.lines : []
+  return lines.some((line) => pos > line.time + 0.15 && pos < line.end)
+}
+
+/** Whether one of a track's measured lines started within `seconds` before `pos` (and is still going there). */
+function lineStartedBefore(track: PreparedTrack, pos: number, seconds: number) {
+  const lines = Array.isArray(track.mix.lines) && track.mix.vocalSource === 'lyrics' ? track.mix.lines : []
+  return lines.some((line) => line.time < pos && pos - line.time < seconds && pos < line.end)
+}
+
 /** A song's absolute level over a stretch (amplitude, its loudness × the stretch's energy against its mean). */
 function levelOver(track: PreparedTrack, from: number, to: number) {
   const mean = track.energyBetween(track.start, track.end)
@@ -1926,6 +1938,12 @@ function planSeveral(
     if (party && variant.preset === 'dropSwap' && energyB < 0.6) bound -= 0.3
     // Energy across the handover: B in the bars after A is gone against A in the bars before the swap (where A still
     // plays in full), in dB of absolute level. A falloff costs, a big one rules the placement out; party likes a rise.
+    // Leave A while it still carries energy (round 1: Titanium → Animals three times "don't wait until the song has
+    // lost all its energy"; Right Round → Beauty And A Beat's echo out from 2:33 rated 5, from 3:03 rated 2).
+    // (measured where the transition starts taking A away: its first 2 bars)
+    const exitEnergy = a.energyBetween(p.laneA.start, p.laneA.start + 8 * a.period)
+    const bodyEnergy = a.energyBetween(a.introEnd, a.outroStart > a.introEnd ? a.outroStart : a.end)
+    if (bodyEnergy > 0.05) bound += 0.4 * Math.min(0.3, Math.max(-1, exitEnergy / bodyEnergy - 1))
     const drop = handoverDrop(placed, a, b)
     const allowed = party ? 1.5 : 3
     if (drop > allowed) bound -= 0.15 * (drop - allowed) + (drop > allowed + 4 ? 2 : 0)
@@ -2050,7 +2068,7 @@ function planSeveral(
         for (const t of a.phraseGrid) {
           const i = floorIndex(a.downbeats, t + 0.05)
           const after = lastBar - i
-          if (i < 0 || after < 2 || after > 16 || (after === post && tailBars[lastBar] <= a.end)) continue
+          if (i < 0 || after < 2 || after > 16 || pre + after > maxBars || (after === post && tailBars[lastBar] <= a.end)) continue
           jobs.push({ pa: { t, bonus: 0, drop: false, chorus: false }, after, tail: true })
         }
       }
@@ -2152,6 +2170,12 @@ function planSeveral(
     const isMashup = placement.variant.volume === 'mashup'
     if (isMashup && !mashupFits(placement, a, b, harmony)) return null
     if (placement.variant.preset === 'reverbOut' && !reverbFits(placement, a, b)) return null
+    // A party wordplay hands over to B at full energy (round 1: How Deep Is Your Love → Wake Me Up, "B had no drop").
+    if (party && (placement.variant.volume === 'answer' || placement.variant.volume === 'jumpcut')) {
+      const atB = positionB(placement, placement.stats.shape.swap) ?? placement.laneB.start
+      const bodyB = b.energyBetween(b.introEnd, b.outroStart > b.introEnd ? b.outroStart : b.end)
+      if (handoverDrop(placement, a, b) > 1.5 || b.energyBetween(atB, atB + 8 * b.period) < 0.85 * bodyB) return null
+    }
     const dropSwap = placement.variant.volume === 'overlap' && placement.variant.bars === (placement.variant.pre ?? 0)
     const isTail = placement.variant.volume === 'tail'
     // A drop swap only where it genuinely fits (the user: "they can't always be done"): B lands on a real drop, A leaves
@@ -2245,6 +2269,11 @@ function planSeveral(
       }
     }
     const { clash: voices, lostA, lostB } = vocalCost(placement, a, b, party)
+    // B is never entered inside one of its lines (round 1: God's Plan → Hello cut "Hello" off "Hello from the other
+    // side"); A leaving right after it began a new line sets up words that never come (Rock That Body → Outside: "I
+    // wanna rock" starts, then fades) and costs.
+    if (entersMidLine(b, positionB(placement, stats.bHere) ?? placement.laneB.start)) return null
+    const startedLine = lineStartedBefore(a, positionA(placement, stats.aGone), 2)
     // The short S-curve may let one voice end as the other starts (a quarter second at most, about where two voices are
     // heard as two); otherwise never voice over voice.
     if (voices > (placement.variant.volume === 'scurve' ? Math.min(0.25, stats.beat / 2) : 0.1)) return null
@@ -2304,7 +2333,7 @@ function planSeveral(
     // (Not on the wordplay cuts, which switch at once by design.)
     const wordplay = placement.variant.volume === 'answer' || placement.variant.volume === 'jumpcut'
     const jump = wordplay ? 0 : Math.max(0, handoverJump(placement, b) - 4)
-    const score = -quiet - 0.08 * jump + placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    const score = -quiet - 0.08 * jump - (startedLine ? 0.25 : 0) + placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
   // The best `count` judged plans that differ in kind (see `kindOf`); `best` is the last one kept, the bar to beat.

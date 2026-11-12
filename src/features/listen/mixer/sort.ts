@@ -441,11 +441,11 @@ export function sortForMix(tracks: Array<{ id: string; mix: TrackMix | null }>, 
     style,
     opts.maxWork ?? DEFAULT_WORK,
   )
-  // Party: ballads (little percussion, few attacks) close the set instead of opening it or sitting between rap tracks.
-  if (style === 'party') {
-    const ballad = (k: number) => isBallad(analysed[k].features.track)
-    order = [...order.filter((k) => !ballad(k)), ...order.filter(ballad)]
-  }
+  // Ballads (little percussion, few attacks) never sit between the beat-driven songs: party closes on them, clean (which
+  // rises from calm to lively) opens with them (round 1: God's Plan → Hello, "the songs' energies don't match at all").
+  const ballad = (k: number) => isBallad(analysed[k].features.track)
+  if (style === 'party') order = [...order.filter((k) => !ballad(k)), ...order.filter(ballad)]
+  else order = [...order.filter(ballad), ...order.filter((k) => !ballad(k))]
   const result: string[] = []
   let next = 0
   for (let index = 0; index < tracks.length; index++) {

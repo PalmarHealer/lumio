@@ -407,7 +407,8 @@ function echoOut(ctx: PresetContext): PresetShape {
       // A's low goes on the meet, so neither A nor its echoes carry a bassline under B's.
       low: [[0, 1], ...stepAt(meet, 1, 0)],
     }),
-    b: automation(length, { gain: [[0, 0], ...stepFrom(meet, 0, 1)], low: [[0, 0], ...stepFrom(meet, 0, 1)] }),
+    // B's bass comes up over its first beat (round 1: "B's bass beats come in too strong/fast").
+    b: automation(length, { gain: [[0, 0], ...stepFrom(meet, 0, 1)], low: [[meet, 0], [meet + ctx.beat, 1]] }),
     effects: [{ kind: 'echo', deck: 'a', at: 0, beats, feedback }],
     anchorA: meet,
     anchorB: meet,

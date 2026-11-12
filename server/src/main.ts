@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { lookup } from 'node:dns/promises'
@@ -16,6 +16,7 @@ import { SOUND_VERSION } from './sound-analysis.ts'
 import { MIX_VERSION } from './mix-analysis.ts'
 import { JellyfinError, analyzeTrack, parsePlaylistMixer, type BakedLookup, type MixTrack } from './mix.ts'
 import { BAKED_PART_LIMIT, BakedClips, isBakedKey, serveFile, type BakedMeta } from './baked.ts'
+import { STEMS, STEM_UPLOAD_LIMIT, Stems, windowAudio, windowOf, type Stem, type StemWindow } from './stems.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
@@ -192,6 +193,30 @@ if (!JELLYFIN_URL) {
 const store = new Store(DATA_DIR)
 const lyricsIndex = MEILI_URL && MEILI_KEY ? lyricsSearch(MEILI_URL, MEILI_KEY, MEILI_LYRICS_INDEX) : null
 const bakedClips = new BakedClips(DATA_DIR)
+const stems = new Stems(DATA_DIR)
+/** The separation worker's secret (STEMS_WORKER_TOKEN); without it the worker routes are off. */
+const STEMS_WORKER_TOKEN = process.env.STEMS_WORKER_TOKEN ?? ''
+setInterval(() => void stems.sweep().catch((error) => console.warn('Stems sweep:', error)), 3600_000).unref()
+
+function isStemWorker(request: IncomingMessage) {
+  const sent = (request.headers.authorization ?? '').replace(/^Bearer /, '')
+  if (!STEMS_WORKER_TOKEN || !sent) return false
+  const a = Buffer.from(sent)
+  const b = Buffer.from(STEMS_WORKER_TOKEN)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+/** Whether someone may see a library item (Jellyfin answers it for them); remembered for ten minutes. */
+const itemAccess = new Map<string, number>()
+async function canSeeItem(token: string, userId: string, item: string) {
+  const key = `${token}|${item}`
+  if ((itemAccess.get(key) ?? 0) > Date.now()) return true
+  const response = await fetch(`${JELLYFIN_URL}/Users/${userId}/Items/${item}`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal: AbortSignal.timeout(15_000) }).catch(() => null)
+  if (!response?.ok) return false
+  if (itemAccess.size > 20_000) itemAccess.clear()
+  itemAccess.set(key, Date.now() + 600_000)
+  return true
+}
 // Clips no saved transition refers to any more (a reorder, an edit) are freed after a day; the quota is kept.
 setInterval(() => void bakedClips.sweep(store.bakedKeysInUse()).catch((error) => console.warn('Baked clips sweep:', error)), 3600_000).unref()
 
@@ -1382,6 +1407,48 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     return serveKept(response, () => (image.src.startsWith('upload:') ? uploadedImage(image.src.slice('upload:'.length)) : keptImage(image.src)))
   }
 
+  // The separation worker (see stems.ts), with its own secret instead of a Jellyfin sign-in. GET
+  // /music/stems/jobs/next?wait=<s>: the next job ({id, item, window}), waiting up to 30 s for one (204: none).
+  // GET /music/stems/jobs/<id>/audio: the job's window as WAV (stereo, 44.1 kHz, 16-bit), streamed from Jellyfin here.
+  // PUT /music/stems/jobs/<id>/<vocals|drums|bass|other>: one stem as FLAC. POST /music/stems/jobs/<id>/fail {error}.
+  if (path.startsWith('/music/stems/jobs/')) {
+    if (!STEMS_WORKER_TOKEN) return send(response, 404, { error: 'No stem worker configured' })
+    if (!isStemWorker(request)) return send(response, 401, { error: 'Worker token required' })
+    if (path === '/music/stems/jobs/next' && request.method === 'GET') {
+      const wait = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000
+      const job = await stems.next(wait)
+      return job ? send(response, 200, { id: job.id, item: job.item, window: job.window, stems: STEMS }) : send(response, 204)
+    }
+    const jobPath = path.match(/^\/music\/stems\/jobs\/([0-9a-f-]{36})\/(audio|fail|vocals|drums|bass|other)$/)
+    const job = jobPath ? stems.job(jobPath[1]!) : null
+    if (!jobPath || !job) return send(response, 404, { error: 'No such job' })
+    const action = jobPath[2]!
+    if (action === 'audio' && request.method === 'GET') {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 5 * 60_000)
+      try {
+        const wav = await windowAudio(JELLYFIN_URL, job.token, job.item, job.window, controller.signal).catch(() => null)
+        if (!wav) return send(response, 502, { error: 'Jellyfin gave no audio' })
+        response.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length })
+        return response.end(wav)
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    if (action === 'fail' && request.method === 'POST') {
+      const body = await readJson<{ error?: unknown }>(request).catch(() => ({ error: undefined }))
+      stems.fail(job, typeof body.error === 'string' ? body.error : 'Worker failed')
+      return send(response, 204)
+    }
+    if (request.method === 'PUT' && (STEMS as readonly string[]).includes(action)) {
+      const flac = await readBody(request, STEM_UPLOAD_LIMIT).catch(() => null)
+      if (!flac) return send(response, 413, { error: 'Too large' })
+      const failed = await stems.receive(job, action as Stem, flac)
+      return failed ? send(response, 400, { error: failed }) : send(response, 204)
+    }
+    return send(response, 405, { error: 'Not allowed' })
+  }
+
   const me = await authenticate(tokenOf(request, url))
   if (!me) return send(response, 401, { error: 'Not signed in' })
 
@@ -1936,6 +2003,52 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       console.warn(`Baked clip ${key}:`, error)
       return send(response, 500, { error: 'Could not keep the part' })
     }
+  }
+
+  // Stems ("Mix-Modus", see stems.ts). POST /music/stems/preheat {playlistId, items: [{id, windows?: [{start, end}]}]}:
+  // asks for the songs' stems (whole songs without windows; windows up to 300 s), held for the playlist, for those who
+  // may edit it ({queued, ready}; 503 when no worker is configured). POST /music/stems/release {playlistId}: lets go of
+  // them (deleted unless another playlist holds them). GET /music/stems/status?ids=…: per song its windows' state.
+  // GET /music/stems/<item>/<window>/<stem>: one stem as FLAC, for those who can see the song.
+  if ((path === '/music/stems/preheat' || path === '/music/stems/release') && request.method === 'POST') {
+    const body = await readJson<{ playlistId?: unknown; items?: unknown }>(request, 262_144).catch(() => null)
+    const playlistId = typeof body?.playlistId === 'string' ? body.playlistId.toLowerCase() : ''
+    if (!/^[0-9a-f]{32}$/.test(playlistId)) return send(response, 400, { error: 'Bad playlistId' })
+    const token = tokenOf(request, url)!
+    try {
+      if (!(await accessToPlaylist(token, me.id, playlistId, true)).edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+    }
+    if (path === '/music/stems/release') return send(response, 200, await stems.release(playlistId))
+    if (!STEMS_WORKER_TOKEN) return send(response, 503, { error: 'No stem worker configured' })
+    const items = Array.isArray(body?.items) ? body.items : null
+    if (!items || items.length > 400) return send(response, 400, { error: 'Bad items' })
+    const wanted: Array<{ item: string; window: StemWindow }> = []
+    for (const entry of items as Array<{ id?: unknown; windows?: unknown }>) {
+      const item = typeof entry?.id === 'string' ? entry.id.toLowerCase() : ''
+      if (!/^[0-9a-f]{32}$/.test(item)) return send(response, 400, { error: 'Bad item id' })
+      const windows = entry.windows === undefined ? [{ start: 0, end: 0 }] : entry.windows
+      if (!Array.isArray(windows) || windows.length > 8) return send(response, 400, { error: 'Bad windows' })
+      for (const value of windows as Array<{ start?: unknown; end?: unknown }>) {
+        const window = windowOf(Number(value?.start), Number(value?.end))
+        if (!window) return send(response, 400, { error: 'Bad window' })
+        wanted.push({ item, window })
+      }
+    }
+    return send(response, 200, await stems.preheat(playlistId, token, wanted))
+  }
+  if (path === '/music/stems/status' && request.method === 'GET') {
+    const ids = (url.searchParams.get('ids') ?? '').toLowerCase().split(',').filter(Boolean)
+    if (!ids.length || ids.length > 400 || !ids.every((id) => /^[0-9a-f]{32}$/.test(id))) return send(response, 400, { error: 'Bad ids' })
+    return send(response, 200, await stems.status(ids))
+  }
+  const stemFile = path.match(/^\/music\/stems\/([0-9a-f]{32})\/(whole|\d{1,7}-\d{1,7})\/(vocals|drums|bass|other)$/i)
+  if (stemFile && request.method === 'GET') {
+    const item = stemFile[1]!.toLowerCase()
+    if (!(await canSeeItem(tokenOf(request, url)!, me.id, item))) return send(response, 404, { error: 'No such song' })
+    const file = await stems.file(item, stemFile[2]!, stemFile[3]!)
+    return file ? serveFile(response, file) : send(response, 404, { error: 'No such stem' })
   }
 
   // POST /music/mix/training {playlistId, pair, …}: one transition someone saved in the editor, kept as training data

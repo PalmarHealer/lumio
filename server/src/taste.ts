@@ -3,8 +3,9 @@ import { partsIn } from './wrapped.ts'
 
 /**
  * Someone's listening, boiled down per song for the mixes the app builds (daylist, daily mixes, radios): how much they
- * play it now and over the long run, how often they skip it, and at which times of the day and week. Lumio's own plays
- * and imported ones (Spotify) count alike; only songs in the library (a Jellyfin id) are kept.
+ * play it now and over the long run, how often they skip it, and at which times of the day and week; and which songs
+ * they hear in one sitting. Lumio's own plays and imported ones (Spotify) count alike; only songs in the library (a
+ * Jellyfin id) are kept.
  */
 export interface TasteSignals {
   /** When the numbers were made (the decays are relative to it). */
@@ -17,10 +18,19 @@ export interface TasteSignals {
    * half-life of a week, and the last time (ms). For the home grid's "heavy rotation".
    */
   sources: Record<string, { w: number; t: number }>
+  /**
+   * What was heard in one sitting over the last half year (a pause of half an hour starts a new one): each sitting's
+   * distinct songs, as places in `keys`. Artists heard together belong together (the Daily Mixes group by it).
+   */
+  sessions: { keys: string[]; lists: number[][] }
 }
 
 export interface TrackSignals {
-  /** Plays that count (30 s or more, or to the end); a song skipped late counts half. */
+  /**
+   * Plays that count (30 s or more, or to the end). Skipping on after 30 s takes nothing away (songs left late are
+   * played again more often than those heard out); going back to a song counts half a play more, unless it was
+   * only passed on the way further back (under 30 s, or left by going back again).
+   */
   p: number
   /** Plays in the last 30 days. */
   m: number
@@ -57,12 +67,34 @@ const SOURCE_HALF_LIFE = 7 * DAY
 const SOURCE_HORIZON = 60 * DAY
 /** Older plays say too little to be worth reading. */
 const HORIZON = 3 * 365 * DAY
+/** Going back to a song (and hearing it) says more than letting it come up. */
+const BACK_WEIGHT = 1.5
+const SESSION_HORIZON = 182 * DAY
+const SESSION_GAP = 30 * 60_000
+/** A sitting's songs beyond this say little more about what belongs together. */
+const SESSION_MAX = 80
 const JELLYFIN_ID = /^[0-9a-f]{32}$/i
 
 export function tasteSignals(store: Store, userId: string, timeZone: string, now = Date.now()): TasteSignals {
   const tracks: Record<string, TrackSignals> = {}
+  const keys = new Map<string, number>()
+  const lists: number[][] = []
+  let sitting = new Set<number>()
+  let sittingEnd = 0
+  const closeSitting = () => {
+    if (sitting.size >= 2) lists.push([...sitting])
+    sitting = new Set()
+  }
   for (const play of store.tasteRows(userId, now - HORIZON)) {
     if (!JELLYFIN_ID.test(play.key)) continue
+    if (play.startedAt >= now - SESSION_HORIZON) {
+      if (play.startedAt - sittingEnd > SESSION_GAP) closeSitting()
+      sittingEnd = Math.max(sittingEnd, play.startedAt + play.seconds * 1000)
+      if (play.seconds >= 30 && sitting.size < SESSION_MAX) {
+        if (!keys.has(play.key)) keys.set(play.key, keys.size)
+        sitting.add(keys.get(play.key)!)
+      }
+    }
     const entry = (tracks[play.key] ??= { p: 0, m: 0, s: 0, l: 0, k: 0, t: 0, d: new Array(12).fill(0) })
     entry.t = Math.max(entry.t, play.startedAt)
     // A skip is leaving a song early for another one; stopping the music (closing the app) says nothing about it.
@@ -70,7 +102,8 @@ export function tasteSignals(store: Store, userId: string, timeZone: string, now
       if (play.reasonEnd === 'fwdbtn') entry.k++
       continue
     }
-    const weight = play.reasonEnd === 'fwdbtn' ? 0.5 : 1
+    // Going back to a song and staying with it; one only passed on the way further back says nothing.
+    const weight = play.reasonStart === 'backbtn' && play.reasonEnd !== 'backbtn' ? BACK_WEIGHT : 1
     const age = Math.max(0, now - play.startedAt)
     entry.p += weight
     if (age < 30 * DAY) entry.m += weight
@@ -99,5 +132,6 @@ export function tasteSignals(store: Store, userId: string, timeZone: string, now
     entry.t = Math.max(entry.t, play.startedAt)
   }
   for (const entry of Object.values(sources)) entry.w = round(entry.w)
-  return { at: now, timeZone, tracks, sources }
+  closeSitting()
+  return { at: now, timeZone, tracks, sources, sessions: { keys: [...keys.keys()], lists } }
 }

@@ -64,7 +64,7 @@ const near = (value: number, centre: number, width: number) => Math.exp(-0.5 * (
  * Where a song stands in the library (0–1, by rank): today's masters are all loud and bright, so only the comparison
  * with the other songs tells the calm ones from the driving ones.
  */
-function rankers(features: SoundFeatures[]) {
+export function rankers(features: SoundFeatures[]) {
   const ranker = (values: number[]) => {
     const sorted = [...values].sort((a, b) => a - b)
     return (value: number) => {
@@ -88,9 +88,9 @@ function rankers(features: SoundFeatures[]) {
   }
 }
 
-type Rankers = ReturnType<typeof rankers>
+export type Rankers = ReturnType<typeof rankers>
 
-function qualities(f: SoundFeatures, rank: Rankers) {
+export function qualities(f: SoundFeatures, rank: Rankers) {
   const bright = rank.bright(f.brightness)
   const energy = 0.5 * rank.loud(f.loudness) + 0.3 * rank.busy(f.onsets) + 0.2 * bright
   // Major and clearly so reads happier; an unclear key says little either way.
@@ -212,7 +212,7 @@ export function moodMixes(input: Context): OfficialPlaylist[] {
 
 const QUEER = /^(queer|lgbt|lgbtq|lgbtq\+|lgbtqia|lgbtqia\+|gay|lesbian|bisexual|trans|transgender|queercore|drag|non-binary|nonbinary|queer pop|queer rap)$/
 /** Tags that say nothing about the music. */
-const NOISE =
+export const NOISE =
   /^(seen live|favorites?|favourites?|my favorites?|my favourites?|love|loved|awesome|beautiful|amazing|best|cool|good|great|spotify|albums i own|under \d+ listeners|check out|[0-9]+|[0-9]+ stars?|all|music|songs?|other|misc|vocal|vocals|male vocalists|female|male|german|deutsch|english|usa|american|british|uk)$/
 
 /** A name as it goes into an address ("Hip-Hop/Rap" → "hip-hop-rap"). */

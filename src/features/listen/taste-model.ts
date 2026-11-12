@@ -10,8 +10,13 @@ import { artistsOf } from '@/lib/item-links'
  *   without it, Jellyfin's play count and last played date stand in.
  * - A phase: artists and genres taking a much bigger share of the last weeks than of the long run get a boost
  *   everywhere, so a new obsession shows up in the mixes within days.
- * - Skips: a song skipped in its first 30 seconds again and again sinks (smoothed, so one skip says little).
- * - Fatigue: what played in the last hours or days steps back for a while.
+ * - Skips: a song skipped in its first 30 seconds again and again sinks (smoothed, so one skip says little; how early
+ *   in those 30 seconds makes no difference to whether it gets played again). Skipping on later takes nothing away, and
+ *   going back to a song counts half a play more (the server's weights).
+ * - Fatigue: what played in the last hours steps back a little (people replay a song soonest right after hearing it, so
+ *   only a little).
+ * - Times: how much each artist is heard in each slot of the week, so a time of day has its artists, not just its songs.
+ * - Together: artists heard in the same sittings belong together, whatever their genres say.
  * - Discovery: unplayed songs are scored by how much their artists and genres are loved (and Last.fm's similar artists),
  *   so the new songs in a mix are near the listener's taste, not random.
  */
@@ -31,6 +36,8 @@ export interface TasteSignals {
   tracks: Record<string, TrackSignals>
   /** What was played from lately (source keys): minutes, fading with a half-life of a week, and the last time. */
   sources?: Record<string, { w: number; t: number }>
+  /** Each sitting's distinct songs over the last half year, as places in `keys` (missing from an older server). */
+  sessions?: { keys: string[]; lists: number[][] }
 }
 
 const HOUR = 60 * 60_000
@@ -104,6 +111,13 @@ export interface TasteModel {
   lastPlayed: (track: BaseItemDto) => number
   /** How often it was heard in a slot of the week (see slotOf), fading over three months. */
   slot: (track: BaseItemDto, slot: number) => number
+  /** How much an artist is heard in a slot of the week, and how much is heard in it altogether. */
+  artistSlot: (id: string, slot: number) => number
+  slotTotal: (slot: number) => number
+  /** How much two artists are heard in the same sittings, 0–1 (0 without enough sittings of both). */
+  together: (a: string, b: string) => number
+  /** Whether the log's sittings were there (otherwise `together` is 0 for everyone). */
+  heardTogether: boolean
   /** An artist's and a genre's share of the listener's love, 0–1 (the most loved is 1). */
   artist: (id: string) => number
   genre: (name: string) => number
@@ -199,12 +213,56 @@ export function buildTasteModel(
   const artistOf = (track: BaseItemDto) => Math.max(0, ...artistIdsOf(track).map(artist))
   const genreOf = (track: BaseItemDto) => Math.max(0, ...(track.Genres ?? []).map(genre))
 
-  // What played lately steps back: strongly for some hours, a little for a week.
+  // What played lately steps back, gently: a year of listening showed a song is most likely played again right after it
+  // was heard, so a strong step back takes out exactly what the listener wants (measured: a third of the hits).
   const fatigue = (last: number) => {
     if (!last) return 1
     const age = now - last
-    return age < 6 * HOUR ? 0.15 : age < DAY ? 0.35 : age < 3 * DAY ? 0.65 : age < 7 * DAY ? 0.85 : 1
+    return age < 3 * HOUR ? 0.5 : age < DAY ? 0.8 : 1
   }
+
+  // When each artist is heard (the slots of the week), from their songs that count.
+  const artistSlots = new Map<string, number[]>()
+  const slotTotals = new Array<number>(12).fill(0)
+  // Which artists a song in the log stands for (for the sittings).
+  const artistsByTrack = new Map<string, string[]>()
+  for (const track of tracks) {
+    const id = keyOf(track)
+    if (!entries.get(id)?.counts) continue
+    const artists = artistIdsOf(track)
+    artistsByTrack.set(id, artists)
+    const slots = signals?.tracks[id]?.d
+    if (!slots) continue
+    for (let slot = 0; slot < 12; slot++) {
+      const plays = slots[slot] ?? 0
+      if (!plays) continue
+      slotTotals[slot]! += plays
+      for (const artist of artists) {
+        const list = artistSlots.get(artist) ?? new Array<number>(12).fill(0)
+        list[slot]! += plays
+        artistSlots.set(artist, list)
+      }
+    }
+  }
+
+  // Artists heard in the same sittings (made when first asked for: not every mix needs it).
+  let sittings: { count: Map<string, number>; pairs: Map<string, number> } | undefined
+  const pairKey = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`)
+  const sittingsOf = () => {
+    if (sittings) return sittings
+    const count = new Map<string, number>()
+    const pairs = new Map<string, number>()
+    const keys = signals?.sessions?.keys ?? []
+    for (const list of signals?.sessions?.lists ?? []) {
+      const artists = [...new Set(list.flatMap((at) => artistsByTrack.get(keys[at] ?? '') ?? []))]
+      if (artists.length < 2) continue
+      for (const artist of artists) add(count, artist, 1)
+      for (let i = 0; i < artists.length; i++) for (let j = i + 1; j < artists.length; j++) add(pairs, pairKey(artists[i]!, artists[j]!), 1)
+    }
+    return (sittings = { count, pairs })
+  }
+  /** Fewer sittings than this say too little about who an artist is heard with. */
+  const MIN_SITTINGS = 3
 
   return {
     love: (track) => {
@@ -228,6 +286,17 @@ export function buildTasteModel(
     month: (track) => entries.get(keyOf(track))?.month ?? 0,
     lastPlayed: (track) => entries.get(keyOf(track))?.last ?? 0,
     slot: (track, slot) => signals?.tracks[keyOf(track)]?.d[slot] ?? 0,
+    artistSlot: (id, slot) => artistSlots.get(id)?.[slot] ?? 0,
+    slotTotal: (slot) => slotTotals[slot] ?? 0,
+    together: (a, b) => {
+      if (a === b) return 1
+      const { count, pairs } = sittingsOf()
+      const mine = count.get(a) ?? 0
+      const theirs = count.get(b) ?? 0
+      if (mine < MIN_SITTINGS || theirs < MIN_SITTINGS) return 0
+      return (pairs.get(pairKey(a, b)) ?? 0) / Math.sqrt(mine * theirs)
+    },
+    heardTogether: !!signals?.sessions?.lists.length,
     artist,
     genre,
     phaseArtists,

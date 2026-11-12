@@ -384,12 +384,12 @@ export class Store {
       .all(userId, before) as Array<{ artist: string | null; subtitle: string | null; first: number }>
   }
 
-  /** Someone's song plays since a moment (imported ones too), for the taste signals the mixes are built from. */
+  /** Someone's song plays since a moment, oldest first (imported ones too), for the taste signals the mixes are built from. */
   tasteRows(userId: string, since: number) {
     const rows = this.db
-      .prepare("SELECT item_key, started_at, seconds, reason_end FROM plays WHERE user_id = ? AND kind = 'audio' AND started_at >= ?")
-      .all(userId, since) as Array<{ item_key: string; started_at: number; seconds: number; reason_end: string | null }>
-    return rows.map((row) => ({ key: row.item_key, startedAt: row.started_at, seconds: row.seconds, reasonEnd: row.reason_end }))
+      .prepare("SELECT item_key, started_at, seconds, reason_start, reason_end FROM plays WHERE user_id = ? AND kind = 'audio' AND started_at >= ? ORDER BY started_at")
+      .all(userId, since) as Array<{ item_key: string; started_at: number; seconds: number; reason_start: string | null; reason_end: string | null }>
+    return rows.map((row) => ({ key: row.item_key, startedAt: row.started_at, seconds: row.seconds, reasonStart: row.reason_start, reasonEnd: row.reason_end }))
   }
 
   /** What someone played from (album, playlist …) since a moment: the player's source per play, and how long it ran. */

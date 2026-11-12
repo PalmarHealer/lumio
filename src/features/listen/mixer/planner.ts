@@ -119,7 +119,9 @@ const MIN_CLARITY = 0.6
  * Mean offset (seconds) between the decks' beats allowed in any one bar where both are heard, after the fitted rate and
  * phase: a drift the fit can't take out (the songs' tempos bending differently) is heard as the beats sliding apart.
  */
-const MAX_BAR_OFFSET = 0.02
+const MAX_BAR_OFFSET = 0.03
+/** How far the beats may drift apart over the whole overlap (a straight-line fit of their offsets): the tempos meet. */
+const MAX_TREND = 0.005
 /** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
 const MAX_WINDOW_DRIFT = 0.025
 /**
@@ -903,7 +905,8 @@ function beatOffsets(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple:
   for (const advance of bBeats) {
     const t = p.bStart + advance / p.rate
     const i = Math.round(t / dt)
-    if (i < 0 || i >= stats.loudA.length || !stats.loudA[i] || !stats.loudB[i]) continue
+    // Every beat while both decks play, however quiet one of them is (a deck at -16 dB still flams audibly).
+    if (i < 0 || i >= stats.gainA.length || stats.gainA[i] <= 0.02 || stats.gainB[i] <= 0.02) continue
     heard++
     let signed = t - nearest(aBeats, t)
     if (multiple === 0.5 && Math.abs(signed) > stats.beat / 4) signed -= Math.sign(signed) * (stats.beat / 2)
@@ -922,7 +925,7 @@ function beatOffsets(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple:
  */
 function phaseError(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: number) {
   const { times, offsets, heard } = beatOffsets(p, a, b, multiple, 0.45)
-  if (offsets.length === 0) return { median: 0, p90: 0, checked: heard === 0 ? 1 : 0, worstWindow: 0, worstBar: 0 }
+  if (offsets.length === 0) return { median: 0, p90: 0, checked: heard === 0 ? 1 : 0, worstWindow: 0, worstBar: 0, trend: 0 }
   const window = 8 * p.stats.beat
   const sums = new Map<number, { sum: number; count: number }>()
   times.forEach((t, i) => {
@@ -946,8 +949,21 @@ function phaseError(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
     bars.set(w, entry)
   })
   let worstBar = 0
-  for (const { sum, count } of bars.values()) if (count >= 2) worstBar = Math.max(worstBar, Math.abs(sum / count))
-  return { median: sorted[sorted.length >> 1], p90: sorted[Math.floor(sorted.length * 0.9)], checked: offsets.length / heard, worstWindow, worstBar }
+  for (const { sum, count } of bars.values()) if (count >= 3) worstBar = Math.max(worstBar, Math.abs(sum / count))
+  // What the offsets drift by over the overlap (a straight-line fit): the tempos not quite meeting.
+  let trend = 0
+  if (times.length >= 4) {
+    const meanT = times.reduce((sum, t) => sum + t, 0) / times.length
+    const meanO = offsets.reduce((sum, o) => sum + o, 0) / offsets.length
+    let num = 0
+    let den = 0
+    for (let i = 0; i < times.length; i++) {
+      num += (times[i] - meanT) * (offsets[i] - meanO)
+      den += (times[i] - meanT) ** 2
+    }
+    trend = den > 0 ? Math.abs((num / den) * (times[times.length - 1] - times[0])) : 0
+  }
+  return { median: sorted[sorted.length >> 1], p90: sorted[Math.floor(sorted.length * 0.9)], checked: offsets.length / heard, worstWindow, worstBar, trend }
 }
 
 /**
@@ -959,7 +975,7 @@ function phaseError(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
 function alignPhase(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: number) {
   let current: Placement = p
   let fitted = false
-  for (let round = 0; round < 2; round++) {
+  for (let round = 0; round < 3; round++) {
     const { times, offsets } = beatOffsets(current, a, b, multiple, 0.3)
     if (times.length < 4) break
     fitted = true
@@ -974,7 +990,8 @@ function alignPhase(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
     const slope = den > 0 ? num / den : 0
     // B late by o at τ: its beats must come o earlier. A slope s stretches B's time by (1 − s); after it, the offset
     // left at B's start is meanO − slope · (meanT − bStart).
-    const rate = Math.abs(slope) < 0.005 ? current.rate / (1 - slope) : current.rate
+    // The tempos must meet exactly over the overlap: any slope left is a drift (rateOk is checked by the caller).
+    const rate = Math.abs(slope) < 0.03 ? current.rate / (1 - slope) : current.rate
     const level = rate === current.rate ? meanO : meanO - slope * (meanT - current.bStart)
     let bStart = current.bStart - level
     let laneB = current.laneB
@@ -1933,8 +1950,15 @@ export function planTransition(
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
     // against A's beats. Judged two bars at a time too.
-    const drift = placement.beatmatched ? phaseError(placement, a, b, tempo.multiple) : { median: 0, p90: 0, checked: 1, worstWindow: 0, worstBar: 0 }
-    if (drift.median > MAX_DRIFT || drift.p90 > 2.5 * MAX_DRIFT || drift.checked < 0.75 || drift.worstWindow > MAX_WINDOW_DRIFT || drift.worstBar > MAX_BAR_OFFSET)
+    const drift = placement.beatmatched ? phaseError(placement, a, b, tempo.multiple) : { median: 0, p90: 0, checked: 1, worstWindow: 0, worstBar: 0, trend: 0 }
+    if (
+      drift.median > MAX_DRIFT ||
+      drift.p90 > 2.5 * MAX_DRIFT ||
+      drift.checked < 0.75 ||
+      drift.worstWindow > MAX_WINDOW_DRIFT ||
+      drift.worstBar > MAX_BAR_OFFSET ||
+      drift.trend > MAX_TREND
+    )
       return null
     // A swung groove against a straight one flams wherever both beats are loud: a little of that is a handover, more
     // costs (up to a 16-beat stretch, then the full price).

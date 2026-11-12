@@ -2974,3 +2974,24 @@ export function transitionIssues(transition: Transition, aMix: TrackMix | null, 
   }
   return { voices, basses }
 }
+
+/**
+ * The planner's thresholds and helpers the editor's live checks and suggestions (editor-checks.ts) use, so both judge a
+ * transition the same way. Read-only; nothing here plans.
+ */
+export const plannerRules = {
+  VOICE_HEARD,
+  ECHO_HEARD,
+  TONAL_HEARD,
+  KEY_CLASH,
+  BEAT_HEARD,
+  KICK_HEARD,
+  MIN_VERIFIABLE,
+  SCATTERED,
+  ACCENT_FAINT,
+  MAX_RISE_DB,
+  DEFAULT_TEMPO,
+  filterBands,
+  outAnchors,
+  inAnchors,
+}

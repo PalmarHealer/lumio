@@ -133,32 +133,48 @@ export interface Column {
   vocal: boolean
 }
 
-/** The loudest analysis frame between two track positions (a column), per band. */
-function frameMax(mix: TrackMix, from: number, to: number): Column {
-  const rate = mix.frameRate || 10
+/** Level curves over a song: the analysis' (10 a second), or finer ones worked out from the loaded audio. */
+export interface Curves {
+  frameRate: number
+  duration: number
+  energy: number[]
+  bands: { low: number[]; mid: number[]; high: number[] }
+}
+
+/** The loudest frame between two track positions (a column), per band. */
+function frameMax(curves: Curves, from: number, to: number): Column {
+  const rate = curves.frameRate || 10
   const lo = Math.max(0, Math.floor(Math.min(from, to) * rate))
-  const hi = Math.min(mix.energy.length - 1, Math.max(lo, Math.ceil(Math.max(from, to) * rate)))
+  const hi = Math.min(curves.energy.length - 1, Math.max(lo, Math.ceil(Math.max(from, to) * rate)))
   const column: Column = { low: 0, mid: 0, high: 0, energy: 0, vocal: false }
   for (let i = lo; i <= hi; i++) {
-    column.low = Math.max(column.low, mix.bands.low[i] ?? 0)
-    column.mid = Math.max(column.mid, mix.bands.mid[i] ?? 0)
-    column.high = Math.max(column.high, mix.bands.high[i] ?? 0)
-    column.energy = Math.max(column.energy, mix.energy[i] ?? 0)
+    column.low = Math.max(column.low, curves.bands.low[i] ?? 0)
+    column.mid = Math.max(column.mid, curves.bands.mid[i] ?? 0)
+    column.high = Math.max(column.high, curves.bands.high[i] ?? 0)
+    column.energy = Math.max(column.energy, curves.energy[i] ?? 0)
   }
-  const middle = (from + to) / 2
-  column.vocal = mix.vocals.some((span) => middle >= span.start && middle < span.end)
   return column
 }
 
-/** Each column of a deck from its analysis (null where it doesn't play or there's no analysis). */
-export function deckColumns(mix: TrackMix | null, positions: ReadonlyArray<number | null>): Array<Column | null> {
+/**
+ * Each column of a deck (null where it doesn't play or nothing is known): its levels from `fine` curves where they
+ * reach, else from the analysis; singing from the analysis.
+ */
+export function deckColumns(mix: TrackMix | null, positions: ReadonlyArray<number | null>, fine: Curves | null = null): Array<Column | null> {
   const columns: Array<Column | null> = []
   for (let x = 0; x + 1 < positions.length; x++) {
     const p = positions[x]
     const q = positions[x + 1]
-    if (!mix || p === null || q === null || p < 0 || p > mix.duration) columns.push(null)
+    const curves = fine && p !== null && p <= fine.duration ? fine : mix
+    if (!curves || p === null || q === null || p < 0 || p > curves.duration) {
+      columns.push(null)
+      continue
+    }
     // A loop jumps back: the column holds what plays right after the jump.
-    else columns.push(frameMax(mix, q < p ? q : p, q < p ? q + 0.01 : q))
+    const column = frameMax(curves, q < p ? q : p, q < p ? q + 0.01 : q)
+    const middle = (p + q) / 2
+    column.vocal = !!mix?.vocals.some((span) => middle >= span.start && middle < span.end)
+    columns.push(column)
   }
   return columns
 }

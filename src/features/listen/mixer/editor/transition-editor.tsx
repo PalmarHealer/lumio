@@ -53,6 +53,7 @@ import {
   type LaneParam,
 } from './timeline-math'
 import { useHistory } from './use-history'
+import { envelopeOf, type Envelope } from './envelope'
 import { useChecks } from './use-assist'
 import type { PreviewControls } from './use-preview'
 
@@ -253,6 +254,24 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
   const shownPlayhead = preview?.status === 'ready' ? preview.position : playhead
   const [looping, setLooping] = useState(false)
   const issues = useChecks(transition, aMix, bMix)
+  // Finer waveforms once the audio is loaded (the analysis' curves until then).
+  const [fine, setFine] = useState<{ a: Envelope | null; b: Envelope | null }>({ a: null, b: null })
+  const sourceA = preview?.sources.a ?? null
+  const sourceB = preview?.sources.b ?? null
+  useEffect(() => {
+    let current = true
+    if (sourceA) void envelopeOf(sourceA).then((envelope) => current && setFine((before) => ({ ...before, a: envelope }))).catch(() => undefined)
+    return () => {
+      current = false
+    }
+  }, [sourceA])
+  useEffect(() => {
+    let current = true
+    if (sourceB) void envelopeOf(sourceB).then((envelope) => current && setFine((before) => ({ ...before, b: envelope }))).catch(() => undefined)
+    return () => {
+      current = false
+    }
+  }, [sourceB])
   // The kinds found, warnings first.
   const issueKinds = [...new Set([...issues].sort((x, y) => (x.severity === y.severity ? 0 : x.severity === 'warn' ? -1 : 1)).map((issue) => issue.kind))]
   /** The hint picked on the timeline (its message shows under it). */
@@ -286,22 +305,22 @@ export function TransitionEditor({ initial, aMix, bMix, aTitle, bTitle, aDuratio
 
   // Where each deck is, column by column, and its grid in transition time.
   const decks = useMemo(() => {
-    const make = (deck: Deck, mix: TrackMix | null) => {
+    const make = (deck: Deck, mix: TrackMix | null, curves: Envelope | null) => {
       const positions = deckTrack(transition, deck, axis)
       const phraseSet = new Set(mix?.phrases ?? [])
       const downbeats = mix ? marksInTime(axis, positions, mix.downbeats) : []
       return {
         deck,
         positions,
-        columns: deckColumns(mix, positions),
-        ghost: deckColumns(mix, deckTrack(transition, deck, axis, true)),
+        columns: deckColumns(mix, positions, curves),
+        ghost: deckColumns(mix, deckTrack(transition, deck, axis, true), curves),
         beats: mix ? marksInTime(axis, positions, mix.beats) : [],
         bars: downbeats,
         phrases: mix ? marksInTime(axis, positions, mix.downbeats.filter((d) => phraseSet.has(d))) : [],
       }
     }
-    return { a: make('a', aMix), b: make('b', bMix) }
-  }, [transition, axis, aMix, bMix])
+    return { a: make('a', aMix, fine.a), b: make('b', bMix, fine.b) }
+  }, [transition, axis, aMix, bMix, fine])
   const bars = overlapBars(transition, decks.a.bars, decks.b.bars)
 
   /** Where to snap a time: beats of both decks (bars with Shift). */

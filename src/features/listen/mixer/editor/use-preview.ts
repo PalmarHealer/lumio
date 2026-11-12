@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useAuthedSession } from '@/features/auth/session'
 import { jellyfin } from '@/lib/jellyfin'
 import { music } from '../../player/music-player'
-import { createTransitionPreview, type TransitionPreview } from '../preview'
+import { createTransitionPreview, type PreviewSource, type TransitionPreview } from '../preview'
 import { laneReach, rateAdvance } from '../timeline'
 import type { Transition } from '../types'
 import { loadDeckAudio, sourceEnd } from './audio'
@@ -33,6 +33,8 @@ export interface PreviewControls {
   seek: (t: number) => void
   scrub: (t: number) => void
   setLoop: (region: { from: number; to: number } | null) => void
+  /** The audio loaded for each deck (for drawing it finer than the analysis). */
+  sources: { a: PreviewSource | null; b: PreviewSource | null }
 }
 
 /**
@@ -46,6 +48,7 @@ export function useTransitionPreview(options: { fromId: string; toId: string; tr
   const [status, setStatus] = useState<PreviewStatus>('loading')
   const [playing, setPlaying] = useState(false)
   const [position, setPosition] = useState(0)
+  const [sources, setSources] = useState<{ a: PreviewSource | null; b: PreviewSource | null }>({ a: null, b: null })
   const preview = useRef<TransitionPreview | null>(null)
   const context = useRef<AudioContext | null>(null)
   const loaded = useRef({ a: 0, b: 0 })
@@ -72,6 +75,7 @@ export function useTransitionPreview(options: { fromId: string; toId: string; tr
         ])
         if (disposed) return
         loaded.current = { a: sourceEnd(a), b: sourceEnd(b) }
+        setSources({ a, b })
         const created = await createTransitionPreview({ a, b, transition: latest.current ?? start, preRoll: PRE_ROLL, postRoll: POST_ROLL, context: ctx })
         if (disposed) return created.dispose()
         preview.current = created
@@ -111,7 +115,10 @@ export function useTransitionPreview(options: { fromId: string; toId: string; tr
       const until = Math.min(duration || Infinity, needed[deck] + MARGIN_S)
       loaded.current[deck] = until
       void loadDeckAudio({ api, userId: session.userId, accessToken: session.accessToken, deviceId: jellyfin.deviceInfo.id, context: ctx, id: deck === 'a' ? fromId : toId, until })
-        .then((source) => current.setSource(deck, source))
+        .then(async (source) => {
+          await current.setSource(deck, source)
+          setSources((before) => ({ ...before, [deck]: source }))
+        })
         .catch(() => undefined)
     }
   }, [transition, status, api, session.userId, session.accessToken, fromId, toId, aDuration, bDuration])
@@ -139,5 +146,5 @@ export function useTransitionPreview(options: { fromId: string; toId: string; tr
     }),
     [],
   )
-  return { status, playing, position, ...controls }
+  return { status, playing, position, sources, ...controls }
 }

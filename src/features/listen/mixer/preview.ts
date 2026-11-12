@@ -53,6 +53,11 @@ export interface TransitionPreview {
   /** Called every frame while playing, and on seek, pause and the end. Returns the unsubscribe. */
   onPosition(listener: (t: number, playing: boolean) => void): () => void
   setVolume(volume: number): void
+  /**
+   * New audio for a deck (an edit moved its reach outside the window decoded so far). Resolves once loaded; playing,
+   * the preview goes on from where it is with it.
+   */
+  setSource(deck: 'a' | 'b', source: PreviewSource): Promise<void>
   dispose(): void
 }
 
@@ -76,7 +81,7 @@ export async function createTransitionPreview(options: PreviewOptions): Promise<
   const owned = !options.context
   const preRoll = Math.max(0, options.preRoll ?? 8)
   const postRoll = Math.max(0, options.postRoll ?? 8)
-  const aEnd = options.a.origin + options.a.channels[0]!.length / options.a.sampleRate
+  let aEnd = options.a.origin + options.a.channels[0]!.length / options.a.sampleRate
   const volume = new GainNode(ctx, { gain: options.volume ?? 1 })
   volume.connect(options.destination ?? ctx.destination)
   const master: Master = await createMaster(ctx, volume)
@@ -257,6 +262,15 @@ export async function createTransitionPreview(options: PreviewOptions): Promise<
         frame = requestAnimationFrame(tick)
       }
       return () => listeners.delete(listener)
+    },
+    async setSource(deck, source) {
+      await (deck === 'a' ? playerA : playerB).load(stereo(source), source.origin, source.sampleRate)
+      if (deck === 'a') {
+        aEnd = source.origin + source.channels[0]!.length / source.sampleRate
+        transition = asPlayed(transition, aEnd)
+        plans = plansOf(transition)
+      }
+      if (playing) start(position() + lead)
     },
     setVolume(value) {
       volume.gain.setTargetAtTime(Math.max(0, Math.min(1, value)), ctx.currentTime, 0.01)

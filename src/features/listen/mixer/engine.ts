@@ -555,7 +555,7 @@ function scheduleFilter(deck: Deck, keyframes: Keyframe[], start: number, scale:
   const count = Math.max(2, Math.ceil(span * FILTER_CURVE_RATE) + 1)
   const duration = Math.max(1e-3, start + last * scale - begin)
   for (let i = 1; i < count; i++) {
-    const { lowpass, highpass } = filterFrequencies(valueAt(keyframes, from + (span * i) / (count - 1), 0), rate)
+    const { lowpass, highpass } = filterFrequencies(valueAfter(keyframes, from + (span * i) / (count - 1), 0), rate)
     const time = begin + (duration * i) / (count - 1)
     rampAt(deck.lowpass.frequency, time, lowpass)
     rampAt(deck.highpass.frequency, time, highpass)
@@ -578,7 +578,7 @@ function scheduleKill(deck: Deck, keyframes: Keyframe[], start: number, scale: n
   const count = Math.max(2, Math.ceil(span * FILTER_CURVE_RATE) + 1)
   const duration = Math.max(1e-3, start + last * scale - begin)
   for (let i = 1; i < count; i++) {
-    const frequency = killFrequency(valueAt(keyframes, from + (span * i) / (count - 1), 1))
+    const frequency = killFrequency(valueAfter(keyframes, from + (span * i) / (count - 1), 1))
     for (const param of params) rampAt(param, begin + (duration * i) / (count - 1), frequency)
   }
 }

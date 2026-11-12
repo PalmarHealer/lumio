@@ -192,11 +192,20 @@ function keyframes(value: unknown, min: number, max: number): Array<{ t: number;
   return out
 }
 
+/** Lanes a deck may have besides the five above (reverb send, the stem lanes); kept only when sent. */
+const OPTIONAL_AUTOMATION_KEYS = ['reverb', 'drums', 'vocals', 'instrumental'] as const
+
 function automation(value: unknown) {
   if (!isRecord(value)) return null
   const out: Record<string, Array<{ t: number; v: number }>> = {}
   for (const key of AUTOMATION_KEYS) {
     const frames = keyframes(value[key] ?? [], key === 'filter' ? -1 : 0, 1)
+    if (!frames) return null
+    out[key] = frames
+  }
+  for (const key of OPTIONAL_AUTOMATION_KEYS) {
+    if (value[key] === undefined) continue
+    const frames = keyframes(value[key], 0, 1)
     if (!frames) return null
     out[key] = frames
   }
@@ -240,7 +249,10 @@ function effect(value: unknown) {
  * One transition (the contract's v2: one clock, paths with loops, rate curves), checked field by field and copied
  * without anything else; null when anything is off, and for transitions of the older v1 shape.
  */
-function transition(key: string, value: unknown): Record<string, unknown> | null {
+/** A baked clip as kept on this server, for checking a transition's `baked` (see baked.ts); null when there is none. */
+export type BakedLookup = (key: string) => { from: string; to: string; start: number; length: number } | null
+
+function transition(key: string, value: unknown, baked?: BakedLookup): Record<string, unknown> | null {
   if (!isRecord(value) || value.v !== 2) return null
   const [from, to, ...rest] = key.split('>')
   if (rest.length || !from || !to || !ID.test(from) || !ID.test(to) || value.from !== from || value.to !== to) return null
@@ -284,7 +296,16 @@ function transition(key: string, value: unknown): Record<string, unknown> | null
     effects,
     custom: value.custom,
     confidence,
+    // Server-owned: kept only when it names a clip kept here for this very pair, with the clip's own placement.
+    ...bakedOf(value.baked, from, to, baked),
   }
+}
+
+function bakedOf(value: unknown, from: string, to: string, lookup?: BakedLookup) {
+  if (!lookup || !isRecord(value) || typeof value.key !== 'string') return {}
+  const clip = lookup(value.key)
+  if (!clip || clip.from.toLowerCase() !== from.toLowerCase() || clip.to.toLowerCase() !== to.toLowerCase()) return {}
+  return { baked: { url: `/music/mix/baked/${value.key}`, key: value.key, start: clip.start, length: clip.length } }
 }
 
 /**
@@ -292,14 +313,14 @@ function transition(key: string, value: unknown): Record<string, unknown> | null
  * mixer settings at all. A transition that doesn't pass is left out and counted in `dropped`: its pair then gets an
  * automatic one, rather than the whole save failing over it. `updated` is left to the caller (set when it saves).
  */
-export function parsePlaylistMixer(body: unknown): { settings: Omit<PlaylistMixer, 'updated'>; dropped: number } | null {
+export function parsePlaylistMixer(body: unknown, baked?: BakedLookup): { settings: Omit<PlaylistMixer, 'updated'>; dropped: number } | null {
   if (!isRecord(body) || typeof body.on !== 'boolean' || (body.style !== 'clean' && body.style !== 'party') || !isRecord(body.transitions)) return null
   const entries = Object.entries(body.transitions)
   if (entries.length > MIXER_MAX_TRANSITIONS) return null
   const transitions: Record<string, Record<string, unknown>> = {}
   let dropped = 0
   for (const [key, value] of entries) {
-    const checked = transition(key, value)
+    const checked = transition(key, value, baked)
     if (checked) transitions[key] = checked
     else dropped++
   }

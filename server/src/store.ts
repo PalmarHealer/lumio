@@ -165,6 +165,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS playlist_adds (playlist_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (playlist_id, item_id));
       CREATE TABLE IF NOT EXISTS track_mix (item_id TEXT PRIMARY KEY, data TEXT, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS playlist_mixer (playlist_id TEXT PRIMARY KEY, data TEXT NOT NULL, user_id TEXT NOT NULL, updated INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS mix_training (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, user_id TEXT NOT NULL, playlist_id TEXT NOT NULL, pair TEXT NOT NULL, data TEXT NOT NULL);
     `)
     // How a play went (music too): why it started and ended, where it came from, shuffle, from the device, buffering.
     const playColumns = (this.db.prepare('PRAGMA table_info(plays)').all() as Array<{ name: string }>).map((column) => column.name)
@@ -544,6 +545,27 @@ export class Store {
   playlistMixer(playlistId: string): { data: unknown; userId: string; updated: number } | null {
     const row = this.db.prepare('SELECT data, user_id, updated FROM playlist_mixer WHERE playlist_id = ?').get(playlistId) as { data: string; user_id: string; updated: number } | undefined
     return row ? { data: JSON.parse(row.data) as unknown, userId: row.user_id, updated: row.updated } : null
+  }
+
+  /** Every kept playlist mixer's transitions' baked clip keys (for keeping the clips they refer to). */
+  bakedKeysInUse(): Set<string> {
+    const keys = new Set<string>()
+    for (const row of this.db.prepare('SELECT data FROM playlist_mixer').all() as Array<{ data: string }>) {
+      const data = JSON.parse(row.data) as { transitions?: Record<string, { baked?: { key?: string } }> }
+      for (const transition of Object.values(data.transitions ?? {})) if (typeof transition.baked?.key === 'string') keys.add(transition.baked.key)
+    }
+    return keys
+  }
+
+  /** Keeps one saved transition as training data for the planner (see POST /music/mix/training). */
+  addMixTraining(userId: string, playlistId: string, pair: string, data: unknown) {
+    this.db.prepare('INSERT INTO mix_training (at, user_id, playlist_id, pair, data) VALUES (?, ?, ?, ?, ?)').run(Date.now(), userId, playlistId, pair, JSON.stringify(data))
+  }
+
+  /** The kept training data from `after` (an id) on, oldest first, at most `limit` rows. */
+  mixTraining(after: number, limit: number): Array<{ id: number; at: number; userId: string; playlistId: string; pair: string; data: unknown }> {
+    const rows = this.db.prepare('SELECT id, at, user_id, playlist_id, pair, data FROM mix_training WHERE id > ? ORDER BY id LIMIT ?').all(after, limit) as Array<{ id: number; at: number; user_id: string; playlist_id: string; pair: string; data: string }>
+    return rows.map((row) => ({ id: row.id, at: row.at, userId: row.user_id, playlistId: row.playlist_id, pair: row.pair, data: JSON.parse(row.data) as unknown }))
   }
 
   setPlaylistMixer(playlistId: string, data: unknown, userId: string, updated: number) {

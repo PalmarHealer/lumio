@@ -26,6 +26,8 @@ ARG LUMIO_BUILD
 RUN pnpm build
 
 FROM node:24-alpine
+# ffmpeg encodes baked transitions (FLAC masters, AAC copies for the player's quality setting): about +50 MB.
+RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY server/package.json ./server/
 COPY server/src ./server/src

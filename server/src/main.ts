@@ -14,7 +14,8 @@ import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, 
 import { tasteSignals, type TasteSignals } from './taste.ts'
 import { SOUND_VERSION } from './sound-analysis.ts'
 import { MIX_VERSION } from './mix-analysis.ts'
-import { JellyfinError, analyzeTrack, parsePlaylistMixer, type MixTrack } from './mix.ts'
+import { JellyfinError, analyzeTrack, parsePlaylistMixer, type BakedLookup, type MixTrack } from './mix.ts'
+import { BAKED_PART_LIMIT, BakedClips, isBakedKey, serveFile, type BakedMeta } from './baked.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
@@ -190,6 +191,9 @@ if (!JELLYFIN_URL) {
 
 const store = new Store(DATA_DIR)
 const lyricsIndex = MEILI_URL && MEILI_KEY ? lyricsSearch(MEILI_URL, MEILI_KEY, MEILI_LYRICS_INDEX) : null
+const bakedClips = new BakedClips(DATA_DIR)
+// Clips no saved transition refers to any more (a reorder, an edit) are freed after a day; the quota is kept.
+setInterval(() => void bakedClips.sweep(store.bakedKeysInUse()).catch((error) => console.warn('Baked clips sweep:', error)), 3600_000).unref()
 
 // ---- authentication: the user's own Jellyfin token ----
 
@@ -1855,7 +1859,18 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     if (request.method === 'GET') return send(response, 200, kept().current)
     if (!access.edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
     const body = await readJson<Record<string, unknown>>(request, MIXER_BODY_LIMIT).catch(() => null)
-    const parsed = parsePlaylistMixer(body)
+    // The baked clips the transitions name, read first (the check itself doesn't wait).
+    const clips = new Map<string, BakedMeta>()
+    const transitions = body && typeof body.transitions === 'object' && body.transitions ? Object.values(body.transitions as Record<string, unknown>) : []
+    for (const entry of transitions.slice(0, 1000)) {
+      const key = (entry as { baked?: { key?: unknown } } | null)?.baked?.key
+      if (typeof key === 'string' && isBakedKey(key) && !clips.has(key)) {
+        const meta = await bakedClips.meta(key)
+        if (meta && meta.playlistId === playlistId) clips.set(key, meta)
+      }
+    }
+    const lookup: BakedLookup = (key) => clips.get(key) ?? null
+    const parsed = parsePlaylistMixer(body, lookup)
     if (!parsed) return send(response, 400, { error: 'Bad mixer settings' })
     // Read again now that the body is in (another save may have landed meanwhile); from here on nothing waits.
     const { stored, current } = kept()
@@ -1864,6 +1879,88 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     const updated = Math.max(Date.now(), (stored?.updated ?? 0) + 1)
     store.setPlaylistMixer(playlistId, parsed.settings, me.id, updated)
     return send(response, 200, { ...parsed.settings, updated, dropped: parsed.dropped })
+  }
+
+  // Baked transitions (see baked.ts). PUT /music/mix/baked/<key> {playlistId, from, to, start, length, engine}: describes a
+  // clip (replacing an earlier one and its parts), for those who may edit the playlist; then PUT …?part=a|b with the
+  // part as WAV (stereo, at most 48 kHz and 120 s). GET …?part=a|b&quality=original|<kbps>: the part as kept (24-bit
+  // FLAC) or as AAC at about that bitrate, for those who can see the playlist. DELETE: frees the clip (editors).
+  const baked = path.match(/^\/music\/mix\/baked\/([0-9a-f]{32})$/)
+  if (baked && ['GET', 'PUT', 'DELETE'].includes(request.method ?? '')) {
+    const key = baked[1]!
+    const part = url.searchParams.get('part')
+    if (part !== null && part !== 'a' && part !== 'b') return send(response, 400, { error: 'part is a or b' })
+    const token = tokenOf(request, url)!
+    const existing = await bakedClips.meta(key)
+    if (request.method === 'PUT' && part === null) {
+      const body = await readJson<Record<string, unknown>>(request, 16_384).catch(() => null)
+      const playlistId = typeof body?.playlistId === 'string' ? body.playlistId.toLowerCase() : ''
+      if (!/^[0-9a-f]{32}$/.test(playlistId)) return send(response, 400, { error: 'Bad playlistId' })
+      try {
+        if (!(await accessToPlaylist(token, me.id, playlistId, true)).edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+        if (existing && existing.playlistId !== playlistId && !(await accessToPlaylist(token, me.id, existing.playlistId, true)).edit) return send(response, 403, { error: 'The clip belongs to another playlist' })
+      } catch (error) {
+        return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+      }
+      const meta = await bakedClips.putMeta(key, body, me.id)
+      return typeof meta === 'string' ? send(response, 400, { error: meta }) : send(response, 200, meta)
+    }
+    if (!existing) return send(response, 404, { error: 'No such clip' })
+    let access: { see: boolean; edit: boolean }
+    try {
+      access = await accessToPlaylist(token, me.id, existing.playlistId, request.method !== 'GET')
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+    }
+    if (!access.see) return send(response, 404, { error: 'No such clip' })
+    if (request.method === 'GET') {
+      if (part === null) return send(response, 200, existing)
+      const file = await bakedClips.file(key, part, url.searchParams.get('quality') ?? 'original').catch((error) => {
+        console.warn(`Baked clip ${key}:`, error)
+        return null
+      })
+      return file ? serveFile(response, file) : send(response, 404, { error: 'No such part' })
+    }
+    if (!access.edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+    if (request.method === 'DELETE') {
+      await bakedClips.remove(key)
+      return send(response, 204)
+    }
+    if (part === null) return send(response, 400, { error: 'part is a or b' })
+    const wav = await readBody(request, BAKED_PART_LIMIT).catch(() => null)
+    if (!wav) return send(response, 413, { error: 'Too large' })
+    try {
+      const failed = await bakedClips.putPart(key, part, wav)
+      return failed ? send(response, 400, { error: failed }) : send(response, 204)
+    } catch (error) {
+      console.warn(`Baked clip ${key}:`, error)
+      return send(response, 500, { error: 'Could not keep the part' })
+    }
+  }
+
+  // POST /music/mix/training {playlistId, pair, …}: one transition someone saved in the editor, kept as training data
+  // for the planner (what it started from, the result, the edit, versions; the app decides the fields, at most 256 KB),
+  // for those who may edit the playlist. GET /admin/mix/training?after=<id>&limit=<n>: the kept rows as JSON lines,
+  // oldest first (administrators).
+  if (path === '/music/mix/training' && request.method === 'POST') {
+    const body = await readJson<Record<string, unknown>>(request, 262_144).catch(() => null)
+    const playlistId = typeof body?.playlistId === 'string' ? body.playlistId.toLowerCase() : ''
+    const pair = typeof body?.pair === 'string' ? body.pair : ''
+    if (!/^[0-9a-f]{32}$/.test(playlistId) || !/^[0-9a-f-]{32,36}>[0-9a-f-]{32,36}$/i.test(pair)) return send(response, 400, { error: 'Bad playlistId or pair' })
+    try {
+      if (!(await accessToPlaylist(tokenOf(request, url)!, me.id, playlistId, true)).edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+    }
+    store.addMixTraining(me.id, playlistId, pair, body)
+    return send(response, 204)
+  }
+  if (path === '/admin/mix/training' && request.method === 'GET') {
+    if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
+    const after = Math.max(0, Number(url.searchParams.get('after')) || 0)
+    const limit = Math.min(10_000, Math.max(1, Number(url.searchParams.get('limit')) || 1000))
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' })
+    return response.end(store.mixTraining(after, limit).map((row) => JSON.stringify(row)).join('\n') + '\n')
   }
 
   // GET /music/lyrics-search?q=…: songs whose lyrics have these words ({items, snippets: {id: lines around the match}}),

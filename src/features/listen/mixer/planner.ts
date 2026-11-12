@@ -331,7 +331,7 @@ interface Variant {
   prior: number
 }
 
-const FREE_LENGTH: ReadonlySet<ConcretePreset> = new Set(['crossfade', 'bassSwap', 'filterBuild', 'fadeOut', 'fadeIn'])
+const FREE_LENGTH: ReadonlySet<ConcretePreset> = new Set(['crossfade', 'bassSwap', 'filterBuild', 'fadeOut', 'fadeIn', 'reverbOut'])
 
 /** The shapes with a swap moment line up the phrases there; the others at their own anchors. */
 const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwap' || preset === 'crossfade' || preset === 'filterBuild' ? 'swap' : 'shape')
@@ -432,19 +432,24 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
   // Automatic transitions never cut: a cut has to be perfect to work. The blend is the transition to have wherever the
   // tempos can be matched and it passes every rule (its prior outweighs the score terms of a neat echo out); without a
   // match, an echo out or a filtered fade.
+  // The reverb out is the softer echo out: A dissolves into B (a sparse or sung ending suits it).
   if (style === 'clean' && synced) {
     addBlends(0.9)
     add('echoOut', 0)
+    add('reverbOut', 0.01, [4, 2])
     add('fadeOut', -0.02, [4])
   } else if (style === 'clean') {
     add('echoOut', 0.15)
+    add('reverbOut', 0.16, [2])
     add('fadeOut', 0.12, [4])
     add('fadeIn', 0, [2])
   } else if (synced) {
     addBlends(0.75)
     add('echoOut', 0.05)
+    add('reverbOut', 0.05, [4, 2])
   } else {
     add('echoOut', 0.12)
+    add('reverbOut', 0.12, [2])
     add('fadeOut', 0.05, [4])
   }
   if (!forced) return list
@@ -1093,6 +1098,19 @@ function readyAtExit(stats: ShapeStats) {
   const from = Math.max(0, exit - Math.round((4 * stats.beat) / Math.max(dt, 1e-6)))
   for (let i = from; i <= exit; i++) if (gainB[i] < 0.98 || Math.min(passB.low[i], passB.mid[i], passB.high[i]) < 0.9) return false
   return true
+}
+
+/**
+ * A reverb out is cut on a line's end, not in one, and its hall (about a second at full, then -10 dB and below) isn't
+ * laid under B's first line: when A sings into its last second, B's voice waits a second after the cut.
+ */
+function reverbFits(p: Placement, a: PreparedTrack, b: PreparedTrack) {
+  const length = p.stats.shape.length
+  const end = positionA(p, length)
+  if (spanAt(a.vocals, end - 0.05)) return false
+  if (!spansTouch(a.vocals, end - 1, end)) return true
+  const atB = positionB(p, length)
+  return atB === null || !spansTouch(b.vocals, atB, atB + 1)
 }
 
 /** A song's accent spread (seconds); 0 when unknown. */
@@ -1894,6 +1912,7 @@ function planSeveral(
     let placement = start
     const isMashup = placement.variant.volume === 'mashup'
     if (isMashup && !mashupFits(placement, a, b, harmony)) return null
+    if (placement.variant.preset === 'reverbOut' && !reverbFits(placement, a, b)) return null
     if (placement.variant.callback && !callbackFits(placement, a)) return null
     if (placement.beatmatched) {
       const aligned = alignPhase(placement, a, b, tempo.multiple)
@@ -2097,7 +2116,7 @@ const clock = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60))
 /** A short German description of a plan, as the review app shows it. */
 function labelOf(t: Transition, p?: Placement): string {
   if (t.length <= 0) return 'Kein Übergang (nacheinander)'
-  const names: Partial<Record<PresetId, string>> = { echoOut: 'Echo-Ausklang', fadeOut: 'Ausblende', fadeIn: 'Einblende', crossfade: 'Überblendung' }
+  const names: Partial<Record<PresetId, string>> = { echoOut: 'Echo-Ausklang', reverbOut: 'Hall-Ausklang', fadeOut: 'Ausblende', fadeIn: 'Einblende', crossfade: 'Überblendung' }
   if (t.preset !== 'blend') return `${names[t.preset] ?? t.preset} · A ab ${clock(t.aOut)} · B ab ${clock(t.bIn)}`
   const v = p?.variant
   const bars = v ? v.bars : Math.round(((t.length - t.bAt) * t.tempo.a) / 240)

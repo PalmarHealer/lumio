@@ -31,6 +31,7 @@ export const PRESETS: readonly ConcretePreset[] = [
   'bassSwap',
   'filterBuild',
   'echoOut',
+  'reverbOut',
   'dropSwap',
   'hardCut',
   'brake',
@@ -411,6 +412,42 @@ function echoOut(ctx: PresetContext): PresetShape {
 }
 
 /**
+ * Reverb out (the user's "Hall-Effekt am Ende"): A plays on at full volume, unfiltered, while its reverb send rises over
+ * its last bars (up to 4, at most a third of the transition) to 0.7, and is cut on the end, where its hall rings on into
+ * B (about 3 s). Beatmatched, B comes in early, rising over the first two fifths, its bass held back to the cut; without
+ * a beatmatch B comes in on the cut, so no two beats run side by side.
+ */
+function reverbOut(ctx: PresetContext): PresetShape {
+  const bars = Math.max(2, ctx.bars)
+  const length = bars * 4 * ctx.beat
+  const send = Math.min(16 * ctx.beat, length / 3)
+  return {
+    preset: 'reverbOut',
+    length,
+    a: automation(length, {
+      gain: [[0, 1], ...stepAt(length, 1, 0)],
+      reverb: [
+        [length - send, 0],
+        [length, 0.7],
+      ],
+    }),
+    b: automation(length, {
+      gain: ctx.synced
+        ? [
+            [0, 0],
+            [(length * 2) / 5, 1],
+          ]
+        : [[0, 0], ...stepAt(length, 0, 1)],
+      low: [[0, 0], ...stepAt(length, 0, 1)],
+    }),
+    effects: [],
+    anchorA: length,
+    anchorB: length,
+    swap: length,
+  }
+}
+
+/**
  * Drop swap: A is cut exactly on the downbeat where B's drop lands. With a pre-roll (beatmatched only) B's build-up
  * rises under A first, high-passed, bassless and with its mids down, so the drop arrives as a release; with an echo
  * tail A's last beat rings on into the drop.
@@ -773,6 +810,8 @@ export function presetShape(preset: ConcretePreset, context: PresetContext): Pre
       return fadeIn(ctx)
     case 'echoOut':
       return echoOut(ctx)
+    case 'reverbOut':
+      return reverbOut(ctx)
     case 'dropSwap':
       return dropSwap(ctx)
     case 'brake':

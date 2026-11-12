@@ -155,6 +155,7 @@ export type PresetId =
   | 'bassSwap'
   | 'filterBuild'
   | 'echoOut'
+  | 'reverbOut'
   | 'dropSwap'
   | 'hardCut'
   | 'brake'

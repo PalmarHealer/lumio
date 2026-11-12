@@ -13,6 +13,7 @@ import {
   killFrequency,
   REVERB_TAIL_S,
   reverbTailEnd,
+  resetDeck,
   scheduleAutomation,
   tailsEnd,
   valueAfter,
@@ -166,4 +167,45 @@ test('brake: the rate falls from 1 to 0 over its length', () => {
     assert.ok(rate <= previous + 1e-12)
     previous = rate
   }
+})
+
+/** Whether a param passes through cutoffs between 0 and 20 Hz anywhere in [from, to] (a high-pass must jump there). */
+function nearZero(param: Parameters<typeof valueOn>[0], from: number, to: number) {
+  for (let t = from; t <= to; t += 0.0001) {
+    const value = valueOn(param, t)
+    if (value > 1e-9 && value < 20 - 1e-9) return t
+  }
+  return null
+}
+
+test('high-passes jump into and out of 0 Hz, never ramp through a fraction of a hertz', () => {
+  // The filter knob sweeping a high-pass back to open, and the low band falling into a kill and rising out of it.
+  const deck = fakeDeck()
+  scheduleAutomation(
+    deck,
+    {
+      ...neutral(),
+      filter: [
+        { t: 0, v: 0.6 },
+        { t: 1, v: 0 },
+      ],
+      low: [
+        { t: 0, v: 1 },
+        { t: 1, v: 0 },
+        { t: 2, v: 0 },
+        { t: 3, v: 1 },
+      ],
+    },
+    0,
+  )
+  assert.equal(nearZero(deck.highpass.frequency, 0, 1.5), null)
+  assert.equal(nearZero(deck.kill[0].frequency, 0, 3.5), null)
+  assert.equal(valueOn(deck.highpass.frequency, 1.01), 0)
+  assert.ok(valueOn(deck.kill[0].frequency, 1.5) > 199)
+  assert.equal(valueOn(deck.kill[0].frequency, 3.01), 0)
+  // B gliding back to neutral (resetDeck with a ramp) leaves an open high-pass at 0 Hz.
+  const open = fakeDeck()
+  resetDeck(open, 0, 0.05)
+  assert.equal(nearZero(open.highpass.frequency, 0, 0.1), null)
+  assert.equal(nearZero(open.kill[0].frequency, 0, 0.1), null)
 })

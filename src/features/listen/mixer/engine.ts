@@ -542,6 +542,17 @@ function scheduleLinear(param: AudioParam, keyframes: Keyframe[], neutral: numbe
   }
 }
 
+/**
+ * Moves a high-pass's frequency (the filter's or the kill's) to `value` at `time`: a ramp, except into or out of 0 Hz
+ * (transparent), which jumps. A ramp down to 0 would pass through cutoffs of a fraction of a hertz, where a biquad's
+ * poles sit so close to z = 1 that changing them while sound passes builds up a huge error (measured: a spike 24 dB
+ * over full scale as a high-pass sweep ended, caught by the limiter as a 24 dB duck).
+ */
+function rampHighpass(param: AudioParam, time: number, value: number) {
+  if (value < HIGHPASS_MIN_HZ || valueOn(param, time) < HIGHPASS_MIN_HZ) setAt(param, time, value)
+  else rampAt(param, time, value)
+}
+
 /** The filter knob's curve: its frequency mapping isn't linear, so it is sampled finely (5 ms) into short ramps. */
 function scheduleFilter(deck: Deck, keyframes: Keyframe[], start: number, scale: number, from: number, now: number) {
   const begin = Math.max(now, start + from * scale)
@@ -564,7 +575,7 @@ function scheduleFilter(deck: Deck, keyframes: Keyframe[], start: number, scale:
     const { lowpass, highpass } = filterFrequencies(valueAfter(keyframes, from + (span * i) / (count - 1), 0), rate)
     const time = begin + (duration * i) / (count - 1)
     rampAt(deck.lowpass.frequency, time, lowpass)
-    rampAt(deck.highpass.frequency, time, highpass)
+    rampHighpass(deck.highpass.frequency, time, highpass)
   }
 }
 
@@ -585,7 +596,7 @@ function scheduleKill(deck: Deck, keyframes: Keyframe[], start: number, scale: n
   const duration = Math.max(1e-3, start + last * scale - begin)
   for (let i = 1; i < count; i++) {
     const frequency = killFrequency(valueAfter(keyframes, from + (span * i) / (count - 1), 1))
-    for (const param of params) rampAt(param, begin + (duration * i) / (count - 1), frequency)
+    for (const param of params) rampHighpass(param, begin + (duration * i) / (count - 1), frequency)
   }
 }
 
@@ -811,13 +822,14 @@ export function resetDeck(deck: Deck, time = deck.ctx.currentTime, ramp = 0) {
   // The filters glide open on the log scale (short ramps); the transparent end points are then set exactly.
   if (ramp > 0) {
     const lowFrom = Math.max(LOWPASS_MIN_HZ, valueOn(deck.lowpass.frequency, time))
-    const highFrom = Math.max(HIGHPASS_MIN_HZ, valueOn(deck.highpass.frequency, time))
-    const killFrom = Math.max(HIGHPASS_MIN_HZ, valueOn(deck.kill[0].frequency, time))
+    // A high-pass glides only if it is on (at 0 Hz it stays there; see `rampHighpass`).
+    const highFrom = valueOn(deck.highpass.frequency, time)
+    const killFrom = valueOn(deck.kill[0].frequency, time)
     for (let i = 1; i <= GLIDE_STEPS; i++) {
       const p = i / GLIDE_STEPS
       rampAt(deck.lowpass.frequency, time + ramp * p, lowFrom * (top / lowFrom) ** p)
-      rampAt(deck.highpass.frequency, time + ramp * p, highFrom * (HIGHPASS_MIN_HZ / highFrom) ** p)
-      for (const filter of deck.kill) rampAt(filter.frequency, time + ramp * p, killFrom * (HIGHPASS_MIN_HZ / killFrom) ** p)
+      if (highFrom >= HIGHPASS_MIN_HZ) rampHighpass(deck.highpass.frequency, time + ramp * p, highFrom * (HIGHPASS_MIN_HZ / highFrom) ** p)
+      if (killFrom >= HIGHPASS_MIN_HZ) for (const filter of deck.kill) rampHighpass(filter.frequency, time + ramp * p, killFrom * (HIGHPASS_MIN_HZ / killFrom) ** p)
     }
   }
   setAt(deck.lowpass.frequency, end, top)

@@ -205,6 +205,14 @@ export interface DeckAutomation {
    * e.g. rising over A's last bars so A dissolves into B. Missing or empty = no reverb (transitions made before it).
    */
   reverb?: Keyframe[]
+  /**
+   * Stem lanes, 0–1 (1 = as is, 0 = gone), for the deck's drums, voice, and the rest without bass (its bass stays on
+   * `low`): the editor's "smart filters". Missing or empty = 1. Played from real stems where they're loaded, else
+   * approximated live (a percussive/harmonic and centre split). The planner doesn't emit them yet.
+   */
+  drums?: Keyframe[]
+  vocals?: Keyframe[]
+  instrumental?: Keyframe[]
 }
 
 export type TransitionEffect =
@@ -266,6 +274,13 @@ export interface Transition {
   custom: boolean
   /** How sure the planner is that this sounds right (0–1); low when the analysis was unsure. */
   confidence: number
+  /**
+   * Server-owned: the overlap rendered to an audio clip at `url` (leaving "Mix-Modus" bakes the stem lanes in), covering
+   * transition time `start` to `start + length` (seconds). Playback plays A up to it, the clip, then B on from its end.
+   * `key` (A, B, this transition's hash, engine version) says whether it still matches; a reorder or an edit
+   * invalidates it. Missing = played live.
+   */
+  baked?: { url: string; key: string; start: number; length: number }
 }
 
 /** A playlist's mixer settings, kept on the Lumio server (`/music/mixer/<playlistId>`). */

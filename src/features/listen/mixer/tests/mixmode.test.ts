@@ -1,6 +1,7 @@
-/** Mix-Modus: which windows of its songs a playlist asks stems for (mixmode/windows.ts). */
+/** Mix-Modus: which windows of its songs a playlist asks stems for (mixmode/windows.ts), and which stem feeds which lane. */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { LANE_STEMS, laneStems, stemsToLoad } from '../mixmode/lane-stems.ts'
 import { covered, playlistWindows, tidyWindows, transitionWindows } from '../mixmode/windows.ts'
 import type { Transition } from '../types.ts'
 
@@ -53,4 +54,11 @@ test('a playlist asks each song for its opening and close, or what its stored tr
   assert.ok(covered(wanted.y!, 20, 30))
   assert.ok(covered(wanted.y!, 150, 240))
   assert.equal(covered(wanted.y!, 100, 120), false)
+})
+
+test('the instrumental lane plays the server\'s "other" stem only; the bass stem feeds no lane', () => {
+  assert.deepEqual(LANE_STEMS, { vocals: 'vocals', drums: 'drums', instrumental: 'other' })
+  assert.equal(stemsToLoad().includes('bass' as never), false)
+  assert.deepEqual(laneStems({ vocals: 1, drums: 2, bass: 3, other: 4 }), { vocals: 1, drums: 2, instrumental: 4 })
+  assert.deepEqual(laneStems({ bass: 3 }), {})
 })

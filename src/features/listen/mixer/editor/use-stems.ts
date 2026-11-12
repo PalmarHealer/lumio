@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { loadStem, mixSources, preheat, stemStatus, useMixMode, type StemWindowStatus } from '../mixmode/mix-mode'
+import { laneStems, stemsToLoad } from '../mixmode/lane-stems'
+import { loadStem, preheat, stemStatus, useMixMode, type StemWindowStatus } from '../mixmode/mix-mode'
 import { covered, transitionWindows, type Window } from '../mixmode/windows'
 import { useStableLumioFetch } from '../queries'
 import type { Transition } from '../types'
@@ -17,8 +18,8 @@ const windowFor = (windows: StemWindowStatus[] | undefined, need: Window) => win
 /**
  * The editor's real stems in Mix-Modus: for the stretches of both songs the transition plays, asks the server for them
  * (when the playlist's pre-heat didn't cover them, e.g. after the transition was moved), waits for them, loads the four
- * stems of each deck's window and hands them to the preview (vocals, drums, and bass with the rest as the
- * instrumental). Outside Mix-Modus both decks stay approximated.
+ * stems of each deck's window and hands them to the preview (see lane-stems.ts: vocals, drums, and the rest as the
+ * instrumental; the bass stays on the EQ). Outside Mix-Modus both decks stay approximated.
  */
 export function useDeckStems(options: { playlistId: string; from: string; to: string; transition: Transition | null; preview: PreviewControls }): { a: DeckStems; b: DeckStems } {
   const { playlistId, from, to, transition, preview } = options
@@ -88,11 +89,10 @@ export function useDeckStems(options: { playlistId: string; from: string; to: st
         }
         setState((before) => ({ ...before, [deck]: 'loading' }))
         try {
-          const [vocals, drums, bass, other] = await Promise.all(
-            (['vocals', 'drums', 'bass', 'other'] as const).map((stem) => loadStem(lumioFetch, decks[deck].id, window.window, stem, decode)),
-          )
+          const names = stemsToLoad()
+          const sources = await Promise.all(names.map((stem) => loadStem(lumioFetch, decks[deck].id, window.window, stem, decode)))
           if (stopped) return
-          await setStems(deck, { vocals, drums, instrumental: mixSources(bass!, other!) })
+          await setStems(deck, laneStems(Object.fromEntries(names.map((stem, i) => [stem, sources[i]!]))))
           loaded.current[deck] = window.window.id
           setState((before) => ({ ...before, [deck]: 'ready' }))
         } catch {

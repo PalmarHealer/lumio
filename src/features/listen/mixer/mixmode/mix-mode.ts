@@ -108,19 +108,6 @@ export async function loadStem(lumioFetch: LumioFetch, item: string, window: Ste
   return { channels, origin: window.start, sampleRate: decoded.sampleRate }
 }
 
-/** Two stems played as one (the instrumental: bass and the rest), sample by sample. */
-export function mixSources(x: PreviewSource, y: PreviewSource): PreviewSource {
-  const length = Math.min(x.channels[0]!.length, y.channels[0]!.length)
-  const channels = [0, 1].map((c) => {
-    const out = new Float32Array(length)
-    const p = x.channels[Math.min(c, x.channels.length - 1)]!
-    const q = y.channels[Math.min(c, y.channels.length - 1)]!
-    for (let i = 0; i < length; i++) out[i] = p[i]! + q[i]!
-    return out
-  })
-  return { channels, origin: x.origin, sampleRate: x.sampleRate }
-}
-
 /**
  * Leaving Mix-Modus: every hand-made transition of songs that are neighbours now goes to the baking (one already baked
  * as it is is skipped there), which lets the stems go when done; without any, they are let go at once.

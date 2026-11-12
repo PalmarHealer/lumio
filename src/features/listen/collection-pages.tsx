@@ -44,8 +44,9 @@ import { TasteMenuItem } from './taste'
 import { DownloadButton, DownloadMenuItem } from './download-ui'
 import { useHeldByDownload } from './download-ui'
 import { MixerBadge, MixerMenuItems, SortBuildDialog } from './mixer/mixer-ui'
-import { useMixInfo, usePlaylistMixer } from './mixer/queries'
+import { useMixInfo, usePlaylistMixer, useStableLumioFetch } from './mixer/queries'
 import { PlaylistSortMenu } from './playlist-sort-menu'
+import { dropStaleBakes } from './mixer/mixmode/bake'
 import { MixModeBanner, MixModeMenuItem } from './mixer/mixmode/mix-mode-ui'
 
 const messages = defineMessages({
@@ -359,6 +360,7 @@ export function PlaylistPage() {
   const [suiting, setSuiting] = useState(false)
   const mixer = usePlaylistMixer(id)
   const mixing = mixer.data?.on === true
+  const lumioFetch = useStableLumioFetch()
   const shareInfo = infos.data?.find((info) => info.playlist.Id === id)
   const adds = usePlaylistAdds(id, (shareInfo?.editors.length ?? 0) > 1).data
   // A mixer playlist shows each song's tempo and key (what its transitions are planned with) where a shared one shows
@@ -421,7 +423,18 @@ export function PlaylistPage() {
             : undefined
         }
         onRemove={canEdit ? (track) => track.PlaylistItemId && actions.remove.mutate({ playlistId: id, entryIds: [track.PlaylistItemId] }) : undefined}
-        onMove={canEdit ? (track, index) => track.PlaylistItemId && actions.move.mutate({ playlistId: id, entryId: track.PlaylistItemId, index }) : undefined}
+        onMove={
+          canEdit
+            ? (track, index) => {
+                if (!track.PlaylistItemId) return
+                // The order after the move: baked clips of pairs that are no longer neighbours are let go (as when sorting).
+                const order = list.map((entry) => entry.Id ?? '')
+                const from = list.findIndex((entry) => entry.PlaylistItemId === track.PlaylistItemId)
+                if (from >= 0) order.splice(index, 0, ...order.splice(from, 1))
+                actions.move.mutate({ playlistId: id, entryId: track.PlaylistItemId, index }, { onSuccess: () => mixing && void dropStaleBakes(lumioFetch, id, order) })
+              }
+            : undefined
+        }
         onEdit={mine && item ? setEditing : undefined}
         actions={
           <>

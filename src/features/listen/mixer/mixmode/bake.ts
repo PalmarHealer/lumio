@@ -7,7 +7,8 @@ import { loadDeckAudio } from '../editor/audio'
 import type { PreviewSource } from '../preview'
 import type { RenderStems } from '../render'
 import type { PlaylistMixer, Transition } from '../types'
-import { loadStem, mixSources, stemStatus, type StemWindowStatus } from './mix-mode'
+import { laneStems, stemsToLoad } from './lane-stems'
+import { loadStem, stemStatus, type StemWindowStatus } from './mix-mode'
 import { covered } from './windows'
 
 /**
@@ -36,14 +37,12 @@ const toBuffer = (source: PreviewSource) => {
 
 /** The song's real stems over [from, to] of its track, when one separated window covers it; else none (approximated). */
 async function stemsFor(deps: BakeDeps, item: string, windows: StemWindowStatus[] | undefined, from: number, to: number, context: BaseAudioContext): Promise<RenderStems | undefined> {
-  const window = windows?.find((w) => w.state === 'ready' && covered([w.window], from, to))
+  const window = windows?.find((w) => w.state === 'ready' && covered([w.window], Math.max(0, from - 1), to + 1))
   if (!window) return undefined
-  const [vocals, drums, bass, other] = await Promise.all(
-    (['vocals', 'drums', 'bass', 'other'] as const).map((stem) => loadStem(deps.lumioFetch, item, window.window, stem, context)),
-  )
-  const instrumental = mixSources(bass!, other!)
+  const names = stemsToLoad()
+  const loaded = await Promise.all(names.map((stem) => loadStem(deps.lumioFetch, item, window.window, stem, context)))
   const placed = (source: PreviewSource) => ({ buffer: toBuffer(source), origin: source.origin })
-  return { vocals: placed(vocals!), drums: placed(drums!), instrumental: placed(instrumental) }
+  return laneStems(Object.fromEntries(names.map((stem, i) => [stem, placed(loaded[i]!)])))
 }
 
 /** Bakes a transition and uploads its clip; returns the clip's key. */

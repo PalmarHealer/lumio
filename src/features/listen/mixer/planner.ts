@@ -1393,7 +1393,7 @@ function audibleClarity(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   let least = Infinity
   for (let i = 0; i < stats.loudA.length; i += step) {
     const t = i * dt
-    if (t > length || t < p.bStart || !stats.loudA[i] || !stats.loudB[i]) continue
+    if (t > length || t < p.bStart || !bothHeard(stats, i)) continue
     const atA = positionA(p, t)
     const atB = positionB(p, t) ?? 0
     // B before its first beat has no grid to match: -1 rejects. A after its last beat is its tail (a play-out to its
@@ -1413,12 +1413,54 @@ function audibleClarity(p: Placement, a: PreparedTrack, b: PreparedTrack) {
  * do (a killed or filtered low hides a kick; a ducked deck is left with its kick alone). `riskyA`/`riskyB`: whose
  * accents fall under MIN_VERIFIABLE; `kickRisk`: the kicks do.
  */
+/**
+ * B's mean attack clarity over the overlap where its accents are heard (1 without a clarity analysis): B is better
+ * entered on clear bars than on a scattered texture (Rock That Body → Outside: Outside's chops at 1:09–1:25).
+ */
+function entryClarity(p: Placement, b: PreparedTrack) {
+  const { stats } = p
+  const { dt } = stats
+  if (dt <= 0 || stats.shape.length <= 0) return 1
+  const step = Math.max(1, Math.round(0.25 / dt))
+  let sum = 0
+  let n = 0
+  for (let i = 0; i < stats.passB.mid.length; i += step) {
+    const t = i * dt
+    if (t < p.bStart || t > stats.shape.length || Math.max(stats.passB.mid[i], stats.passB.high[i]) < ACCENT_FAINT) continue
+    const atB = positionB(p, t)
+    if (atB === null) continue
+    const c = b.clarityBetween(atB, atB + 0.01)
+    if (!Number.isFinite(c)) return 1
+    sum += c
+    n++
+  }
+  return n > 0 ? sum / n : 1
+}
+
+/**
+ * Both decks heard at a sample: loud (a band at -10 dB) or with accents at -20 dB through their filters, which flam
+ * against a scattered bar (see `riskAt`, which decides).
+ */
+const bothHeard = (stats: ShapeStats, i: number) =>
+  (stats.loudA[i] || Math.max(stats.passA.mid[i], stats.passA.high[i]) >= ACCENT_FAINT) &&
+  (stats.loudB[i] || Math.max(stats.passB.mid[i], stats.passB.high[i]) >= ACCENT_FAINT)
+
 function riskAt(stats: ShapeStats, i: number, a: PreparedTrack, b: PreparedTrack, atA: number, atB: number) {
-  const accA = Math.max(stats.passA.mid[i], stats.passA.high[i]) >= BEAT_HEARD
-  const accB = Math.max(stats.passB.mid[i], stats.passB.high[i]) >= BEAT_HEARD
+  const clarA = a.clarityBetween(atA, atA + 0.01)
+  const clarB = b.clarityBetween(atB, atB + 0.01)
+  // Against a bar with next to no clear attacks (a scattered texture: vocal chops, an arp; clarity 0.25 or less) the
+  // other deck's accents count from -20 dB, not -10 (Rock That Body → Outside at 1:09: A's low-passed snare at -16 dB
+  // over Outside's chops measured 20–25 ms apart).
+  const levelA = Math.max(stats.passA.mid[i], stats.passA.high[i])
+  const levelB = Math.max(stats.passB.mid[i], stats.passB.high[i])
+  // (The scattered deck's own texture counts where it's heard as usual, from -10 dB.)
+  const scatteredA = Number.isFinite(clarA) && clarA <= SCATTERED && levelA >= BEAT_HEARD
+  const scatteredB = Number.isFinite(clarB) && clarB <= SCATTERED && levelB >= BEAT_HEARD
+  const accA = levelA >= (scatteredB ? ACCENT_FAINT : BEAT_HEARD)
+  const accB = levelB >= (scatteredA ? ACCENT_FAINT : BEAT_HEARD)
   // Snares, claps and hats flam against the other deck's (both heard); a deck left with its kick alone doesn't.
-  const cA = accA && accB ? a.clarityBetween(atA, atA + 0.01) : 1
-  const cB = accA && accB ? b.clarityBetween(atB, atB + 0.01) : 1
+  const cA = accA && accB ? clarA : 1
+  const cB = accA && accB ? clarB : 1
   let kick = 1
   if (stats.passA.low[i] >= KICK_HEARD && stats.passB.low[i] >= KICK_HEARD) kick = Math.min(a.kickClarityBetween(atA, atA + 0.01), b.kickClarityBetween(atB, atB + 0.01))
   return { value: Math.min(cA, cB, kick), riskyA: cA < MIN_VERIFIABLE, riskyB: cB < MIN_VERIFIABLE, kickRisk: kick < MIN_VERIFIABLE, cA, cB }
@@ -1434,7 +1476,7 @@ function riskyTime(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   let risky = 0
   for (let i = 0; i < stats.loudA.length; i += step) {
     const t = i * dt
-    if (t > stats.shape.length || t < p.bStart || !stats.loudA[i] || !stats.loudB[i]) continue
+    if (t > stats.shape.length || t < p.bStart || !bothHeard(stats, i)) continue
     const atA = positionA(p, t)
     if (atA > lastBeatA + 0.05) continue
     const atB = positionB(p, t) ?? 0
@@ -1443,8 +1485,15 @@ function riskyTime(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   return risky
 }
 
-/** The level a ducked deck's mids and highs go down to: under the -10 dB from which its accents are heard. */
+/**
+ * The level a ducked deck's mids and highs go down to: -16 dB, under the -10 dB from which its accents are heard (not
+ * under the -20 dB that counts against a scattered bar: such a bar with both decks' accents is out, not ducked).
+ */
 const DUCK = 0.15
+/** Attack clarity at or under which a bar is a scattered texture (see `riskAt`). */
+const SCATTERED = 0.25
+/** Where accents count as heard against a scattered bar: -20 dB. */
+const ACCENT_FAINT = 0.1
 /**
  * How many candidates get the sampled checks before the best found so far is taken (measured on 25 songs: the best is
  * found within the first 60 for 90 % of pairs; a few with many long blends failing their gates take thousands).
@@ -1471,7 +1520,7 @@ function duckRisky(p: Placement, a: PreparedTrack, b: PreparedTrack): Placement 
   let estimate = 0
   for (let i = 0; i < stats.loudA.length; i += coarse) {
     const t = i * dt
-    if (t > length || t < p.bStart || !stats.loudA[i] || !stats.loudB[i]) continue
+    if (t > length || t < p.bStart || !bothHeard(stats, i)) continue
     const atA = positionA(p, t)
     const atB = positionB(p, t) ?? 0
     if (atA > lastBeatA + 0.05) continue
@@ -1483,7 +1532,7 @@ function duckRisky(p: Placement, a: PreparedTrack, b: PreparedTrack): Placement 
   let total = 0
   for (let i = 0; i < stats.loudA.length; i++) {
     const t = i * dt
-    if (t > length || t < p.bStart || !stats.loudA[i] || !stats.loudB[i]) continue
+    if (t > length || t < p.bStart || !bothHeard(stats, i)) continue
     const atA = positionA(p, t)
     const atB = positionB(p, t) ?? 0
     if (atA > lastBeatA + 0.05) continue
@@ -2365,7 +2414,7 @@ function planSeveral(
     const parked = repeatedShare(a, positionA(placement, placement.bStart), positionA(placement, stats.aGone))
     const repeatTerm = parked >= 0.4 ? 0.3 * Math.min(1, Math.max(0, stats.aGone - placement.bStart - 8 * stats.beat) / (24 * stats.beat)) : 0
     const finish = placement.variant.preset === 'blend' ? placement.variant.prior - start.variant.prior - BEST_FINISH : 0
-    const clarityTerm = Number.isNaN(placement.clarity) ? 0.1 : 0.3 * Math.max(0, 1 - placement.clarity / MIN_CLARITY)
+    const clarityTerm = (Number.isNaN(placement.clarity) ? 0.1 : 0.3 * Math.max(0, 1 - placement.clarity / MIN_CLARITY)) + 0.2 * (1 - entryClarity(placement, b))
     const duckTerm = (0.02 * (placement.ducked ?? 0)) / (4 * stats.beat)
     // Party wants a switch you can hear: B's event on A's boundary, or the bass changing deck.
     const quiet = party && placement.variant.preset === 'blend' && placement.variant.bassAt === 'none' && !placement.pb.drop && !placement.pb.chorus ? 0.15 : 0

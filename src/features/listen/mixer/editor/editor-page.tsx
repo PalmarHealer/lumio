@@ -11,6 +11,7 @@ import { closeListenPanel, openListenPanel, setListenLayout, useListenLayout, us
 import { ticksToSeconds } from '@/lib/format'
 import { defineMessages, useMessages } from '@/lib/i18n'
 import { ENGINE_VERSION } from '../baked'
+import { PLANNER_VERSION } from '../planner'
 import { MixerSaveError, usePlaylistMixer, useSaveMixer, useStableLumioFetch, useTrackMixes } from '../queries'
 import { transitionFor } from '../resolve'
 import { pairKey, type Transition } from '../types'
@@ -133,7 +134,7 @@ export function TransitionEditorPage() {
       diff: editDiff(origin.plan, final),
       versions: { a: aMix?.v ?? null, b: bMix?.v ?? null },
       engine: ENGINE_VERSION,
-      planner: null,
+      planner: PLANNER_VERSION,
       style: mixer.data?.style ?? 'clean',
     }
     void lumioFetch('/music/mix/training', { method: 'POST', body: JSON.stringify(body) }).catch(() => undefined)

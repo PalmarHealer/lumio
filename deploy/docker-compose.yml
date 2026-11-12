@@ -29,6 +29,8 @@ services:
       # only, see docs/SETUP.md).
       # MEILI_URL: http://meilisearch:7700
       # MEILI_KEY: ""
+      # Optional: the editor's stems ("Mix-Modus"): a shared secret for the stem worker(s), see stem-worker below.
+      # STEMS_WORKER_TOKEN: ""
     volumes:
       - lumio-data:/data
     # Only your reverse proxy needs to reach it; publish the port only without one.
@@ -47,6 +49,26 @@ services:
       - ./jellyfin/cache:/cache
       - /path/to/media:/media:ro
     # No ports: only Lumio talks to Jellyfin.
+
+  # Optional: separates songs into stems for the editor on this server's CPU, as a fallback (windows only, low
+  # priority, one at a time; it pauses while a stronger primary worker elsewhere is connected). Off unless you enable
+  # it (docker compose --profile stems up). Needs the HTDemucs ONNX model in ./stems-model and STEMS_WORKER_TOKEN set
+  # on both services.
+  # stem-worker:
+  #   image: ghcr.io/palmarhealer/lumio-stem-worker:latest
+  #   profiles: [stems]
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - lumio
+  #   environment:
+  #     LUMIO_URL: http://lumio:8097/api
+  #     STEMS_WORKER_TOKEN: ""
+  #     ROLE: fallback
+  #     NICE: "19"
+  #     THREADS: "2"
+  #   cpus: 2
+  #   volumes:
+  #     - ./stems-model:/models:ro
 
 volumes:
   lumio-data:

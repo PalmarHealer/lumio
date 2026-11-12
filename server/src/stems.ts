@@ -23,6 +23,14 @@ export const STEM_UPLOAD_LIMIT = MAX_SONG * 44_100 * 2 * 4 + 65_536
 /** A worker's lease on a job: after this without all four stems the job goes back into the queue (at most 3 times). */
 const LEASE_MS = 20 * 60_000
 const MAX_ATTEMPTS = 3
+/** A primary worker counts as present this long after it last asked for a job or uploaded. */
+const PRIMARY_PRESENT_MS = 90_000
+
+/**
+ * Who asks for jobs: the primary worker (e.g. a GPU machine) takes everything; a fallback worker (the Lumio server's
+ * own CPU, opt-in) takes only windows, and only while no primary worker is present.
+ */
+export type WorkerRole = 'primary' | 'fallback'
 
 export interface StemWindow {
   /** 'whole' or '<startMs>-<endMs>'. */
@@ -74,7 +82,8 @@ export class Stems {
   private readonly quotaBytes: number
   private readonly ttl: number
   private readonly jobs = new Map<string, StemJob>()
-  private readonly waiters: Array<(job: StemJob | null) => void> = []
+  private readonly waiters: Array<{ role: WorkerRole; give: (job: StemJob | null) => void }> = []
+  private primarySeen = 0
 
   constructor(dataDir: string, quotaMb = Number(process.env.STEMS_QUOTA_MB ?? 20_000), ttlHours = Number(process.env.STEMS_TTL_HOURS ?? 72)) {
     this.dir = join(dataDir, 'stems')
@@ -187,12 +196,22 @@ export class Stems {
 
   // ---- the worker's side ----
 
+  /** Whether a fallback worker may take this job now (a window, and no primary worker around). */
+  private fallbackMay(job: StemJob) {
+    return job.window.id !== 'whole' && Date.now() - this.primarySeen > PRIMARY_PRESENT_MS
+  }
+
   private offer(job: StemJob) {
-    const waiter = this.waiters.shift()
-    if (waiter) {
-      this.lease(job)
-      waiter(job)
-    }
+    const at = this.waiters.findIndex((waiter) => waiter.role === 'primary' || this.fallbackMay(job))
+    if (at < 0) return
+    const [waiter] = this.waiters.splice(at, 1)
+    this.lease(job)
+    waiter!.give(job)
+  }
+
+  /** A worker of this role showed up (asked for a job or delivered). */
+  seen(role: WorkerRole) {
+    if (role === 'primary') this.primarySeen = Date.now()
   }
 
   private lease(job: StemJob) {
@@ -202,7 +221,8 @@ export class Stems {
   }
 
   /** The next job for a worker, waiting up to `waitMs` for one (long-poll); null when none came. */
-  next(waitMs: number): Promise<StemJob | null> {
+  next(waitMs: number, role: WorkerRole = 'primary'): Promise<StemJob | null> {
+    this.seen(role)
     const now = Date.now()
     for (const job of this.jobs.values()) {
       // A lease that ran out goes back to the queue (a worker that died), until it has been tried too often.
@@ -213,15 +233,18 @@ export class Stems {
         } else job.state = 'queued'
       }
     }
-    const queued = [...this.jobs.values()].find((job) => job.state === 'queued')
+    const queued = [...this.jobs.values()].find((job) => job.state === 'queued' && (role === 'primary' || this.fallbackMay(job)))
     if (queued) {
       this.lease(queued)
       return Promise.resolve(queued)
     }
     return new Promise((resolve) => {
-      const waiter = (job: StemJob | null) => {
-        clearTimeout(timer)
-        resolve(job)
+      const waiter = {
+        role,
+        give: (job: StemJob | null) => {
+          clearTimeout(timer)
+          resolve(job)
+        },
       }
       const timer = setTimeout(() => {
         const at = this.waiters.indexOf(waiter)

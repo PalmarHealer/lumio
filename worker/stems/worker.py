@@ -12,6 +12,10 @@ Environment:
                        stems drums/bass/other/vocals); default /models/htdemucs.onnx
   PROVIDER             cpu (default) or cuda
   THREADS              CPU threads for onnxruntime (default: all)
+  ROLE                 primary (default: takes every job) or fallback (e.g. on the Lumio server's own CPU: takes
+                       windows only, and nothing while a primary worker is around)
+  NICE                 raise the process's niceness by this much (e.g. 19 for a fallback on a busy server)
+Limit a fallback's CPU with the container (docker --cpus / compose cpus); it runs one job at a time.
 """
 import io
 import json
@@ -30,6 +34,8 @@ TOKEN = os.environ.get('STEMS_WORKER_TOKEN', '')
 MODEL_PATH = os.environ.get('MODEL_PATH', '/models/htdemucs.onnx')
 PROVIDER = os.environ.get('PROVIDER', 'cpu')
 THREADS = int(os.environ.get('THREADS', '0'))
+ROLE = 'fallback' if os.environ.get('ROLE') == 'fallback' else 'primary'
+NICE = int(os.environ.get('NICE', '0'))
 SOURCES = ['drums', 'bass', 'other', 'vocals']
 
 
@@ -89,7 +95,7 @@ def run_job(session, segment, job):
     for stem, data in stems.items():
         buffer = io.BytesIO()
         sf.write(buffer, np.clip(data, -1, 1), rate, format='FLAC', subtype='PCM_24')
-        request('PUT', f"/music/stems/jobs/{job['id']}/{stem}", buffer.getvalue(), 'audio/flac')
+        request('PUT', f"/music/stems/jobs/{job['id']}/{stem}?role={ROLE}", buffer.getvalue(), 'audio/flac')
     seconds = len(audio) / rate
     print(f"job {job['id']} {job['item']} {job['window']['id']}: {seconds:.0f} s of audio in {time.time() - started:.1f} s", flush=True)
 
@@ -97,11 +103,13 @@ def run_job(session, segment, job):
 def main():
     if not TOKEN:
         sys.exit('STEMS_WORKER_TOKEN is not set')
+    if NICE:
+        os.nice(NICE)
     session, segment = load_model()
-    print(f'stem worker: {MODEL_PATH} ({PROVIDER}, segment {segment}), polling {LUMIO_URL}', flush=True)
+    print(f'stem worker ({ROLE}): {MODEL_PATH} ({PROVIDER}, segment {segment}), polling {LUMIO_URL}', flush=True)
     while True:
         try:
-            status, body = request('GET', '/music/stems/jobs/next?wait=25', timeout=60)
+            status, body = request('GET', f'/music/stems/jobs/next?wait=25&role={ROLE}', timeout=60)
         except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
             print(f'poll failed: {error}', flush=True)
             time.sleep(10)

@@ -1408,7 +1408,8 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
   }
 
   // The separation worker (see stems.ts), with its own secret instead of a Jellyfin sign-in. GET
-  // /music/stems/jobs/next?wait=<s>: the next job ({id, item, window}), waiting up to 30 s for one (204: none).
+  // /music/stems/jobs/next?wait=<s>[&role=fallback]: the next job ({id, item, window}), waiting up to 30 s for one
+  // (204: none); a fallback worker gets windows only, and nothing while a primary worker is around.
   // GET /music/stems/jobs/<id>/audio: the job's window as WAV (stereo, 44.1 kHz, 16-bit), streamed from Jellyfin here.
   // PUT /music/stems/jobs/<id>/<vocals|drums|bass|other>: one stem as FLAC. POST /music/stems/jobs/<id>/fail {error}.
   if (path.startsWith('/music/stems/jobs/')) {
@@ -1416,7 +1417,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     if (!isStemWorker(request)) return send(response, 401, { error: 'Worker token required' })
     if (path === '/music/stems/jobs/next' && request.method === 'GET') {
       const wait = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000
-      const job = await stems.next(wait)
+      const job = await stems.next(wait, url.searchParams.get('role') === 'fallback' ? 'fallback' : 'primary')
       return job ? send(response, 200, { id: job.id, item: job.item, window: job.window, stems: STEMS }) : send(response, 204)
     }
     const jobPath = path.match(/^\/music\/stems\/jobs\/([0-9a-f-]{36})\/(audio|fail|vocals|drums|bass|other)$/)
@@ -1441,6 +1442,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       return send(response, 204)
     }
     if (request.method === 'PUT' && (STEMS as readonly string[]).includes(action)) {
+      if (url.searchParams.get('role') !== 'fallback') stems.seen('primary')
       const flac = await readBody(request, STEM_UPLOAD_LIMIT).catch(() => null)
       if (!flac) return send(response, 413, { error: 'Too large' })
       const failed = await stems.receive(job, action as Stem, flac)

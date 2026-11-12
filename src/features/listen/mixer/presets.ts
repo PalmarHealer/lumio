@@ -70,7 +70,7 @@ export interface PresetContext {
    * both at full volume, one singing over the other's instrumental; the bass hands over gradually on the swap, late,
    * and A leaves under a rising high-pass over the last fifth).
    */
-  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer'
+  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut'
   /** Blend: where the bass changes deck (start, middle) or 'none' (one of the two parts has no bass of its own). */
   bassAt?: 'start' | 'middle' | 'none'
   /**
@@ -561,6 +561,50 @@ export function matchLevels(shape: PresetShape, beat: number, difference: number
  * Needs B beatmatched; the planner loops bars of either song so neither runs into singing or a drop meanwhile.
  */
 /**
+ * The jump cut (the user on Heartless → Heartless: "when A says 'heartless', B says it and takes over"): A plays to the
+ * end of its line and is cut on the beat (the middle), B starts right there with its answering line; only the lows
+ * cross over around the cut, mids and highs switch at once.
+ */
+function jumpcut(ctx: PresetContext): PresetShape {
+  const bars = Math.max(2, ctx.bars)
+  const length = bars * 4 * ctx.beat
+  const middle = Math.min(length - ctx.beat, Math.max(ctx.beat, (ctx.swapBar ?? bars / 2) * 4 * ctx.beat))
+  // The lows cross over a beat around the cut (half a beat each side): soft, but too short for two kicks to flam.
+  const from = middle - ctx.beat / 2
+  const to = middle + ctx.beat / 2
+  return {
+    preset: 'blend',
+    length,
+    a: automation(length, {
+      gain: [
+        [0, 1],
+        [to - RAMP, 1],
+        [to, 0],
+      ],
+      low: [
+        [from, 1],
+        [to, 0],
+      ],
+      mid: [[0, 1], ...stepAt(middle, 1, 0)],
+      high: [[0, 1], ...stepAt(middle, 1, 0)],
+    }),
+    b: automation(length, {
+      gain: [[0, 0], ...stepFrom(from, 0, 1)],
+      low: [
+        [from, 0],
+        [to, 1],
+      ],
+      mid: [[0, 0], ...stepFrom(middle, 0, 1)],
+      high: [[0, 0], ...stepFrom(middle, 0, 1)],
+    }),
+    effects: [],
+    anchorA: 0,
+    anchorB: 0,
+    swap: middle,
+  }
+}
+
+/**
  * The wordplay handover (the user's "der ist krank"): B's beat fades in over the first half under A (its mids and
  * highs down, so no voice of B's is heard yet), A plays in full and is cut on the middle, where the bass and the
  * rest of B change over; B's answering line starts just after.
@@ -645,6 +689,7 @@ const EQ_OUT = 0.15
 function blend(ctx: PresetContext): PresetShape {
   if (ctx.volume === 'mashup') return mashup(ctx)
   if (ctx.volume === 'answer') return answer(ctx)
+  if (ctx.volume === 'jumpcut') return jumpcut(ctx)
   const bars = Math.max(1, ctx.bars)
   const length = bars * 4 * ctx.beat
   // The swap: on the bar the planner lines up with A's section boundary (0 = the start).
@@ -688,15 +733,17 @@ function blend(ctx: PresetContext): PresetShape {
             [middle, 1],
           ]
         : [
+            // B rises over its first bar (a quarter of a short blend) instead of jumping in.
             [0, 0],
-            [RAMP, 1],
+            [Math.max(RAMP, Math.min(4 * ctx.beat, length / 4)), 1],
           ]
   const swapAt = bassAt === 'start' || middle === 0 ? RAMP : middle
   // A DJ's bass swap is gradual: A's low goes down to half over the two bars before the phrase downbeat and is gone on
   // it, where B's low comes in (never both full: B's stays killed until then).
   const preCut = bassAt === 'middle' ? Math.min(8 * ctx.beat, middle / 2) : 0
   const aLow: Point[] = bassAt === 'none' ? [] : preCut > 0 ? [[middle - preCut, 1], [swapAt - RAMP, 0.5], [swapAt, 0]] : [[0, 1], ...stepAt(swapAt, 1, 0)]
-  const bLow: Point[] = bassAt === 'none' ? [] : [[0, 0], ...stepFrom(swapAt, 0, 1)]
+  // (On a drop swap the swap is the end: B's bass lands exactly there.)
+  const bLow: Point[] = bassAt === 'none' ? [] : [[0, 0], ...(swapAt >= length - RAMP ? stepAt(length, 0, 1) : stepFrom(swapAt, 0, 1))]
   // Tonal content: crossing equal-power in the fade, swapped in the beat around the middle for clashing keys.
   const aMid: Point[] = ctx.midSwap
     ? [
@@ -711,11 +758,15 @@ function blend(ctx: PresetContext): PresetShape {
       : volume === 'fade'
         ? aBand
         : []
+  // B's tonal swap comes up over the beat after the middle, or (a drop swap, the middle is the end) lands on the end.
+  const lateSwap = middle + beat > length
   const bMid: Point[] = ctx.midSwap
-    ? [
-        [middle, 0.1],
-        [middle + beat, 1],
-      ]
+    ? lateSwap
+      ? [[0, 0.1], ...stepAt(length, 0.1, 1)]
+      : [
+          [middle, 0.1],
+          [middle + beat, 1],
+        ]
     : volume === 'fade'
       ? bBand
       : []
@@ -736,10 +787,12 @@ function blend(ctx: PresetContext): PresetShape {
         ? aBand
         : []
   const bHigh: Point[] = ctx.midSwap
-    ? [
-        [middle, EQ_OUT],
-        [middle + beat, 1],
-      ]
+    ? lateSwap
+      ? [[0, EQ_OUT], ...stepAt(length, EQ_OUT, 1)]
+      : [
+          [middle, EQ_OUT],
+          [middle + beat, 1],
+        ]
     : volume === 'fade'
       ? bBand
       : []

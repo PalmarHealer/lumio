@@ -104,6 +104,13 @@ export interface TrackMix {
   energy: number[]
   /** Band energy per frame (0–1 each, relative to the band's loudest): low < 200 Hz, mid 200–2000 Hz, high > 2000 Hz. */
   bands: { low: number[]; mid: number[]; high: number[] }
+  /**
+   * Each band's level where its curve in `bands` is 1 (the band's loudest frame), in dB of full scale like `loudness`
+   * (the mean square of the samples in that band; one scale for every song). A frame's absolute band level is
+   * bandLoudness + 20·log10(curve value), so A's and B's lows, mids and highs can be compared. Missing in analyses made
+   * before it.
+   */
+  bandLoudness?: { low: number; mid: number; high: number }
   /** The song's structure, in order, covering the whole track. */
   sections: MixSection[]
   /** Drop moments (a phrase start where bass and energy jump after a build-up). */

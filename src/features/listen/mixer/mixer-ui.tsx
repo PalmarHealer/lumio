@@ -16,10 +16,7 @@ import { entriesInOrder, hasSharedEntries, planMoves } from './reorder'
 import type { SortMessage, SortRequest } from './sort-worker'
 import type { MixStyle, PresetId, TrackMix } from './types'
 
-/**
- * Every transition kind gets a name wherever one is shown. `reverbOut` is on its way into the planner's presets; the
- * union keeps its name ready, and a preset added to `PresetId` without a name here fails to compile.
- */
+/** Every transition kind gets a name wherever one is shown: a preset added to `PresetId` without one fails to compile. */
 type LabelledPreset = PresetId
 
 const PRESET_NAMES = {

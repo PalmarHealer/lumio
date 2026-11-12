@@ -170,12 +170,12 @@ interface Anchor {
  * the first downbeat after its line ends, B's the last downbeat before its line starts (within a bar of it), so B's line
  * answers right after A's. The pair's bonus rides on A's spot.
  */
-function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{ pa: Anchor; pb: Anchor }> {
+function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{ pa: Anchor; pb: Anchor; title: boolean }> {
   const linesA = Array.isArray(a.mix.lines) && a.mix.vocalSource === 'lyrics' ? a.mix.lines : []
   const linesB = Array.isArray(b.mix.lines) && b.mix.vocalSource === 'lyrics' ? b.mix.lines : []
   if (linesA.length === 0 || linesB.length === 0) return []
   const titles = new Set([...(a.mix.titleWords ?? []), ...(b.mix.titleWords ?? [])])
-  const pairs: Array<{ pa: Anchor; pb: Anchor; weight: number }> = []
+  const pairs: Array<{ pa: Anchor; pb: Anchor; weight: number; title: boolean }> = []
   for (const la of linesA) {
     if (!(la.time >= a.duration * (style === 'party' ? 0.45 : 0.6)) || !(la.end < a.duration - 8 * a.period)) continue
     const iA = Math.max(0, floorIndex(a.downbeats, la.end - 0.05) + 1)
@@ -191,13 +191,16 @@ function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{
       const title = shared.some((w) => titles.has(w))
       if (!title && shared.length < 2) continue
       const weight = title ? WORDPLAY_TITLE : WORDPLAY_WORD
-      pairs.push({ pa: { t: ta, bonus: weight, drop: false, chorus: false }, pb: { t: tb, bonus: 0, drop: false, chorus: false }, weight })
+      pairs.push({ pa: { t: ta, bonus: weight, drop: false, chorus: false }, pb: { t: tb, bonus: 0, drop: false, chorus: false }, weight, title })
     }
   }
   // The strongest few (a title word first, then the latest line of A).
   pairs.sort((x, y) => y.weight - x.weight || y.pa.t - x.pa.t)
   return pairs.slice(0, 24)
 }
+
+/** Bonus for a drop swap landing on B's drop (half on a chorus). */
+const DROP_SWAP_BONUS = 0.5
 
 /** Bonus for a wordplay pair answering with a title word, or with another content word. */
 const WORDPLAY_TITLE = 1
@@ -315,7 +318,7 @@ interface Variant {
   filter: boolean
   midSwap: boolean
   /** Blend: volume shape, where the bass changes deck, the filters in on B and out on A (see the blend preset). */
-  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer'
+  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut'
   bassAt?: 'start' | 'middle' | 'none'
   filterIn?: 'hp' | 'lp' | null
   filterOut?: 'hp' | 'lp' | 'eq' | null
@@ -341,7 +344,7 @@ const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwa
  * 24 and 8; 4 bars and the seamless S-curve over 2 as the fallback. Which EQ and
  * filter it gets is chosen per placement (`blendFinishes`).
  */
-const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
+const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
   // B's event lands on A's boundary after `pre` bars of B under A; A plays on, thinned, for `post` bars to its next
   // section, where it leaves. Pop: 4-bar phrases, 8-bar blends; dance music: 8 + 8 or more.
   // Preferred in that order (the user: "you can really take more time"): 16 bars, then 32, then 8; 4 bars and the
@@ -362,6 +365,12 @@ const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup' | 
   // Wordplay (the user's "der ist krank"): B's line answers A's with the same word, a quick 4-bar handover; only placed
   // on a pair of lines sharing a word (`wordPairs`), whose anchors carry the bonus.
   { volume: 'answer', pre: 2, post: 2, prior: -0.2, party: true, clean: true },
+  // The wordplay jump cut, preferred where the shared word is a title word (see `wordPairs`).
+  { volume: 'jumpcut', pre: 1, post: 1, prior: 0.2, party: true, clean: true },
+  // The drop swap the user asked for more of: B's drop (or chorus) lands on A's boundary after a short beatmatched
+  // run-up under A, A goes on it and the bass changes there (party; a bonus where B's event is a drop).
+  { volume: 'overlap', pre: 4, post: 0, prior: -0.3, party: true, clean: false },
+  { volume: 'overlap', pre: 2, post: 0, prior: -0.32, party: true, clean: false },
 ]
 
 /**
@@ -372,6 +381,9 @@ function blendFinishes(variant: Variant, clash: boolean): Variant[] {
   // The bass changes deck on the swap (A's boundary): 'start' when B's event opens the blend.
   const at: NonNullable<Variant['bassAt']> = (variant.pre ?? 0) === 0 ? 'start' : 'middle'
   if (variant.volume === 'scurve') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: clash }]
+  if (variant.volume === 'jumpcut') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: false, prior: variant.prior + BEST_FINISH }]
+  // A drop swap: B high-passed under A (no bass), A out on B's event, where B's bass comes in.
+  if (variant.volume === 'overlap' && (variant.bars - (variant.pre ?? 0)) === 0) return [{ ...variant, bassAt: 'middle', filterIn: 'hp', filterOut: null, midSwap: clash, prior: variant.prior + BEST_FINISH }]
   if (variant.volume === 'answer') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: clash, prior: variant.prior + BEST_FINISH }]
   if (variant.volume === 'mashup') return clash ? [] : [{ ...variant, bassAt: 'middle', filterIn: 'lp', filterOut: 'hp', midSwap: false, prior: variant.prior + BEST_FINISH }]
   const finishes: Array<[NonNullable<Variant['bassAt']>, Variant['filterIn'], Variant['filterOut'], number]> = [
@@ -859,10 +871,64 @@ function handoverDrop(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   const { stats } = p
   const swap = stats.shape.length > 0 ? Math.min(stats.shape.swap, stats.aGone) : 0
   const atA = positionA(p, swap)
-  const before = levelOver(a, atA - 8 * a.period, atA)
   const atB = positionB(p, stats.aGone) ?? p.laneB.start
+  const before = levelOver(a, atA - 8 * a.period, atA)
   const after = levelOver(b, atB, atB + 16 * b.period)
-  return before > 0 && after > 0 ? 20 * Math.log10(before / after) : 0
+  let drop = before > 0 && after > 0 ? 20 * Math.log10(before / after) : 0
+  // Per band where both analyses carry absolute band levels (an EDM drop into a piano ballad loses its highs): the
+  // worst of A's bands that mattered (within 12 dB of A's loudest band there).
+  const bandA = bandLevels(a, atA - 8 * a.period, atA)
+  const bandB = bandLevels(b, atB, atB + 16 * b.period)
+  if (bandA && bandB) {
+    const top = Math.max(bandA.low, bandA.mid, bandA.high)
+    for (const band of ['low', 'mid', 'high'] as const) if (bandA[band] >= top - 12) drop = Math.max(drop, bandA[band] - bandB[band])
+  }
+  return drop
+}
+
+/** A track's absolute band levels (dB FS) over a stretch, from bandLoudness and its band curves; null when unknown. */
+function bandLevels(track: PreparedTrack, from: number, to: number) {
+  const loud = track.mix.bandLoudness
+  const bands = track.mix.bands
+  const rate = track.mix.frameRate
+  if (!loud || !bands || !(rate > 0) || !Number.isFinite(loud.low) || !Number.isFinite(loud.mid) || !Number.isFinite(loud.high)) return null
+  const mean = (curve: number[]) => {
+    let sum = 0
+    let count = 0
+    for (let f = Math.max(0, Math.floor(from * rate)); f < Math.min(curve.length, Math.ceil(to * rate)); f++) {
+      sum += curve[f] ** 2
+      count++
+    }
+    return count > 0 ? Math.sqrt(sum / count) : 0
+  }
+  const db = (base: number, curve: number[]) => base + 20 * Math.log10(Math.max(1e-3, mean(curve)))
+  return { low: db(loud.low, bands.low), mid: db(loud.mid, bands.mid), high: db(loud.high, bands.high) }
+}
+
+/**
+ * How much B's heard level (gain × EQ × filter over its absolute bands) jumps from the beat before the swap to the beat
+ * after it, in dB: a B held thin and then thrown in at once.
+ */
+function handoverJump(p: Placement, b: PreparedTrack) {
+  const { stats } = p
+  const { dt, passB } = stats
+  if (dt <= 0) return 0
+  const swap = stats.shape.swap
+  const heard = (t0: number, t1: number) => {
+    let sum = 0
+    let count = 0
+    for (let i = Math.max(0, Math.round(t0 / dt)); i <= Math.min(passB.low.length - 1, Math.round(t1 / dt)); i++) {
+      const at = positionB(p, i * dt)
+      if (at === null) continue
+      const e = b.bandsAt(at)
+      sum += (passB.low[i] * e.low) ** 2 + (passB.mid[i] * e.mid) ** 2 + (passB.high[i] * e.high) ** 2
+      count++
+    }
+    return count > 0 ? sum / count : 0
+  }
+  const before = heard(swap - stats.beat, swap - 0.02)
+  const after = heard(swap + 0.02, swap + stats.beat)
+  return before > 1e-6 && after > 0 ? 10 * Math.log10(after / before) : 0
 }
 
 /** Cosine of two harmonic profiles (0 when either is missing). */
@@ -1087,16 +1153,16 @@ function monotonic(shape: PresetShape, callback: boolean) {
 }
 
 /**
- * B is in full (gain, every band, filter open) over the bar before A's last band falls under BEAT_HEARD: B carries the
- * music when A goes.
+ * B is in (gain 0.9, every band 0.8, filter open) over the 2 beats before A's last band falls under BEAT_HEARD: B
+ * carries the music when A goes.
  */
 function readyAtExit(stats: ShapeStats) {
   const { passA, passB, gainB, dt } = stats
   let exit = -1
   for (let i = 0; i < passA.low.length; i++) if (Math.max(passA.low[i], passA.mid[i], passA.high[i]) >= BEAT_HEARD) exit = i
   if (exit < 0) return true
-  const from = Math.max(0, exit - Math.round((4 * stats.beat) / Math.max(dt, 1e-6)))
-  for (let i = from; i <= exit; i++) if (gainB[i] < 0.98 || Math.min(passB.low[i], passB.mid[i], passB.high[i]) < 0.9) return false
+  const from = Math.max(0, exit - Math.round((2 * stats.beat) / Math.max(dt, 1e-6)))
+  for (let i = from; i <= exit; i++) if (gainB[i] < 0.9 || Math.min(passB.low[i], passB.mid[i], passB.high[i]) < 0.8) return false
   return true
 }
 
@@ -1703,7 +1769,11 @@ function planSeveral(
     const skipA = a.loudSeconds(reachA, a.end)
     const skipB = b.loudSeconds(b.start, p.laneB.start)
     let bound = variant.prior + jitter(`${ids.from}>${ids.to}:${variant.preset}:${variant.preRollBars}:${variant.bars}:${variant.midSwap}`)
-    bound += p.pa.bonus + p.pb.bonus - 0.02 * p.loops
+    // A drop swap lands on B's drop (or chorus): the user wants more of them where they fit.
+    if (variant.preset === 'blend' && variant.volume === 'overlap' && variant.bars === (variant.pre ?? 0))
+      bound += p.pb.drop ? DROP_SWAP_BONUS : p.pb.chorus ? DROP_SWAP_BONUS / 2 : -10
+    // Loops only when needed to fit: starting the blend earlier is better (the user on Titanium → Animals).
+    bound += p.pa.bonus + p.pb.bonus - 0.08 * p.loops
     // A blend's length preference is its layout's prior; a fade's or echo's leans to the target length.
     if (FREE_LENGTH.has(variant.preset)) bound -= 0.12 * Math.abs(Math.log2(variant.bars / targetBars))
     if (party) {
@@ -1773,10 +1843,11 @@ function planSeveral(
         const k = i + bars
         return i >= 0 && Math.abs(track.downbeats[i] - t) <= 0.05 && k >= 0 && k < track.downbeats.length ? track.downbeats[k] : NaN
       }
-      if (variant.volume === 'answer') {
+      if (variant.volume === 'answer' || variant.volume === 'jumpcut') {
         // Wordplay: A's bar right after its line and B's bar right before its answering line meet on the swap; straight
         // material, `pre` bars before and `post` after it on both decks (bars, not phrases: lines don't keep to them).
-        for (const { pa, pb } of words) {
+        for (const { pa, pb, title } of words) {
+          if (variant.volume === 'jumpcut' && !title) continue
           const iA = floorIndex(a.downbeats, pa.t + 0.05)
           const iB = floorIndex(b.downbeats, pb.t + 0.05)
           const startA = a.downbeats[iA - pre]
@@ -1913,6 +1984,8 @@ function planSeveral(
     const isMashup = placement.variant.volume === 'mashup'
     if (isMashup && !mashupFits(placement, a, b, harmony)) return null
     if (placement.variant.preset === 'reverbOut' && !reverbFits(placement, a, b)) return null
+    const dropSwap = placement.variant.volume === 'overlap' && placement.variant.bars === (placement.variant.pre ?? 0)
+    if (dropSwap && !placement.pb.drop && !placement.pb.chorus) return null
     if (placement.variant.callback && !callbackFits(placement, a)) return null
     if (placement.beatmatched) {
       const aligned = alignPhase(placement, a, b, tempo.multiple)
@@ -1998,7 +2071,11 @@ function planSeveral(
       // A only ever goes out and B only ever comes in (the user: "why is A brought back?"); B is in full before A's last
       // band goes ("B isn't ready to take over"), except on the wordplay cut, where B's answer masks A's end.
       if (!monotonic(stats.shape, placement.variant.callback === true)) return null
-      if (placement.variant.volume !== 'answer' && !readyAtExit(stats)) return null
+      // A blend that falls off a cliff after A is gone (an EDM drop into a piano ballad) isn't one: an echo or a fade
+      // takes it (or none).
+      if (handoverDrop(placement, a, b) > (party ? 1.5 : 3) + 6) return null
+      // The wordplay cuts and the drop swap hand over on B's line or event, which masks A's end.
+      if (placement.variant.volume !== 'answer' && placement.variant.volume !== 'jumpcut' && !dropSwap && !readyAtExit(stats)) return null
     }
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
@@ -2039,7 +2116,11 @@ function planSeveral(
     const duckTerm = (0.02 * (placement.ducked ?? 0)) / (4 * stats.beat)
     // Party wants a switch you can hear: B's event on A's boundary, or the bass changing deck.
     const quiet = party && placement.variant.preset === 'blend' && placement.variant.bassAt === 'none' && !placement.pb.drop && !placement.pb.chorus ? 0.15 : 0
-    const score = -quiet + placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    // B jumping up at the handover after being held thin ("B suddenly gets loud") costs.
+    // (Not on the wordplay cuts, which switch at once by design.)
+    const wordplay = placement.variant.volume === 'answer' || placement.variant.volume === 'jumpcut'
+    const jump = wordplay ? 0 : Math.max(0, handoverJump(placement, b) - 4)
+    const score = -quiet - 0.08 * jump + placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
   // The best `count` judged plans that differ in kind (see `kindOf`); `best` is the last one kept, the bar to beat.

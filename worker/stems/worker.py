@@ -54,6 +54,9 @@ def load_model():
         options.intra_op_num_threads = THREADS
     providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if PROVIDER == 'cuda' else ['CPUExecutionProvider']
     session = ort.InferenceSession(MODEL_PATH, options, providers=providers)
+    if PROVIDER == 'cuda' and 'CUDAExecutionProvider' not in session.get_providers():
+        # Don't fall back to the CPU silently: a GPU worker that isn't one would hold every job far too long.
+        sys.exit(f'CUDA requested but not available (providers: {session.get_providers()}); check the GPU, driver and NVIDIA Container Toolkit')
     shape = session.get_inputs()[0].shape
     segment = shape[2] if isinstance(shape[2], int) else 343980
     return session, segment

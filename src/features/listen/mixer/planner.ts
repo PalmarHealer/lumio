@@ -604,7 +604,7 @@ function walker(curve: readonly Keyframe[], fallback: number) {
   let k = 0
   return (t: number) => {
     if (curve.length === 0) return fallback
-    if (t <= curve[0].t) return curve[0].v
+    if (t < curve[0].t) return curve[0].v
     const last = curve[curve.length - 1]
     if (t >= last.t) return last.v
     while (k + 1 < curve.length && curve[k + 1].t <= t) k++
@@ -1644,7 +1644,9 @@ export function finalizeTransition(transition: Transition, aDuration: number, bD
         min,
         1,
       )
-    return { gain: fix(automation.gain, 0), low: fix(automation.low, 0), mid: fix(automation.mid, 0), high: fix(automation.high, 0), filter: fix(automation.filter, -1) }
+    const base = { gain: fix(automation.gain, 0), low: fix(automation.low, 0), mid: fix(automation.mid, 0), high: fix(automation.high, 0), filter: fix(automation.filter, -1) }
+    // The reverb send, where the transition has one (a reverb out).
+    return Array.isArray(automation.reverb) && automation.reverb.length > 0 ? { ...base, reverb: fix(automation.reverb, 0) } : base
   }
   const effects = (Array.isArray(transition.effects) ? transition.effects : []).filter(
     (e) => length > 0 && Number.isFinite(e.at) && e.at >= 0 && e.at <= length,
@@ -2400,6 +2402,7 @@ function toTransition(
     mid: moveKeys(deck.mid),
     high: moveKeys(deck.high),
     filter: moveKeys(deck.filter),
+    ...(deck.reverb && deck.reverb.length > 0 ? { reverb: moveKeys(deck.reverb) } : {}),
   })
   const length = clock(shape.length)
   const bAt = clock(p.bStart)

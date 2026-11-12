@@ -130,7 +130,8 @@ export function keyframes(points: Point[], length: number, min = 0, max = 1): Ke
 /** The value of an automation curve at `t`: linear between keyframes, held before the first and after the last. */
 export function valueAt(curve: readonly Keyframe[], t: number, fallback: number): number {
   if (curve.length === 0) return fallback
-  if (t <= curve[0].t) return curve[0].v
+  // At a keyframe's time the value after it counts (a step at t is the new value from t on, as the engine plays it).
+  if (t < curve[0].t) return curve[0].v
   const last = curve[curve.length - 1]
   if (t >= last.t) return last.v
   let lo = 0

@@ -92,14 +92,15 @@ export function rateAdvance(curve: readonly Keyframe[], t0: number, t1: number):
   if (t1 <= t0) return 0
   if (curve.length === 0) return t1 - t0
   const at = (t: number) => {
-    if (t <= curve[0].t) return curve[0].v
+    // At a keyframe's time the value after it counts (a step at t is the new value from t on).
+    if (t < curve[0].t) return curve[0].v
     const last = curve[curve.length - 1]
     if (t >= last.t) return last.v
     for (let i = 1; i < curve.length; i++)
-      if (t <= curve[i].t) {
+      if (t < curve[i].t) {
         const p = curve[i - 1]
         const q = curve[i]
-        return q.t === p.t ? q.v : p.v + ((q.v - p.v) * (t - p.t)) / (q.t - p.t)
+        return p.v + ((q.v - p.v) * (t - p.t)) / (q.t - p.t)
       }
     return last.v
   }

@@ -640,7 +640,8 @@ function blend(ctx: PresetContext): PresetShape {
       bBand.push([t, gainB > 0 ? Math.min(1, Math.sin(angle) / gainB) : Math.min(1, ((Math.PI / 2) * middle) / length)])
     }
   }
-  const aGainPoints: Point[] = volume === 'scurve' ? aGain : [[0, 1], ...stepAt(length, 1, 0)]
+  // A's last bands go over its last beat (not cut: the user hears a song stop), B in full by then.
+  const aGainPoints: Point[] = volume === 'scurve' ? aGain : [[0, 1], [Math.max(0, length - ctx.beat), 1], [length, 0]]
   const bGainPoints: Point[] =
     volume === 'scurve'
       ? bGain
@@ -727,7 +728,8 @@ function blend(ctx: PresetContext): PresetShape {
       filter:
         filterOut && filterOut !== 'eq'
           ? [
-              [middle, 0],
+              // A closing low-pass dulls A: at most its last 4 bars, when B already carries the music.
+              [filterOut === 'lp' ? Math.max(middle, length - 16 * ctx.beat) : middle, 0],
               [length, knob(filterOut)],
             ]
           : [],

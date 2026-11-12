@@ -87,6 +87,8 @@ const ASSUMED_VOICE_MID = 0.5
  * intro (Titanium's, 0.23 against its drops) must count too; only near-silent or thin parts stay free.
  */
 const UNPLACED_VOICE_MID = 0.2
+/** For unplaced lyrics, the sections counted as sung lines a clean mix mustn't cut or skip (the voice veto takes 0.2). */
+const ASSUMED_LINE_MID = 0.35
 
 const finite = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x))
@@ -270,6 +272,7 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
   const sections = cleanSections(mix.sections, duration)
   const bandsAt = bandCurves(mix, frameRate)
   let vocals = vocalsKnown ? cleanSpans(mix.vocals, duration) : []
+  let lineSpans = vocals
   if (!vocalsKnown) {
     const pad = 4 * period
     // Lyrics exist but couldn't be placed: someone certainly sings, so thinner mids count too.
@@ -283,10 +286,14 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
       }
       return count > 0 ? sum / count : 0
     }
-    const assumed = sections
-      .filter((s) => midOver(s.start, s.end) >= voiceMid)
-      .map((s) => ({ start: Math.max(0, s.start - pad), end: Math.min(duration, s.end + pad) }))
-    vocals = cleanSpans(assumed, duration)
+    const assumedAt = (level: number) =>
+      cleanSpans(
+        sections.filter((s) => midOver(s.start, s.end) >= level).map((s) => ({ start: Math.max(0, s.start - pad), end: Math.min(duration, s.end + pad) })),
+        duration,
+      )
+    vocals = assumedAt(voiceMid)
+    // Lines not to be cut or skipped (clean): for unplaced lyrics only the clearly vocal sections, not the whole song.
+    lineSpans = mix.vocalSource === 'unplaced' ? assumedAt(ASSUMED_LINE_MID) : vocals
   }
   const vocalsAssumed = !vocalsKnown && vocals.length > 0
 
@@ -324,7 +331,7 @@ function prepareUncached(mix: TrackMix): PreparedTrack | null {
     clarityBetween: clarity(mix, duration, beats.length > 0 ? beats[0] : 0),
     kickClarityBetween: kickClarity(mix, duration, beats.length > 0 ? beats[0] : 0),
     sungSeconds: (from: number, to: number) =>
-      vocalsKnown || vocalsAssumed ? vocals.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
+      vocalsKnown || vocalsAssumed ? lineSpans.reduce((sum, span) => sum + Math.max(0, Math.min(to, span.end) - Math.max(from, span.start)), 0) : 0,
   }
 }
 

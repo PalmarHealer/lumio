@@ -57,10 +57,10 @@ export interface TrackMix {
    */
   barKickClarity: number[]
   /**
-   * Per bar (same index as `downbeats`): how much it repeats the bar before it or the one before that (0–1, the larger
-   * cosine similarity of the two bars' chroma and kick/mid/accent attacks in 16 steps each). Near 1 in a looped 1- or
-   * 2-bar figure (a chant, a sampled hook, a DJ-intro groove); lower where the music develops (a build with a riser,
-   * sung verses). Empty in analyses made before it.
+   * Per bar (same index as `downbeats`): how much it repeats the bar 1, 2 or 4 bars before it (0–1, the largest cosine
+   * similarity of the bars' chroma and kick/mid/accent attacks in 16 steps each). Near 1 in a looped 1-, 2- or 4-bar
+   * figure (a chant, a sampled hook, a DJ-intro groove); lower where the music develops (sung verses). A build whose
+   * riser or filter changes every bar reads low although it may sound repetitive. Empty in analyses made before it.
    */
   barRepeat: number[]
   /**

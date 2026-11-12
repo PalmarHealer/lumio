@@ -76,7 +76,7 @@ const TONAL_HEARD = 0.3
  */
 const ECHO_HEARD = 0.12
 /** Median distance (seconds) between both decks' beats above which a beatmatch is rejected. */
-const MAX_DRIFT = 0.025
+const MAX_DRIFT = 0.015
 /** How far (seconds) aligning both grids may move B: more means the grids disagree where the songs meet. */
 const MAX_PHASE_SHIFT = 0.04
 /** Below this harmonic score the keys clash: both decks' tonal content may overlap for one beat at most. */
@@ -111,13 +111,15 @@ const MIN_VERIFIABLE = 0.4
  */
 const BEAT_HEARD = 0.3
 const KICK_HEARD = BEAT_HEARD
+/** The low-pass knob at which the cutoff is 1.2 kHz (engine mapping): a voice under it is background (party). */
+const LP_BACKGROUND = Math.log(1200 / 22050) / Math.log(22050 / 70)
 /** Clarity at which a beatmatch counts as fully verifiable (below it, a soft cost). */
 const MIN_CLARITY = 0.6
 /**
  * Mean offset (seconds) between the decks' beats allowed in any one bar where both are heard, after the fitted rate and
  * phase: a drift the fit can't take out (the songs' tempos bending differently) is heard as the beats sliding apart.
  */
-const MAX_BAR_OFFSET = 0.01
+const MAX_BAR_OFFSET = 0.02
 /** Mean offset (seconds) between the decks' beats allowed in any two bars of a beatmatched overlap. */
 const MAX_WINDOW_DRIFT = 0.025
 /**
@@ -183,7 +185,10 @@ function wordPairs(a: PreparedTrack, b: PreparedTrack, style: MixStyle): Array<{
       if (shared.length === 0) continue
       const tb = b.downbeats[floorIndex(b.downbeats, lb.time - 0.1)]
       if (tb === undefined || lb.time - tb > 4 * b.period) continue
-      const weight = shared.some((w) => titles.has(w)) ? WORDPLAY_TITLE : WORDPLAY_WORD
+      // A title word (the hook) answers; two shared ordinary words may too; one ordinary word is chance.
+      const title = shared.some((w) => titles.has(w))
+      if (!title && shared.length < 2) continue
+      const weight = title ? WORDPLAY_TITLE : WORDPLAY_WORD
       pairs.push({ pa: { t: ta, bonus: weight, drop: false, chorus: false }, pb: { t: tb, bonus: 0, drop: false, chorus: false }, weight })
     }
   }
@@ -738,7 +743,8 @@ const positionA = (p: Placement, tau: number) => lanePosition(p.laneA, tau)
 const positionB = (p: Placement, tau: number) => (tau < p.bStart - 1e-9 ? null : lanePosition(p.laneB, (tau - p.bStart) * p.rate))
 
 /** Seconds of singing heard over each other, and of each song's singing lost (muffled, cut mid-line, entered mid-line). */
-function vocalCost(p: Placement, a: PreparedTrack, b: PreparedTrack) {
+function vocalCost(p: Placement, a: PreparedTrack, b: PreparedTrack, party = false) {
+  let muffledUnder = 0
   const { stats } = p
   const { dt } = stats
   const length = stats.shape.length
@@ -757,7 +763,11 @@ function vocalCost(p: Placement, a: PreparedTrack, b: PreparedTrack) {
       const bSings = tb !== null && !!spanAt(b.vocals, tb)
       const aHeard = stats.voiceA[i] > VOICE_HEARD
       const bHeard = stats.voiceB[i] > VOICE_HEARD
-      if (bSings && bHeard && ((aSings && aHeard) || (echoed !== null && echoed[i] >= ECHO_HEARD))) clash += dt
+      if (bSings && bHeard && ((aSings && aHeard) || (echoed !== null && echoed[i] >= ECHO_HEARD))) {
+        // Party: B's voice under A's while B is low-passed at 1.2 kHz or less is background, for 4 bars at most.
+        if (party && muffledUnder < 16 * stats.beat && valueAt(stats.shape.b.filter, t, 0) <= LP_BACKGROUND) muffledUnder += dt
+        else clash += dt
+      }
       if (aSings && !aHeard && stats.gainA[i] > 0.05) lostA += dt
       // B's singing under A before its voice comes in (a pre-roll) is a tease, not a line lost.
       if (bSings && !bHeard && t >= stats.bVoice) lostB += dt
@@ -925,14 +935,10 @@ function phaseError(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
   const sorted = offsets.map(Math.abs).sort((x, y) => x - y)
   let worstWindow = 0
   for (const { sum, count } of sums.values()) if (count >= 3) worstWindow = Math.max(worstWindow, Math.abs(sum / count))
-  // Per bar of A (4 beats) where both decks' accents (snares, claps, hats: the sharpest attacks) are heard: the mean
+  // Per bar of A (4 beats) where both decks' beats are heard in any band (the offsets are taken only there): the mean
   // offset, which the fitted rate and phase must keep within MAX_BAR_OFFSET everywhere.
   const bars = new Map<number, { sum: number; count: number }>()
-  const { stats } = p
   times.forEach((t, i) => {
-    const k = Math.round(t / stats.dt)
-    if (k < 0 || k >= stats.loudA.length) return
-    if (Math.max(stats.passA.mid[k], stats.passA.high[k]) < BEAT_HEARD || Math.max(stats.passB.mid[k], stats.passB.high[k]) < BEAT_HEARD) return
     const w = Math.floor(t / (4 * p.stats.beat))
     const entry = bars.get(w) ?? { sum: 0, count: 0 }
     entry.sum += offsets[i]
@@ -1036,6 +1042,42 @@ function callbackFits(p: Placement, a: PreparedTrack) {
   return false
 }
 
+/**
+ * A only goes out and B only comes in: A's gain and bands never rise and its filter never moves back towards open; B's
+ * the other way round (B's gain may dip on the callback's muted bar). A tolerance of 0.1 lets equal-power curves be.
+ */
+function monotonic(shape: PresetShape, callback: boolean) {
+  // `dir`: the way the curve may go (-1 down, 1 up); a step of more than 0.1 the other way breaks it.
+  const never = (curve: Keyframe[], dir: 1 | -1, magnitude = false) => {
+    for (let k = 1; k < curve.length; k++) {
+      const x = magnitude ? Math.abs(curve[k - 1].v) : curve[k - 1].v
+      const y = magnitude ? Math.abs(curve[k].v) : curve[k].v
+      if (-dir * (y - x) > 0.1) return false
+    }
+    return true
+  }
+  const { a, b } = shape
+  const aDown = [a.gain, a.low, a.mid, a.high].every((curve) => never(curve, -1))
+  const aFilter = never(a.filter, 1, true)
+  const bUp = (callback ? [b.low, b.mid, b.high] : [b.gain, b.low, b.mid, b.high]).every((curve) => never(curve, 1))
+  const bFilter = never(b.filter, -1, true)
+  return aDown && aFilter && bUp && bFilter
+}
+
+/**
+ * B is in full (gain, every band, filter open) over the bar before A's last band falls under BEAT_HEARD: B carries the
+ * music when A goes.
+ */
+function readyAtExit(stats: ShapeStats) {
+  const { passA, passB, gainB, dt } = stats
+  let exit = -1
+  for (let i = 0; i < passA.low.length; i++) if (Math.max(passA.low[i], passA.mid[i], passA.high[i]) >= BEAT_HEARD) exit = i
+  if (exit < 0) return true
+  const from = Math.max(0, exit - Math.round((4 * stats.beat) / Math.max(dt, 1e-6)))
+  for (let i = from; i <= exit; i++) if (gainB[i] < 0.98 || Math.min(passB.low[i], passB.mid[i], passB.high[i]) < 0.9) return false
+  return true
+}
+
 /** A song's accent spread (seconds); 0 when unknown. */
 function spreadOf(mix: TrackMix) {
   const value: unknown = mix.accentSpread
@@ -1048,8 +1090,8 @@ function spreadOf(mix: TrackMix) {
  */
 const GROOVE_SPREAD = 0.02
 
-/** A bar repeats the one or two before it (barRepeat) from here: a looped figure. */
-const REPEATED_BAR = 0.75
+/** A bar repeats the one, two or four before it (barRepeat) from here; 40 % such bars in A's overlap sound looped. */
+const REPEATED_BAR = 0.8
 
 /** The share of a track's bars in [from, to] that repeat the bar or two before them; 0 without the measure or bars. */
 function repeatedShare(track: PreparedTrack, from: number, to: number) {
@@ -1110,8 +1152,9 @@ function audibleClarity(p: Placement, a: PreparedTrack, b: PreparedTrack) {
 function riskAt(stats: ShapeStats, i: number, a: PreparedTrack, b: PreparedTrack, atA: number, atB: number) {
   const accA = Math.max(stats.passA.mid[i], stats.passA.high[i]) >= BEAT_HEARD
   const accB = Math.max(stats.passB.mid[i], stats.passB.high[i]) >= BEAT_HEARD
-  const cA = accA ? a.clarityBetween(atA, atA + 0.01) : 1
-  const cB = accB ? b.clarityBetween(atB, atB + 0.01) : 1
+  // Snares, claps and hats flam against the other deck's (both heard); a deck left with its kick alone doesn't.
+  const cA = accA && accB ? a.clarityBetween(atA, atA + 0.01) : 1
+  const cB = accA && accB ? b.clarityBetween(atB, atB + 0.01) : 1
   let kick = 1
   if (stats.passA.low[i] >= KICK_HEARD && stats.passB.low[i] >= KICK_HEARD) kick = Math.min(a.kickClarityBetween(atA, atA + 0.01), b.kickClarityBetween(atB, atB + 0.01))
   return { value: Math.min(cA, cB, kick), riskyA: cA < MIN_VERIFIABLE, riskyB: cB < MIN_VERIFIABLE, kickRisk: kick < MIN_VERIFIABLE, cA, cB }
@@ -1142,7 +1185,7 @@ const DUCK = 0.15
  * How many candidates get the sampled checks before the best found so far is taken (measured on 25 songs: the best is
  * found within the first 60 for 90 % of pairs; a few with many long blends failing their gates take thousands).
  */
-const JUDGE_BUDGET = 400
+const JUDGE_BUDGET = 1500
 
 /** At most this many bars of a blend may be ducked (more is no longer the blend it was meant to be). */
 const MAX_DUCK_BARS = 4
@@ -1183,16 +1226,15 @@ function duckRisky(p: Placement, a: PreparedTrack, b: PreparedTrack): Placement 
     const risk = riskAt(stats, i, a, b, atA, atB)
     if (risk.kickRisk) return null
     if (!risk.riskyA && !risk.riskyB) continue
-    // The risky deck's accents go down; its kick alone is then all it lets be heard (checked against the other's).
-    for (const list of [risk.riskyA ? runs.a : null, risk.riskyB ? runs.b : null]) {
-      if (!list) continue
-      const last = list[list.length - 1]
-      if (last && t - last[1] <= 2 * dt) last[1] = t + dt
-      else list.push([t, t + dt])
-    }
+    // A's accents go down (A is leaving anyway): then no accents of both decks are heard together there.
+    const last = runs.a[runs.a.length - 1]
+    if (last && t - last[1] <= 2 * dt) last[1] = t + dt
+    else runs.a.push([t, t + dt])
     total += dt
   }
   if (total === 0 || total > MAX_DUCK_BARS * 4 * stats.beat) return null
+  // Monotonic: once ducked, A's accents stay down to its end (a deck never comes back up after going out).
+  if (runs.a.length > 0) runs.a = [[runs.a[0][0], length]]
   const margin = 0.03
   const duck = (curve: Keyframe[], spans: Array<[number, number]>) => {
     if (spans.length === 0) return curve
@@ -1200,7 +1242,8 @@ function duckRisky(p: Placement, a: PreparedTrack, b: PreparedTrack): Placement 
       let f = 1
       for (const [from, to] of spans) {
         const start = from - margin
-        const end = to + margin
+        // A span reaching the shape's end stays down (no ramp back up after it).
+        const end = to >= length - 1e-6 ? Infinity : to + margin
         if (t >= start && t <= end) f = Math.min(f, DUCK)
         else if (t > start - RAMP && t < start) f = Math.min(f, 1 - ((1 - DUCK) * (t - (start - RAMP))) / RAMP)
         else if (t > end && t < end + RAMP) f = Math.min(f, DUCK + ((1 - DUCK) * (t - end)) / RAMP)
@@ -1208,7 +1251,10 @@ function duckRisky(p: Placement, a: PreparedTrack, b: PreparedTrack): Placement 
       return f
     }
     const times = curve.map((k) => k.t)
-    for (const [from, to] of spans) times.push(Math.max(0, from - margin - RAMP), Math.max(0, from - margin), to + margin, to + margin + RAMP)
+    for (const [from, to] of spans) {
+      times.push(Math.max(0, from - margin - RAMP), Math.max(0, from - margin))
+      if (to < length - 1e-6) times.push(to + margin, to + margin + RAMP)
+    }
     const points = [
       ...curve.map((k, n) => ({ t: k.t, v: k.v * factor(k.t), n })),
       ...times.slice(curve.length).map((t) => ({ t, v: valueAt(curve, t, 1) * factor(t), n: Infinity })),
@@ -1872,12 +1918,18 @@ export function planTransition(
         else if (placement.variant.bars <= 4) energyTerm += 0.04 * (1 - energy.busy)
       }
     }
-    const { clash: voices, lostA, lostB } = vocalCost(placement, a, b)
+    const { clash: voices, lostA, lostB } = vocalCost(placement, a, b, party)
     // The short S-curve may let one voice end as the other starts (a quarter second at most, about where two voices are
     // heard as two); otherwise never voice over voice.
     if (voices > (placement.variant.volume === 'scurve' ? Math.min(0.25, stats.beat / 2) : 0.1)) return null
     // Clean never cuts A's lines: muffling one under a filter or EQ (no longer intelligible) counts as cutting it.
     if (!party && trustA * lostA > 0.5) return null
+    if (placement.variant.preset === 'blend') {
+      // A only ever goes out and B only ever comes in (the user: "why is A brought back?"); B is in full before A's last
+      // band goes ("B isn't ready to take over"), except on the wordplay cut, where B's answer masks A's end.
+      if (!monotonic(stats.shape, placement.variant.callback === true)) return null
+      if (placement.variant.volume !== 'answer' && !readyAtExit(stats)) return null
+    }
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
     // against A's beats. Judged two bars at a time too.
@@ -1904,11 +1956,13 @@ export function planTransition(
     // A parked on a looped 1–2-bar figure (a chant, a sampled hook) for most of a long overlap sounds sampled ("you're
     // basically sampling it"): the longer, the more it costs; a short A tail with B carrying the time doesn't.
     const parked = repeatedShare(a, positionA(placement, placement.bStart), positionA(placement, stats.aGone))
-    const repeatTerm = parked >= 0.75 ? 0.3 * Math.min(1, Math.max(0, stats.aGone - placement.bStart - 8 * stats.beat) / (24 * stats.beat)) : 0
+    const repeatTerm = parked >= 0.4 ? 0.3 * Math.min(1, Math.max(0, stats.aGone - placement.bStart - 8 * stats.beat) / (24 * stats.beat)) : 0
     const finish = placement.variant.preset === 'blend' ? placement.variant.prior - start.variant.prior - BEST_FINISH : 0
     const clarityTerm = Number.isNaN(placement.clarity) ? 0.1 : 0.3 * Math.max(0, 1 - placement.clarity / MIN_CLARITY)
     const duckTerm = (0.02 * (placement.ducked ?? 0)) / (4 * stats.beat)
-    const score = placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
+    // Party wants a switch you can hear: B's event on A's boundary, or the bass changing deck.
+    const quiet = party && placement.variant.preset === 'blend' && placement.variant.bassAt === 'none' && !placement.pb.drop && !placement.pb.chorus ? 0.15 : 0
+    const score = -quiet + placement.bound + finish - tonalTerm - energyTerm - swingTerm - grooveTerm - repeatTerm - duckTerm - clarityTerm - lostWeight * (trustA * Math.min(8, lostA) + trustB * Math.min(8, lostB)) - drift.median
     return { placement, score }
   }
   let best: { placement: Placement; score: number } | null = null

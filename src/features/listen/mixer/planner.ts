@@ -101,6 +101,8 @@ const MAX_OVER_DB = 1.8
  */
 const MAX_OVER_DB_OVERLAP = 3
 const HOLE_DB = -6
+/** Both decks together this far below the louder song's loud level: near silence (a hole a fade must not leave). */
+const DEEP_HOLE_DB = -15
 /**
  * Swing (where the off-beat 16ths fall) further apart than this: a swung and a straight groove flam wherever both are
  * loud, so such a pair hands over with little both-loud time (a bass swap handover, the short S-curve). Not lower: the
@@ -446,7 +448,8 @@ function variantsFor(style: MixStyle, synced: boolean, maxBars: number, forced?:
         filterIn: 'hp',
         filterOut: 'hp',
         meet: 'shape',
-        prior: prior + layout.prior + BLEND_FIRST,
+        // Clean prefers B fading in (the user's pick among Titanium → Animals' variants) where all else is equal.
+        prior: prior + layout.prior + BLEND_FIRST + (style === 'clean' && layout.volume === 'fade' ? 0.03 : 0),
       })
     }
   }
@@ -827,7 +830,9 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   let samples = 0
   let basses = 0
   let busy = 0
-  if (length <= 0 || dt <= 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0 }
+  let hole = 0
+  let run = 0
+  if (length <= 0 || dt <= 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0, hole: 0 }
   const { passA, passB } = stats
   // Two basslines, at every sample (the moments around a swap matter): checked first, it rejects.
   for (let i = 0; i < stats.gainA.length; i++) {
@@ -837,7 +842,7 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     if (atB === null) continue
     if (passA.low[i] * a.bandsAt(positionA(p, t)).low > 0.5 && passB.low[i] * b.bandsAt(atB).low > 0.5) basses += dt
   }
-  if (basses > 0) return { over: -Infinity, mean: 0, basses, busy: 0 }
+  if (basses > 0) return { over: -Infinity, mean: 0, basses, busy: 0, hole: 0 }
   const step = Math.max(1, Math.round(0.1 / dt))
   for (let i = 0; i < stats.gainA.length; i += step) {
     const t = i * dt
@@ -859,11 +864,16 @@ function overlapEnergy(p: Placement, a: PreparedTrack, b: PreparedTrack) {
     over.push(worst)
     total += sum / 3
     samples++
+    // A stretch where both together sit far below the louder song's loud level: a hole.
+    if (10 * Math.log10(Math.max(sum / 3, 1e-9)) < DEEP_HOLE_DB) {
+      run += step * dt
+      hole = Math.max(hole, run)
+    } else run = 0
     busy += Math.min(1, (eA.mid + eA.high + eB.mid + eB.high) / 4)
   }
-  if (samples === 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0 }
+  if (samples === 0) return { over: -Infinity, mean: 0, basses: 0, busy: 0, hole: 0 }
   over.sort((x, y) => x - y)
-  return { over: over[Math.floor(over.length * 0.95)], mean: 10 * Math.log10(Math.max(total / samples, 1e-9)), basses, busy: busy / samples }
+  return { over: over[Math.floor(over.length * 0.95)], mean: 10 * Math.log10(Math.max(total / samples, 1e-9)), basses, busy: busy / samples, hole }
 }
 
 /** A song's absolute level over a stretch (amplitude, its loudness × the stretch's energy against its mean). */
@@ -1088,7 +1098,18 @@ function alignPhase(p: Placement, a: PreparedTrack, b: PreparedTrack, multiple: 
   // The grid sits on a song's attacks overall; its kick and its claps/snares may lie a little behind it, each by its own
   // amount. B moves so the kicks' lag and the accents' lag between the decks are as small as they can be together
   // (least squares): the accents always, the kicks 2:1 for the share of the time both basses sound.
-  const kickWeight = 2 * p.stats.kicksTogether
+  // Where both decks' accents are heard most of the overlap, the accents decide (snares flaming are what's heard; the
+  // kicks only count for the time both lows sound and the accents don't).
+  const { stats } = p
+  let accentsBoth = 0
+  let heardBoth = 0
+  for (let i = 0; i < stats.loudA.length; i++) {
+    if (!stats.loudA[i] || !stats.loudB[i]) continue
+    heardBoth++
+    if (Math.max(stats.passA.mid[i], stats.passA.high[i]) >= BEAT_HEARD && Math.max(stats.passB.mid[i], stats.passB.high[i]) >= BEAT_HEARD) accentsBoth++
+  }
+  const accentShare = heardBoth > 0 ? accentsBoth / heardBoth : 1
+  const kickWeight = 2 * stats.kicksTogether * (1 - accentShare)
   const kicks = offsetOf(b.mix, 'kickOffset') - offsetOf(a.mix, 'kickOffset')
   const accents = offsetOf(b.mix, 'accentOffset') - offsetOf(a.mix, 'accentOffset')
   const shift = (kickWeight * kicks + accents) / (kickWeight + 1)
@@ -1998,7 +2019,9 @@ function planSeveral(
     // at its boundary, not inside a line, and the energy holds or rises.
     // (A cut inside a line only on a real drop, which masks it: the user's favourite Judas → Cannibal is one.)
     const cutsLine = !!spanAt(a.vocals, positionA(placement, placement.stats.shape.length) - 0.05)
-    if (dropSwap && ((!placement.pb.drop && !placement.pb.chorus) || (cutsLine && !placement.pb.drop) || handoverDrop(placement, a, b) > 0.5)) return null
+    // ... and it rises by 5 dB at most (the user's favourite Judas → Cannibal: +3.2; a ballad's chorus isn't a drop).
+    const dropRise = dropSwap ? handoverDrop(placement, a, b) : 0
+    if (dropSwap && ((!placement.pb.drop && !placement.pb.chorus) || (cutsLine && !placement.pb.drop) || dropRise > 0.5 || dropRise < -5)) return null
     if (dropSwap && opts.avoid?.includes('dropSwap')) return null
     if (placement.variant.callback && opts.avoid?.includes('callback')) return null
     if ((placement.variant.volume === 'answer' || placement.variant.volume === 'jumpcut') && opts.avoid?.includes('wordplay')) return null
@@ -2067,6 +2090,9 @@ function planSeveral(
       const energy = overlapEnergy(placement, a, b)
       const full = placement.variant.volume === 'overlap' || placement.variant.volume === 'mashup'
       if (energy.over > (full ? MAX_OVER_DB_OVERLAP : MAX_OVER_DB) || energy.basses > 0) return null
+      // A fade or echo that leaves a near-silent stretch longer than a bar (the user's ears: "the song stops") is out;
+      // in a blend a hole only costs (the user liked Titanium → Animals with one).
+      if (placement.variant.preset !== 'blend' && energy.hole > 4 * stats.beat) return null
       if (placement.variant.preset === 'blend') {
         energyTerm = 0.05 * Math.max(0, HOLE_DB - energy.mean)
         // Busy parts (mids and highs up) take a filter, thin ones blend open; long blends suit thin parts, the short
@@ -2084,13 +2110,13 @@ function planSeveral(
     if (voices > (placement.variant.volume === 'scurve' ? Math.min(0.25, stats.beat / 2) : 0.1)) return null
     // Clean never cuts A's lines: muffling one under a filter or EQ (no longer intelligible) counts as cutting it.
     if (!party && trustA * lostA > 0.5) return null
+    // Any transition that falls off a cliff after A is gone (an EDM drop into a piano ballad) is out, the fallbacks too:
+    // B is entered elsewhere, or another kind takes it (or none).
+    if (stats.shape.length > 0 && handoverDrop(placement, a, b) > (party ? 1.5 : 3) + 6) return null
     if (placement.variant.preset === 'blend') {
       // A only ever goes out and B only ever comes in (the user: "why is A brought back?"); B is in full before A's last
       // band goes ("B isn't ready to take over"), except on the wordplay cut, where B's answer masks A's end.
       if (!monotonic(stats.shape, placement.variant.callback === true)) return null
-      // A blend that falls off a cliff after A is gone (an EDM drop into a piano ballad) isn't one: an echo or a fade
-      // takes it (or none).
-      if (handoverDrop(placement, a, b) > (party ? 1.5 : 3) + 6) return null
       // The wordplay cuts and the drop swap hand over on B's line or event, which masks A's end.
       if (placement.variant.volume !== 'answer' && placement.variant.volume !== 'jumpcut' && !dropSwap && !readyAtExit(stats)) return null
     }

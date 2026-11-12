@@ -52,6 +52,8 @@ interface Features {
   /** The harmonic profile (mean of `phraseChroma`) of the last two phrases and of the first two, or null. */
   chromaOut: number[] | null
   chromaIn: number[] | null
+  /** Spectral tilt: highs against lows (dB, from bandLoudness; NaN when unknown), part of a song's timbre. */
+  tilt: number
 }
 
 /** The mean harmonic profile of the phrases playing at the given moments (null without chroma). */
@@ -114,6 +116,7 @@ function features(track: PreparedTrack): Features {
     clearIn: clearRun(track, 0, track.duration * 0.45),
     chromaOut: meanChroma(track, track.phrases.filter((t) => t < track.end).slice(-2)),
     chromaIn: meanChroma(track, track.phrases.slice(0, 2)),
+    tilt: track.mix.bandLoudness && Number.isFinite(track.mix.bandLoudness.high) && Number.isFinite(track.mix.bandLoudness.low) ? track.mix.bandLoudness.high - track.mix.bandLoudness.low : NaN,
   }
 }
 
@@ -160,6 +163,16 @@ function blendable(a: Features, b: Features) {
   return sure && diff <= 0.06 && a.clearOut >= 4 && b.clearIn >= 4
 }
 
+/**
+ * 0–1: how alike the two songs are in kind (a DJ keeps a set's vibe: rap → piano ballad → indie rock isn't a path):
+ * intensity (loudness, tempo, drops, density) and timbre (spectral tilt), tempo cluster aside (tempoScore has it).
+ */
+function vibeScore(a: Features, b: Features) {
+  const intensity = Math.abs(a.intensity - b.intensity)
+  const tilt = Number.isFinite(a.tilt) && Number.isFinite(b.tilt) ? Math.abs(a.tilt - b.tilt) / 12 : 0.3
+  return 1 - clamp(1.6 * intensity + 0.5 * tilt)
+}
+
 function scoreFeatures(a: Features, b: Features, style: MixStyle, useRank: boolean) {
   const harmony = harmonicScore(a.track, b.track)
   const tempo = tempoScore(a.track, b.track, style)
@@ -171,7 +184,8 @@ function scoreFeatures(a: Features, b: Features, style: MixStyle, useRank: boole
   // A pair that can blend outweighs one that only fits on paper (a key-perfect pair that ends in an echo out); between
   // clashing keys a blend has to swap its tonal content quickly, worth half.
   const blend = blendable(a, b) ? (harmony < 0.5 ? 0.5 : 1) : 0
-  return 0.45 * blend + 0.45 * rest + 0.1 * melody
+  // The songs' kind weighs as much as a blend: a set holds its vibe (ballads go to the end or a breather).
+  return 0.3 * blend + 0.3 * rest + 0.1 * melody + 0.3 * vibeScore(a, b)
 }
 
 /**

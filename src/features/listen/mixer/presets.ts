@@ -348,11 +348,16 @@ function fadeOut(ctx: PresetContext): PresetShape {
     preset: 'fadeOut',
     length,
     // A low-pass closes on A as it fades (its kick and hats go first), so where B comes in only A's body is left.
+    // A's low goes over the bar before B's comes in (one bassline; a low-pass alone keeps it).
     a: automation(length, {
       gain: powerFade(0, length, true),
       filter: [
         [0, 0],
         [length, -0.7],
+      ],
+      low: [
+        [Math.max(0, enter - 4 * ctx.beat), 1],
+        [enter, 0],
       ],
     }),
     b: automation(length, { gain: [[0, 0], ...powerFade(enter, length, false, 4)], low: [[enter, 0], [length, 1]] }),
@@ -398,10 +403,8 @@ function echoOut(ctx: PresetContext): PresetShape {
         [meet, 0.35],
         [length, 0.6],
       ],
-      low: [
-        [0, 1],
-        [meet, 0.2],
-      ],
+      // A's low goes on the meet, so neither A nor its echoes carry a bassline under B's.
+      low: [[0, 1], ...stepAt(meet, 1, 0)],
     }),
     b: automation(length, { gain: [[0, 0], ...stepFrom(meet, 0, 1)], low: [[0, 0], ...stepFrom(meet, 0, 1)] }),
     effects: [{ kind: 'echo', deck: 'a', at: 0, beats, feedback }],

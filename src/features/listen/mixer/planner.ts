@@ -2442,6 +2442,35 @@ function toTransition(
   )
 }
 
+/** The transition begun `pad` seconds earlier: A plays on for that long before (at its first rate), everything else later. */
+function padStart(tr: Transition, pad: number): Transition {
+  const later = (list: Keyframe[]) => list.map((k) => ({ ...k, t: k.t + pad }))
+  const deck = (d: DeckAutomation): DeckAutomation => ({
+    gain: later(d.gain),
+    low: later(d.low),
+    mid: later(d.mid),
+    high: later(d.high),
+    filter: later(d.filter),
+    ...(d.reverb && d.reverb.length > 0 ? { reverb: later(d.reverb) } : {}),
+  })
+  const rateA0 = tr.rateA.length > 0 ? tr.rateA[0].v : 1
+  const aOut = tr.aOut - pad * rateA0
+  if (aOut < 0) return tr
+  const pathA = tr.pathA.length > 0 ? [{ from: aOut, to: tr.aOut, repeat: 1 }, ...tr.pathA] : []
+  return {
+    ...tr,
+    aOut,
+    pathA,
+    bAt: tr.bAt + pad,
+    length: tr.length + pad,
+    rateA: tr.rateA.length > 0 ? [{ t: 0, v: rateA0 }, ...later(tr.rateA)] : [],
+    rateB: later(tr.rateB),
+    a: deck(tr.a),
+    b: deck(tr.b),
+    effects: tr.effects.map((e) => ({ ...e, at: e.at + pad })),
+  }
+}
+
 /** How far before the attack a loop jumps (its stretch moved earlier by this, its length kept). */
 const JOIN_LEAD = 0.02
 /** How far before its first attack B starts playing (and fading in), when it would start on or just after one. */
@@ -2453,7 +2482,17 @@ const START_LEAD = 0.04
  * start on or just after one of its beats, starts START_LEAD before that beat, its fade-in and EQ start moved along
  * (its bass stays where it meets A's).
  */
-function leadIns(tr: Transition, b: PreparedTrack): Transition {
+function leadIns(original: Transition, b: PreparedTrack): Transition {
+  // B must never start after its beat: when it would and the transition starts too late to begin B earlier (B right
+  // at its start, no glide before it), the transition begins earlier, A playing on for that much more before.
+  let tr = original
+  if (tr.length > 0) {
+    const i = floorIndex(b.beats, tr.bIn + 0.1)
+    const beat = i >= 0 ? b.beats[i] : NaN
+    const shift = tr.bIn - (beat - START_LEAD)
+    const rate = tr.rateB.length > 0 ? tr.rateB[0].v : 1
+    if (Number.isFinite(beat) && shift > 0 && shift <= 0.1 + START_LEAD && tr.bIn - shift >= 0 && tr.bAt - shift / rate < 0) tr = padStart(tr, shift / rate - tr.bAt + 0.001)
+  }
   const lead = (path: DeckSegment[]): DeckSegment[] => {
     if (!path.some((segment) => segment.repeat > 1)) return path
     const out: DeckSegment[] = []

@@ -3,6 +3,7 @@ import { createReadStream } from 'node:fs'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { lookup } from 'node:dns/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { gzipSync } from 'node:zlib'
 import { isIP, type Socket } from 'node:net'
 import { Readable } from 'node:stream'
 import { extname, join, normalize, resolve, sep } from 'node:path'
@@ -11,7 +12,7 @@ import { isPrivateAddress } from './addresses.ts'
 import { latestApps } from './apps.ts'
 import { creditsOfRecording, lookupCredits, sameName, searchRecordings, type Failure, type JobState, type TrackCredits, type TrackMeta } from './credits.ts'
 import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, type Privacy } from './store.ts'
-import { tasteSignals, type TasteSignals } from './taste.ts'
+import { tasteSittings, tasteSignals, type TasteSignals, type TasteSittings } from './taste.ts'
 import { SOUND_VERSION } from './sound-analysis.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
@@ -224,6 +225,8 @@ function tokenOf(request: IncomingMessage, url: URL) {
 const streams = new Map<string, Set<ServerResponse>>()
 /** The taste signals last made per person and time zone (see GET /me/taste). */
 const tasteCache = new Map<string, TasteSignals>()
+/** The sittings last made per person (see GET /me/taste/sittings). */
+const sittingsCache = new Map<string, TasteSittings>()
 
 function push(userId: string, event: string, data: unknown) {
   for (const response of streams.get(userId) ?? []) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
@@ -238,9 +241,23 @@ function announceActivity(userId: string) {
 
 // ---- responses ----
 
+/** Answers bigger than this go out gzipped, to clients that take it (the taste signals are a megabyte as text). */
+const GZIP_FROM = 16 * 1024
+
 function send(response: ServerResponse, status: number, body?: unknown) {
-  response.writeHead(status, body === undefined ? {} : { 'Content-Type': 'application/json' })
-  response.end(body === undefined ? undefined : JSON.stringify(body))
+  if (body === undefined) {
+    response.writeHead(status, {})
+    response.end()
+    return
+  }
+  const text = JSON.stringify(body)
+  if (text.length >= GZIP_FROM && /\bgzip\b/.test(String(response.req?.headers['accept-encoding'] ?? ''))) {
+    response.writeHead(status, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding' })
+    response.end(gzipSync(text))
+    return
+  }
+  response.writeHead(status, { 'Content-Type': 'application/json' })
+  response.end(text)
 }
 
 async function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
@@ -1656,6 +1673,16 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     const signals = tasteSignals(store, me.id, timeZone)
     tasteCache.set(key, signals)
     return send(response, 200, signals)
+  }
+
+  // GET /me/taste/sittings: the songs heard together in each sitting of the last half year (for the Daily Mixes). Made
+  // at most every hour: half a year of sittings hardly changes in one.
+  if (path === '/me/taste/sittings' && request.method === 'GET') {
+    const cached = sittingsCache.get(me.id)
+    if (cached && Date.now() - cached.at < 60 * 60_000) return send(response, 200, cached)
+    const sittings = tasteSittings(store, me.id)
+    sittingsCache.set(me.id, sittings)
+    return send(response, 200, sittings)
   }
 
   // GET /music/sound: every measured song's sound (an array: bpm, pulse, key, minor 0/1, key clarity, loudness,

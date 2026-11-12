@@ -3,9 +3,8 @@ import { partsIn } from './wrapped.ts'
 
 /**
  * Someone's listening, boiled down per song for the mixes the app builds (daylist, daily mixes, radios): how much they
- * play it now and over the long run, how often they skip it, and at which times of the day and week; and which songs
- * they hear in one sitting. Lumio's own plays and imported ones (Spotify) count alike; only songs in the library (a
- * Jellyfin id) are kept.
+ * play it now and over the long run, how often they skip it, and at which times of the day and week. Lumio's own plays
+ * and imported ones (Spotify) count alike; only songs in the library (a Jellyfin id) are kept.
  */
 export interface TasteSignals {
   /** When the numbers were made (the decays are relative to it). */
@@ -18,11 +17,17 @@ export interface TasteSignals {
    * half-life of a week, and the last time (ms). For the home grid's "heavy rotation".
    */
   sources: Record<string, { w: number; t: number }>
-  /**
-   * What was heard in one sitting over the last half year (a pause of half an hour starts a new one): each sitting's
-   * distinct songs, as places in `keys`. Artists heard together belong together (the Daily Mixes group by it).
-   */
-  sessions: { keys: string[]; lists: number[][] }
+}
+
+/**
+ * What was heard in one sitting over the last half year (a pause of half an hour starts a new one): each sitting's
+ * distinct songs, as places in `keys`. Artists heard together belong together (the Daily Mixes group by it). Apart from
+ * the signals: only the mixes need it, it barely changes from one hour to the next, and it is a sixth of their size.
+ */
+export interface TasteSittings {
+  at: number
+  keys: string[]
+  lists: number[][]
 }
 
 export interface TrackSignals {
@@ -77,24 +82,8 @@ const JELLYFIN_ID = /^[0-9a-f]{32}$/i
 
 export function tasteSignals(store: Store, userId: string, timeZone: string, now = Date.now()): TasteSignals {
   const tracks: Record<string, TrackSignals> = {}
-  const keys = new Map<string, number>()
-  const lists: number[][] = []
-  let sitting = new Set<number>()
-  let sittingEnd = 0
-  const closeSitting = () => {
-    if (sitting.size >= 2) lists.push([...sitting])
-    sitting = new Set()
-  }
   for (const play of store.tasteRows(userId, now - HORIZON)) {
     if (!JELLYFIN_ID.test(play.key)) continue
-    if (play.startedAt >= now - SESSION_HORIZON) {
-      if (play.startedAt - sittingEnd > SESSION_GAP) closeSitting()
-      sittingEnd = Math.max(sittingEnd, play.startedAt + play.seconds * 1000)
-      if (play.seconds >= 30 && sitting.size < SESSION_MAX) {
-        if (!keys.has(play.key)) keys.set(play.key, keys.size)
-        sitting.add(keys.get(play.key)!)
-      }
-    }
     const entry = (tracks[play.key] ??= { p: 0, m: 0, s: 0, l: 0, k: 0, t: 0, d: new Array(12).fill(0) })
     entry.t = Math.max(entry.t, play.startedAt)
     // A skip is leaving a song early for another one; stopping the music (closing the app) says nothing about it.
@@ -132,6 +121,26 @@ export function tasteSignals(store: Store, userId: string, timeZone: string, now
     entry.t = Math.max(entry.t, play.startedAt)
   }
   for (const entry of Object.values(sources)) entry.w = round(entry.w)
-  closeSitting()
-  return { at: now, timeZone, tracks, sources, sessions: { keys: [...keys.keys()], lists } }
+  return { at: now, timeZone, tracks, sources }
+}
+
+export function tasteSittings(store: Store, userId: string, now = Date.now()): TasteSittings {
+  const keys = new Map<string, number>()
+  const lists: number[][] = []
+  let sitting = new Set<number>()
+  let sittingEnd = 0
+  const close = () => {
+    if (sitting.size >= 2) lists.push([...sitting])
+    sitting = new Set()
+  }
+  for (const play of store.tasteRows(userId, now - SESSION_HORIZON)) {
+    if (!JELLYFIN_ID.test(play.key)) continue
+    if (play.startedAt - sittingEnd > SESSION_GAP) close()
+    sittingEnd = Math.max(sittingEnd, play.startedAt + play.seconds * 1000)
+    if (play.seconds < 30 || sitting.size >= SESSION_MAX) continue
+    if (!keys.has(play.key)) keys.set(play.key, keys.size)
+    sitting.add(keys.get(play.key)!)
+  }
+  close()
+  return { at: now, keys: [...keys.keys()], lists }
 }

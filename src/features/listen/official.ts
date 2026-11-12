@@ -11,7 +11,7 @@ import { useLumioFetch } from '@/features/social/social'
 import { fetchSound } from './sound'
 import { useRadioPlaylist } from './radio'
 import { useTasteFilter } from './taste'
-import { buildTasteModel, fetchTasteSignals, slotOf, type TasteModel } from './taste-model'
+import { buildTasteModel, fetchTasteSignals, fetchTasteSittings, slotOf, type TasteModel } from './taste-model'
 
 /**
  * Official playlists: made by the platform (shown under the instance's name and logo, like Spotify's own playlists),
@@ -117,7 +117,7 @@ export function useOfficialPlaylists() {
     enabled: views.length > 0 && taste.ready,
     staleTime: 30 * 60_000,
     queryFn: async (): Promise<OfficialPlaylist[]> => {
-      const [lists, signals, sound] = await Promise.all([
+      const [lists, signals, sound, sittings] = await Promise.all([
         Promise.all(
           views.map(
             async (view) =>
@@ -135,14 +135,15 @@ export function useOfficialPlaylists() {
         ),
         fetchTasteSignals(queryClient, session.userId, get),
         fetchSound(queryClient, get),
+        fetchTasteSittings(queryClient, session.userId, get),
       ])
       const tracks = lists.flat()
       const now = Date.now()
       const t = messagesFor(officialMessages)
       // Last.fm's similar artists to the listener's favourites point the discoveries outward (a failure: without).
-      const first = buildTasteModel(tracks, signals, taste.counts, now)
+      const first = buildTasteModel(tracks, signals, taste.counts, now, undefined, sittings)
       const similar = await similarToFavourites(tracks, first).catch(() => new Set<string>())
-      const model = similar.size ? buildTasteModel(tracks, signals, taste.counts, now, similar) : first
+      const model = similar.size ? buildTasteModel(tracks, signals, taste.counts, now, similar, sittings) : first
       const mixes = await madeForYou({ tracks, model, now, userId: session.userId }, sound, seeded)
       const playlists = buildPlaylists(tracks, t, taste.counts)
       // The charts come from Last.fm; a failure just leaves them out.

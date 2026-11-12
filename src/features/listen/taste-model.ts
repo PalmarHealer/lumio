@@ -36,8 +36,12 @@ export interface TasteSignals {
   tracks: Record<string, TrackSignals>
   /** What was played from lately (source keys): minutes, fading with a half-life of a week, and the last time. */
   sources?: Record<string, { w: number; t: number }>
-  /** Each sitting's distinct songs over the last half year, as places in `keys` (missing from an older server). */
-  sessions?: { keys: string[]; lists: number[][] }
+}
+
+/** Each sitting's distinct songs over the last half year, as places in `keys` (GET /me/taste/sittings). */
+export interface TasteSittings {
+  keys: string[]
+  lists: number[][]
 }
 
 const HOUR = 60 * 60_000
@@ -68,6 +72,24 @@ export function tasteSignalsQuery(userId: string, get: LumioGet = lumioGet) {
 
 export function fetchTasteSignals(queryClient: QueryClient, userId: string, get?: LumioGet) {
   return queryClient.fetchQuery(tasteSignalsQuery(userId, get)).catch(() => null)
+}
+
+/**
+ * The sittings, for the mixes only: fresh for hours (half a year of them hardly changes), and not asked for with every
+ * look at the signals. Null without them (an older server).
+ */
+export function fetchTasteSittings(queryClient: QueryClient, userId: string, get: LumioGet = lumioGet) {
+  return queryClient
+    .fetchQuery({
+      queryKey: ['taste-sittings', userId],
+      staleTime: 6 * 60 * 60_000,
+      queryFn: async (): Promise<TasteSittings | null> => {
+        const response = await get('/me/taste/sittings').catch(() => undefined)
+        if (response === null) throw new Error('Not connected')
+        return response?.ok ? ((await response.json()) as TasteSittings) : null
+      },
+    })
+    .catch(() => null)
 }
 
 /** The parts of the day (as the server counts them): early morning, morning, afternoon, evening, night, late night. */
@@ -145,6 +167,7 @@ export function buildTasteModel(
   counts: (track: BaseItemDto) => boolean,
   now: number,
   similar: ReadonlySet<string> = new Set(),
+  sittingsData: TasteSittings | null = null,
 ): TasteModel {
   const entries = new Map<string, { long: number; short: number; month: number; last: number; skip: number; fav: boolean; counts: boolean; known: boolean }>()
   for (const track of tracks) {
@@ -252,8 +275,8 @@ export function buildTasteModel(
     if (sittings) return sittings
     const count = new Map<string, number>()
     const pairs = new Map<string, number>()
-    const keys = signals?.sessions?.keys ?? []
-    for (const list of signals?.sessions?.lists ?? []) {
+    const keys = sittingsData?.keys ?? []
+    for (const list of sittingsData?.lists ?? []) {
       const artists = [...new Set(list.flatMap((at) => artistsByTrack.get(keys[at] ?? '') ?? []))]
       if (artists.length < 2) continue
       for (const artist of artists) add(count, artist, 1)
@@ -296,7 +319,7 @@ export function buildTasteModel(
       if (mine < MIN_SITTINGS || theirs < MIN_SITTINGS) return 0
       return (pairs.get(pairKey(a, b)) ?? 0) / Math.sqrt(mine * theirs)
     },
-    heardTogether: !!signals?.sessions?.lists.length,
+    heardTogether: !!sittingsData?.lists.length,
     artist,
     genre,
     phaseArtists,

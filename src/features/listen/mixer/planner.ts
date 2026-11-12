@@ -2202,8 +2202,12 @@ function labelOf(t: Transition, p?: Placement): string {
   const v = p?.variant
   const bars = v ? v.bars : Math.round(((t.length - t.bAt) * t.tempo.a) / 240)
   const kind =
-    v?.volume === 'answer'
+    v?.volume === 'jumpcut'
+      ? 'Jump-Cut (Wortspiel)'
+      : v?.volume === 'answer'
       ? 'Wortspiel'
+      : v?.volume === 'overlap' && v.bars === (v.pre ?? 0)
+      ? 'Drop-Swap'
       : v?.volume === 'mashup'
         ? 'Mashup'
         : v?.volume === 'scurve'

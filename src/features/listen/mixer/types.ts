@@ -275,10 +275,12 @@ export interface Transition {
   /** How sure the planner is that this sounds right (0–1); low when the analysis was unsure. */
   confidence: number
   /**
-   * Server-owned: the overlap rendered to an audio clip at `url` (leaving "Mix-Modus" bakes the stem lanes in), covering
-   * transition time `start` to `start + length` (seconds). Playback plays A up to it, the clip, then B on from its end.
-   * `key` (A, B, this transition's hash, engine version) says whether it still matches; a reorder or an edit
-   * invalidates it. Missing = played live.
+   * Server-owned: the overlap rendered to an audio clip at `url` (leaving "Mix-Modus" bakes the stem lanes in).
+   * `start` is the transition time (seconds) of the clip file's first sample, seam padding included (it may be
+   * negative: the engine starts about 0.5 s before the transition), and `length` the file's duration (it runs on at
+   * least 0.5 s after B has settled and the tails have died); the engine crossfades A into the clip and the clip into
+   * B inside those margins. `key` (A, B, this transition's hash, engine version) says whether it still matches; a
+   * reorder or an edit invalidates it. Missing = played live.
    */
   baked?: { url: string; key: string; start: number; length: number }
 }

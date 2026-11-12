@@ -54,10 +54,13 @@ export function MixerHost() {
     }
     setTransitionProvider(provider)
     // Baked transitions' clips come from the Lumio server, in the playback quality (null: lossless).
-    setBakedClipLoader(async (baked, part, quality, signal) => {
-      const response = await lumioFetch(`${baked.url}${baked.url.includes('?') ? '&' : '?'}part=${part}&quality=${quality ?? 'original'}`, { signal })
-      if (!response.ok) throw new Error(`Clip ${response.status}`)
-      return response.arrayBuffer()
+    setBakedClipLoader({
+      playlist: playlistId,
+      load: async (baked, part, quality, signal) => {
+        const response = await lumioFetch(`${baked.url}${baked.url.includes('?') ? '&' : '?'}part=${part}&quality=${quality ?? 'original'}`, { signal })
+        if (!response.ok) throw new Error(`Clip ${response.status}`)
+        return response.arrayBuffer()
+      },
     })
     return () => {
       setTransitionProvider(null)

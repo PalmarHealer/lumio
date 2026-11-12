@@ -1321,9 +1321,10 @@ let cancelEase = () => {}
  */
 export type BakedClipLoader = (baked: NonNullable<Transition['baked']>, part: 'a' | 'b', quality: number | null, signal: AbortSignal) => Promise<ArrayBuffer>
 
-let bakedClipLoader: BakedClipLoader | null = null
+let bakedClipLoader: { load: BakedClipLoader; playlist: string } | null = null
 
-export function setBakedClipLoader(next: BakedClipLoader | null) {
+/** The loader for the playlist whose transitions play (a clip's key names its playlist). */
+export function setBakedClipLoader(next: { load: BakedClipLoader; playlist: string } | null) {
   bakedClipLoader = next
 }
 
@@ -2393,10 +2394,10 @@ async function loadBaked(p: Plan, transition: Transition, sliceA: Slice, sliceB:
   const baked = transition.baked
   const loader = bakedClipLoader
   if (!baked || !loader || !connection) return null
-  const key = await bakeKey({ transition, a: sourceIdentity(p.from), b: sourceIdentity(p.to) })
+  const key = await bakeKey({ playlist: loader.playlist, transition, a: sourceIdentity(p.from), b: sourceIdentity(p.to) })
   if (key !== baked.key) return null
   const quality = streamingMusicQuality(readLocalSettings(connection.userId))
-  const [rawA, rawB] = await Promise.all([loader(baked, 'a', quality, signal), loader(baked, 'b', quality, signal)])
+  const [rawA, rawB] = await Promise.all([loader.load(baked, 'a', quality, signal), loader.load(baked, 'b', quality, signal)])
   const [bufferA, bufferB] = await Promise.all([ctx.decodeAudioData(rawA), ctx.decodeAudioData(rawB)])
   const full = (buffer: AudioBuffer) => [0, 1].map((c) => Float32Array.from(buffer.getChannelData(Math.min(c, buffer.numberOfChannels - 1)), (x) => x / CLIP_GAIN))
   const [a, b] = [full(bufferA), full(bufferB)]

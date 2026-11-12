@@ -97,7 +97,7 @@ async function bakeOne(deps: BakeDeps, playlistId: string, pair: string): Promis
   if (!a || !b) return 'skipped'
   const sources = { a: sourceIdentity(a), b: sourceIdentity(b) }
   // Baked as it is already: nothing to do.
-  if (transition.baked?.key && transition.baked.key === (await bakeKey({ transition, ...sources }))) return 'baked'
+  if (transition.baked?.key && transition.baked.key === (await bakeKey({ playlist: playlistId, transition, ...sources }))) return 'baked'
   const key = await bakePair(deps, playlistId, { a, b }, transition)
   return (await attachBaked(deps.lumioFetch, playlistId, pair, key, sources)) ? 'baked' : 'skipped'
 }

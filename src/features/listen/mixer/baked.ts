@@ -50,17 +50,26 @@ function canonical(value: unknown): string {
   return JSON.stringify(value)
 }
 
+/** What a clip's key is made of: the playlist it belongs to, both songs (`sourceIdentity`) and the transition. */
+export interface KeyParts {
+  /** The server keeps each clip for one playlist: the same pair in two playlists bakes two clips. */
+  playlist: string
+  transition: Transition
+  a: string
+  b: string
+}
+
 /**
- * The text a clip's key hashes: engine version, both songs (`sourceIdentity`) and the transition as it sounds. (Not the
- * sample rate it was rendered at: the player checks a clip's key without knowing it, and it doesn't change the sound.)
+ * The text a clip's key hashes: engine version, playlist, both songs and the transition as it sounds. (Not the sample
+ * rate it was rendered at: the player checks a clip's key without knowing it, and it doesn't change the sound.)
  */
-export function keyText(options: { transition: Transition; a: string; b: string }) {
+export function keyText(options: KeyParts) {
   const { baked: _baked, custom: _custom, confidence: _confidence, ...sound } = options.transition
-  return canonical({ engine: ENGINE_VERSION, a: options.a, b: options.b, transition: sound })
+  return canonical({ engine: ENGINE_VERSION, playlist: options.playlist, a: options.a, b: options.b, transition: sound })
 }
 
 /** A clip's key: the first 32 hex digits of the SHA-256 of `keyText`. */
-export async function bakeKey(options: { transition: Transition; a: string; b: string }) {
+export async function bakeKey(options: KeyParts) {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(keyText(options)))
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, '0'))

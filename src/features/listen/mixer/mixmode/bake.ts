@@ -64,7 +64,7 @@ export async function bakePair(deps: BakeDeps, playlistId: string, items: { a: B
     stemsFor(deps, to, status[to], reachB.from, reachB.to, decode).catch(() => undefined),
   ])
   const clip = await bakeTransition({ a: toBuffer(a), b: toBuffer(b), transition, stems: { a: stemsA, b: stemsB } })
-  const key = await bakeKey({ transition, a: sourceIdentity(items.a), b: sourceIdentity(items.b) })
+  const key = await bakeKey({ playlist: playlistId, transition, a: sourceIdentity(items.a), b: sourceIdentity(items.b) })
 
   const put = async (path: string, init: RequestInit) => {
     const response = await deps.lumioFetch(path, { method: 'PUT', ...init })
@@ -86,7 +86,7 @@ export async function attachBaked(lumioFetch: LumioFetch, playlistId: string, pa
   for (let attempt = 0; attempt < 2; attempt++) {
     const current = (await (await lumioFetch(`/music/mixer/${playlistId}`)).json()) as PlaylistMixer
     const transition = current.transitions?.[pair]
-    if (!transition || (await bakeKey({ transition, ...sources })) !== key) return false
+    if (!transition || (await bakeKey({ playlist: playlistId, transition, ...sources })) !== key) return false
     const baked = { key, url: '', start: 0, length: 0 }
     const body: PlaylistMixer = { ...current, transitions: { ...current.transitions, [pair]: { ...transition, baked } } }
     const response = await lumioFetch(`/music/mixer/${playlistId}`, { method: 'PUT', body: JSON.stringify(body) })

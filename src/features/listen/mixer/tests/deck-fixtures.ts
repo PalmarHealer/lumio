@@ -51,8 +51,11 @@ function param(defaultValue: number): Param {
 const node = (defaultValue: number) => ({ gain: param(defaultValue) }) as unknown as Gain
 const filter = (frequency: number) => ({ frequency: param(frequency) }) as unknown as Filter
 
-/** A deck for `scheduleAutomation` (no reverb lane: that one makes real nodes). */
-export function fakeDeck(sampleRate = 48000): Deck {
+/**
+ * A deck for `scheduleAutomation` (no reverb lane: that one makes real nodes). With `stems`, its stem split exists
+ * already (a stand-in too), as it would once a transition had used it.
+ */
+export function fakeDeck(sampleRate = 48000, options: { stems?: boolean } = {}): Deck {
   return {
     ctx: { currentTime: 0, sampleRate } as Deck['ctx'],
     input: node(1),
@@ -68,6 +71,9 @@ export function fakeDeck(sampleRate = 48000): Deck {
     reverb: null,
     post: node(1),
     paths: { dry: node(1), coloured: node(0) },
+    direct: node(1),
+    shaped: node(1),
+    stems: options.stems ? { node: {} as Deck['post'], out: node(0), drums: param(1), vocals: param(1), instrumental: param(1) } : null,
     level: node(1),
     source: null,
     dispose: () => undefined,

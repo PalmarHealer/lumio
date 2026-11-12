@@ -15,6 +15,7 @@ import {
   reverbTailEnd,
   resetDeck,
   scheduleAutomation,
+  stemSpan,
   tailsEnd,
   valueAfter,
   valueAt,
@@ -208,4 +209,39 @@ test('high-passes jump into and out of 0 Hz, never ramp through a fraction of a 
   resetDeck(open, 0, 0.05)
   assert.equal(nearZero(open.highpass.frequency, 0, 0.1), null)
   assert.equal(nearZero(open.kill[0].frequency, 0, 0.1), null)
+})
+
+test('stem lanes: through the stem split while one is away from 1, straight (exactly the input) otherwise', () => {
+  assert.equal(stemSpan(neutral()), null)
+  const automation = {
+    ...neutral(),
+    vocals: [
+      { t: 2, v: 1 },
+      { t: 4, v: 0 },
+      { t: 8, v: 0 },
+      { t: 10, v: 1 },
+    ],
+  }
+  assert.deepEqual(stemSpan(automation), { first: 2, last: 10 })
+  const deck = fakeDeck(48000, { stems: true })
+  scheduleAutomation(deck, automation, 0)
+  const stems = deck.stems!
+  assert.equal(valueOn(stems.vocals, 6), 0)
+  assert.equal(valueOn(stems.vocals, 3), 0.5)
+  assert.equal(valueOn(stems.drums, 6), 1)
+  // Straight before and after, through the split in between (5 ms crossfades).
+  assert.equal(valueOn(deck.direct.gain, 1), 1)
+  assert.equal(valueOn(stems.out.gain, 1), 0)
+  assert.equal(valueOn(deck.direct.gain, 2), 0)
+  assert.equal(valueOn(stems.out.gain, 6), 1)
+  assert.equal(valueOn(deck.direct.gain, 10.01), 1)
+  assert.equal(valueOn(stems.out.gain, 10.01), 0)
+  // A later transition without stem lanes plays straight from its start.
+  scheduleAutomation(deck, neutral(), 20)
+  assert.equal(valueOn(deck.direct.gain, 20.01), 1)
+  assert.equal(valueOn(stems.out.gain, 20.01), 0)
+  // A deck that has none and doesn't need one gets none (no worklet: neutral decks stay as they were).
+  const plain = fakeDeck()
+  scheduleAutomation(plain, neutral(), 0)
+  assert.equal(plain.stems, null)
 })

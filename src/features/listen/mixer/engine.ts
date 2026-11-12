@@ -1,3 +1,4 @@
+import { stemsProcessorSource } from './stems.ts'
 import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './types.ts'
 
 /**
@@ -5,8 +6,8 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  * player's <audio> elements) and for rendering a transition offline (an OfflineAudioContext fed by decoded buffers),
  * so what the editor previews is what the player plays.
  *
- *   input → brake → gain ┬→ dry ─────────────────────────────────────────────────────┬→ post → (+ echo, + reverb) → level → master
- *                         └→ 3-band isolator (low / mid / high) → high-pass → low-pass → coloured ┘
+ *   input → brake → gain ┬→ direct ┬→ shaped ┬→ dry ──────────────────────────────────────────────┬→ post → (+ echo, + reverb) → level → master
+ *                         └→ stems  ┘          └→ isolator (low / mid / high) → kill → filters → coloured ┘
  *
  * - The isolator and filters only carry the sound while they colour it. They are flat in magnitude at neutral, but
  *   their phase turns (an all-pass around 200 Hz and 2 kHz), and on loud, brickwall-limited masters that alone raised
@@ -40,6 +41,9 @@ import type { DeckAutomation, Keyframe, Transition, TransitionEffect } from './t
  *   after the deck's volume is gone ("echo out"). Like a club mixer's echo it is low-cut: a high-pass (12 dB/octave at
  *   `ECHO_LOW_CUT_HZ`) on its way in and another in its feedback loop, so its repeats carry no bassline under the next
  *   track and each one is thinner than the last.
+ * - The stem lanes (drums, voice, instrumental: the editor's smart filters) play through `stems` (stems.ts: a live
+ *   approximation, made when first needed) only while one of them isn't 1; otherwise `direct`, exactly the input. The
+ *   switch is a 5 ms crossfade, like the coloured path's.
  * - The reverb is a hall (a convolver with a generated impulse, `hallImpulse`) fed by a send after the deck's volume
  *   (its `reverb` lane): its tail rings on after the deck is cut. It exists only on decks whose transitions use it (made
  *   when first needed), so a deck without reverb is exactly what it was before.
@@ -123,6 +127,10 @@ export interface Deck {
   post: GainNode
   /** Which way the sound goes: straight (`dry`, neutral) or through the isolator and filters (`coloured`). */
   paths: { dry: GainNode; coloured: GainNode }
+  /** Before that: straight (`direct`) or through the stem split (`stems`, made when first needed), into `shaped`. */
+  direct: GainNode
+  shaped: GainNode
+  stems: Stems | null
   /** The player's volume, normalization and fades; 1 when rendering. */
   level: GainNode
   /** The source feeding `input` (set by whoever connects one), disconnected with the deck. */
@@ -151,6 +159,9 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
   const brake = new GainNode(ctx)
   const gain = new GainNode(ctx)
   input.connect(brake).connect(gain)
+  const direct = new GainNode(ctx)
+  const shaped = new GainNode(ctx)
+  gain.connect(direct).connect(shaped)
 
   // The isolator. low = LP(200)² · AP(2000); mid = HP(200)² · LP(2000)²; high = HP(200)² · HP(2000)². The all-pass
   // gives the low band the same phase turn at 2 kHz that mid + high have, so the three add up to AP(200) · AP(2000).
@@ -163,9 +174,9 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
   const mid = new GainNode(ctx)
   const high = new GainNode(ctx)
   const sum = new GainNode(ctx)
-  gain.connect(lowA)
+  shaped.connect(lowA)
   lowB.connect(lowAllpass).connect(low).connect(sum)
-  gain.connect(upperA)
+  shaped.connect(upperA)
   upperB.connect(midA)
   midB.connect(mid).connect(sum)
   upperB.connect(highA)
@@ -180,7 +191,7 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
   const dry = new GainNode(ctx)
   const coloured = new GainNode(ctx, { gain: 0 })
   const post = new GainNode(ctx)
-  gain.connect(dry).connect(post)
+  shaped.connect(dry).connect(post)
   lowpass.connect(coloured).connect(post)
 
   const level = new GainNode(ctx)
@@ -196,7 +207,7 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
   delay.connect(wet).connect(level)
   level.connect(destination)
 
-  const nodes: AudioNode[] = [input, brake, gain, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, killA, killB, highpass, lowpass, dry, coloured, post, send, sendCut, delay, feedback, loopCut, wet, level]
+  const nodes: AudioNode[] = [input, brake, gain, direct, shaped, lowA, lowB, lowAllpass, upperA, upperB, midA, midB, highA, highB, low, mid, high, sum, killA, killB, highpass, lowpass, dry, coloured, post, send, sendCut, delay, feedback, loopCut, wet, level]
   // What each automated param starts at (its constructor value), for the engine's own copy of its timeline.
   for (const param of [brake.gain, gain.gain, low.gain, mid.gain, high.gain, lowpass.frequency, highpass.frequency, killA.frequency, killB.frequency, send.gain, feedback.gain, delay.delayTime, wet.gain, dry.gain, coloured.gain]) {
     timelines.set(param, [{ t: 0, v: param.value, ramp: false }])
@@ -214,6 +225,9 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
     lowpass,
     echo: { send, delay, feedback, wet },
     reverb: null,
+    direct,
+    shaped,
+    stems: null,
     post,
     paths: { dry, coloured },
     level,
@@ -223,9 +237,50 @@ export function createDeck(ctx: BaseAudioContext, destination: AudioNode): Deck 
       deck.source = null
       for (const node of nodes) node.disconnect()
       if (deck.reverb) for (const node of Object.values(deck.reverb)) node.disconnect()
+      if (deck.stems) for (const node of [deck.stems.node, deck.stems.out]) node.disconnect()
     },
   }
   return deck
+}
+
+// ---- the stem lanes ----
+
+/** A deck's stem split: the worklet, its three gains (drums, vocals, instrumental: 0–1), and its way into `shaped`. */
+export interface Stems {
+  node: AudioNode
+  out: GainNode
+  drums: AudioParam
+  vocals: AudioParam
+  instrumental: AudioParam
+}
+
+const stemLanes = ['drums', 'vocals', 'instrumental'] as const
+
+/** Contexts whose engine worklets (limiter, stem split) have loaded: only there can a deck make its stem split. */
+const workletsReady = new WeakSet<BaseAudioContext>()
+
+/**
+ * The deck's stem split, made (and connected: gain → split → out → shaped, out at 0) the first time it is needed; null
+ * where the context hasn't loaded the engine's worklets (`loadEngineWorklets`, which `createMaster` does).
+ */
+export function stemsOf(deck: Deck): Stems | null {
+  if (deck.stems) return deck.stems
+  if (!workletsReady.has(deck.ctx)) return null
+  const node = new AudioWorkletNode(deck.ctx, 'lumio-stems', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2], channelCount: 2, channelCountMode: 'explicit' })
+  const out = new GainNode(deck.ctx, { gain: 0 })
+  deck.gain.connect(node).connect(out).connect(deck.shaped)
+  timelines.set(out.gain, [{ t: 0, v: 0, ramp: false }])
+  const param = (name: string) => node.parameters.get(name)!
+  deck.stems = { node, out, drums: param('drums'), vocals: param('vocals'), instrumental: param('instrumental') }
+  return deck.stems
+}
+
+/** Whether a deck's automation uses its stem lanes (any of them away from 1). */
+export const usesStems = (automation: DeckAutomation) => stemLanes.some((lane) => (automation[lane] ?? []).some((keyframe) => keyframe.v !== 1))
+
+/** When (transition time, from `from` on) a deck's stem lanes change its sound: as `colouredSpan`, for the stem lanes. */
+export function stemSpan(automation: DeckAutomation, from = 0) {
+  return spanWhere(stemLanes.map((lane) => automation[lane] ?? []), (t) => stemLanes.some((lane) => valueAfter(automation[lane] ?? [], t, 1) !== 1), from)
 }
 
 // ---- the reverb ----
@@ -601,6 +656,24 @@ function scheduleKill(deck: Deck, keyframes: Keyframe[], start: number, scale: n
 }
 
 /**
+ * The stem lanes: their gains, and the deck through its stem split from just before their first move until they are
+ * all back at 1 (a deck without stem lanes, or a context without the engine's worklets, plays straight on).
+ */
+function scheduleStems(deck: Deck, automation: DeckAutomation, start: number, scale: number, from: number, now: number) {
+  if (!usesStems(automation) && !deck.stems) return
+  const stems = stemsOf(deck)
+  if (!stems) return
+  for (const lane of stemLanes) scheduleLinear(stems[lane], automation[lane] ?? [], 1, start, scale, from, now)
+  holdAt(deck.direct.gain, now)
+  holdAt(stems.out.gain, now)
+  const at = (t: number) => Math.max(now, start + t * scale)
+  const span = stemSpan(automation, from)
+  if (!span) return crossTo(deck.direct.gain, stems.out.gain, now, CROSSFADE_S)
+  crossTo(stems.out.gain, deck.direct.gain, Math.max(at(from), at(span.first) - CROSSFADE_S), CROSSFADE_S)
+  if (Number.isFinite(span.last)) crossTo(deck.direct.gain, stems.out.gain, at(span.last), CROSSFADE_S)
+}
+
+/**
  * Plays a deck's automation: the transition starts at context time `startTime`. Can be called again at any time
  * (a pause or seek during the transition): what was scheduled before is replaced from now on.
  */
@@ -615,6 +688,7 @@ export function scheduleAutomation(deck: Deck, automation: DeckAutomation, start
   scheduleFilter(deck, automation.filter, startTime, scale, from, now)
   scheduleKill(deck, automation.low, startTime, scale, from, now)
   scheduleRouting(deck, automation, startTime, scale, from, now)
+  scheduleStems(deck, automation, startTime, scale, from, now)
   // The reverb send (made only for a transition that uses it; a deck that has one closes it when the next doesn't).
   if (usesReverb(automation) || deck.reverb) {
     const { send, wet } = reverbOf(deck)
@@ -634,17 +708,22 @@ const colours = (automation: DeckAutomation, t: number) =>
  * each stretch between them is exact.
  */
 export function colouredSpan(automation: DeckAutomation, from = 0) {
-  const keyframes = [automation.low, automation.mid, automation.high, automation.filter].flat()
+  return spanWhere([automation.low, automation.mid, automation.high, automation.filter], (t) => colours(automation, t), from)
+}
+
+/** From when until when (from `from` on) `on(t)` holds, for curves `lanes` (linear between keyframes); null if never. */
+function spanWhere(lanes: Keyframe[][], on: (t: number) => boolean, from: number) {
+  const keyframes = lanes.flat()
   const times = [...new Set([from, ...keyframes.map((keyframe) => keyframe.t).filter((t) => t > from)])].sort((x, y) => x - y)
   let first: number | null = null
   let last = from
   times.forEach((t, i) => {
     const next = times[i + 1]
-    if (colours(automation, t)) {
+    if (on(t)) {
       first ??= t
       last = Math.max(last, t)
     }
-    if (colours(automation, next === undefined ? t + 1 : (t + next) / 2)) {
+    if (on(next === undefined ? t + 1 : (t + next) / 2)) {
       first ??= t
       last = next ?? Infinity
     }
@@ -662,6 +741,11 @@ function silentMoment(gain: DeckAutomation['gain'], from: number, to: number, la
 function routeTo(deck: Deck, time: number, path: 'dry' | 'coloured', fade: number) {
   const up = path === 'dry' ? deck.paths.dry.gain : deck.paths.coloured.gain
   const down = path === 'dry' ? deck.paths.coloured.gain : deck.paths.dry.gain
+  crossTo(up, down, time, fade)
+}
+
+/** Brings path gain `up` to 1 and `down` to 0 at context time `time`: at once, or crossfading over `fade`. */
+function crossTo(up: AudioParam, down: AudioParam, time: number, fade: number) {
   if (valueOn(up, time) === 1 && valueOn(down, time) === 0) return
   if (fade <= 0) {
     setAt(up, time, 1)
@@ -789,6 +873,8 @@ function automatedParams(deck: Deck) {
     deck.echo.delay.delayTime,
     deck.paths.dry.gain,
     deck.paths.coloured.gain,
+    deck.direct.gain,
+    ...(deck.stems ? [deck.stems.out.gain, deck.stems.drums, deck.stems.vocals, deck.stems.instrumental] : []),
     ...(deck.reverb ? [deck.reverb.send.gain, deck.reverb.wet.gain] : []),
   ]
 }
@@ -837,6 +923,13 @@ export function resetDeck(deck: Deck, time = deck.ctx.currentTime, ramp = 0) {
   for (const filter of deck.kill) setAt(filter.frequency, end, 0)
   // Back on the dry path once neutral (a glide ends with a crossfade; an instant reset switches at once).
   routeTo(deck, end, 'dry', ramp > 0 ? CROSSFADE_S : 0)
+  if (deck.stems) {
+    for (const lane of stemLanes) {
+      if (ramp > 0) rampAt(deck.stems[lane], end, 1)
+      else setAt(deck.stems[lane], time, 1)
+    }
+    crossTo(deck.direct.gain, deck.stems.out.gain, end, ramp > 0 ? CROSSFADE_S : 0)
+  }
   // The echo: nothing goes in any more, and its return stays shut until the delay line has emptied itself.
   const { send, feedback, wet } = deck.echo
   holdAt(wet.gain, time)
@@ -998,14 +1091,25 @@ const limiterModules = new WeakMap<BaseAudioContext, Promise<void>>()
 /** How many frames later a limiter's output comes (its lookahead, plus one). */
 export const limiterLatency = (sampleRate: number, lookahead = LIMITER_LOOKAHEAD_S) => Math.max(1, Math.round(lookahead * sampleRate)) + 1
 
-async function limiterNode(ctx: BaseAudioContext, lookahead: number, release: number, onStats?: (stats: LimiterStats) => void) {
+/**
+ * Loads the engine's worklets (the limiter and the stem split) into a context, once: `createMaster` does; a context
+ * that plays decks without a master (a check) calls it itself before scheduling stem lanes.
+ */
+export function loadEngineWorklets(ctx: BaseAudioContext) {
   let loading = limiterModules.get(ctx)
   if (!loading) {
-    const url = URL.createObjectURL(new Blob([LIMITER_PROCESSOR], { type: 'text/javascript' }))
-    loading = ctx.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url))
+    const url = URL.createObjectURL(new Blob([LIMITER_PROCESSOR, stemsProcessorSource()], { type: 'text/javascript' }))
+    loading = ctx.audioWorklet
+      .addModule(url)
+      .then(() => void workletsReady.add(ctx))
+      .finally(() => URL.revokeObjectURL(url))
     limiterModules.set(ctx, loading)
   }
-  await loading
+  return loading
+}
+
+async function limiterNode(ctx: BaseAudioContext, lookahead: number, release: number, onStats?: (stats: LimiterStats) => void) {
+  await loadEngineWorklets(ctx)
   const node = new AudioWorkletNode(ctx, 'lumio-limiter', {
     numberOfInputs: 1,
     numberOfOutputs: 1,

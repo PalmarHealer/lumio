@@ -329,7 +329,7 @@ interface Variant {
   filter: boolean
   midSwap: boolean
   /** Blend: volume shape, where the bass changes deck, the filters in on B and out on A (see the blend preset). */
-  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut'
+  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut' | 'tail'
   bassAt?: 'start' | 'middle' | 'none'
   filterIn?: 'hp' | 'lp' | null
   filterOut?: 'hp' | 'lp' | 'eq' | null
@@ -355,7 +355,7 @@ const meetOf = (preset: ConcretePreset): Variant['meet'] => (preset === 'bassSwa
  * 24 and 8; 4 bars and the seamless S-curve over 2 as the fallback. Which EQ and
  * filter it gets is chosen per placement (`blendFinishes`).
  */
-const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
+const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut' | 'tail'; pre: number; post: number; prior: number; party: boolean; clean: boolean }> = [
   // B's event lands on A's boundary after `pre` bars of B under A; A plays on, thinned, for `post` bars to its next
   // section, where it leaves. Pop: 4-bar phrases, 8-bar blends; dance music: 8 + 8 or more.
   // Preferred in that order (the user: "you can really take more time"): 16 bars, then 32, then 8; 4 bars and the
@@ -378,6 +378,9 @@ const BLEND_LAYOUTS: Array<{ volume: 'overlap' | 'fade' | 'scurve' | 'mashup' | 
   { volume: 'answer', pre: 2, post: 2, prior: -0.2, party: true, clean: true },
   // The wordplay jump cut, preferred where the shared word is a title word (see `wordPairs`).
   { volume: 'jumpcut', pre: 1, post: 1, prior: 0.2, party: true, clean: true },
+  // The tail overlap: B under A's own fade-out tail (only where A ends in one, see `fadesOut`), 2 or 4 bars.
+  { volume: 'tail', pre: 4, post: 0, prior: -0.15, party: true, clean: true },
+  { volume: 'tail', pre: 2, post: 0, prior: -0.17, party: true, clean: true },
   // The drop swap the user asked for more of: B's drop (or chorus) lands on A's boundary after a short beatmatched
   // run-up under A, A goes on it and the bass changes there (party; a bonus where B's event is a drop).
   { volume: 'overlap', pre: 4, post: 0, prior: -0.3, party: true, clean: false },
@@ -392,6 +395,7 @@ function blendFinishes(variant: Variant, clash: boolean): Variant[] {
   // The bass changes deck on the swap (A's boundary): 'start' when B's event opens the blend.
   const at: NonNullable<Variant['bassAt']> = (variant.pre ?? 0) === 0 ? 'start' : 'middle'
   if (variant.volume === 'scurve') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: clash }]
+  if (variant.volume === 'tail') return [{ ...variant, bassAt: 'start', filterIn: null, filterOut: null, midSwap: false, prior: variant.prior + BEST_FINISH }]
   if (variant.volume === 'jumpcut') return [{ ...variant, bassAt: 'middle', filterIn: null, filterOut: null, midSwap: false, prior: variant.prior + BEST_FINISH }]
   // A drop swap: B high-passed under A (no bass), A out on B's event, where B's bass comes in.
   if (variant.volume === 'overlap' && (variant.bars - (variant.pre ?? 0)) === 0) return [{ ...variant, bassAt: 'middle', filterIn: 'hp', filterOut: null, midSwap: clash, prior: variant.prior + BEST_FINISH }]
@@ -792,7 +796,8 @@ function vocalCost(p: Placement, a: PreparedTrack, b: PreparedTrack, party = fal
       // Measured singing, or singing assumed where nothing was measured (voice-like body sections): both count.
       const aSings = !!spanAt(a.vocals, positionA(p, t))
       const bSings = tb !== null && !!spanAt(b.vocals, tb)
-      const aHeard = stats.voiceA[i] > VOICE_HEARD
+      // In a tail overlap A's own fade counts: its last line under -10 dB of its loud level is background.
+      const aHeard = stats.voiceA[i] > VOICE_HEARD && (p.variant.volume !== 'tail' || a.energyBetween(positionA(p, t), positionA(p, t) + 0.2) >= 0.32)
       const bHeard = stats.voiceB[i] > VOICE_HEARD
       if (bSings && bHeard && ((aSings && aHeard) || (echoed !== null && echoed[i] >= ECHO_HEARD))) {
         // Party: B's voice under A's while B is low-passed at 1.2 kHz or less is background, for 4 bars at most.
@@ -1207,6 +1212,23 @@ function reverbFits(p: Placement, a: PreparedTrack, b: PreparedTrack) {
   if (!spansTouch(a.vocals, end - 1, end)) return true
   const atB = positionB(p, length)
   return atB === null || !spansTouch(b.vocals, atB, atB + 1)
+}
+
+/**
+ * Whether a song ends in its own fade-out: its level over the 2 bars before its audible end at least 6 dB under that of
+ * the 4 bars before them (the energy curve is relative amplitude).
+ */
+function fadesOut(track: PreparedTrack) {
+  const bar = 4 * track.period
+  // Up to where anything is left at all (its `end` stops at the loud part and would cut the fade itself off).
+  const energy = track.mix.energy
+  const rate = track.mix.frameRate
+  let last = Array.isArray(energy) ? energy.length - 1 : -1
+  while (last > 0 && energy[last] < 0.03) last--
+  const end = last > 0 && rate > 0 ? Math.min(track.duration, (last + 1) / rate) : track.end
+  const tailLevel = track.energyBetween(end - 2 * bar, end)
+  const before = track.energyBetween(end - 6 * bar, end - 2 * bar)
+  return before > 0.05 && tailLevel <= 0.5 * before
 }
 
 /** A song's accent spread (seconds); 0 when unknown. */
@@ -1873,6 +1895,24 @@ function planSeveral(
         const k = i + bars
         return i >= 0 && Math.abs(track.downbeats[i] - t) <= 0.05 && k >= 0 && k < track.downbeats.length ? track.downbeats[k] : NaN
       }
+      if (variant.volume === 'tail') {
+        // A's last `bars` bars up to its audible end, where it fades by itself; B from one of its entry spots on.
+        if (!fadesOut(a) || tailBars.length <= variant.bars) continue
+        const last = tailBars.length - 1
+        const startA = tailBars[last - variant.bars]
+        const beat = (tailBars[last] - startA) / (4 * variant.bars)
+        const stats = shapeFor(variant, beat)
+        const length = stats.shape.length
+        for (const pb of ins) {
+          const end = shiftBars(b, pb.t, variant.bars / tempo.multiple)
+          if (!Number.isFinite(end) || !onGrid(b, pb.t)) continue
+          const rate = (end - pb.t) / length
+          if (!rateOk(rate)) continue
+          const base = { stats, variant, laneA: { start: startA, path: [] }, laneB: { start: pb.t, path: [] }, bStart: PHASE_SLACK, rate, beatmatched: true, clarity: NaN, loops: 0, slack: PHASE_SLACK, pa: { t: startA, bonus: 0, drop: false, chorus: false }, pb }
+          placements.push({ ...base, ...scoreBound(base) })
+        }
+        continue
+      }
       if (variant.volume === 'answer' || variant.volume === 'jumpcut') {
         // Wordplay: A's bar right after its line and B's bar right before its answering line meet on the swap; straight
         // material, `pre` bars before and `post` after it on both decks (bars, not phrases: lines don't keep to them).
@@ -2015,6 +2055,7 @@ function planSeveral(
     if (isMashup && !mashupFits(placement, a, b, harmony)) return null
     if (placement.variant.preset === 'reverbOut' && !reverbFits(placement, a, b)) return null
     const dropSwap = placement.variant.volume === 'overlap' && placement.variant.bars === (placement.variant.pre ?? 0)
+    const isTail = placement.variant.volume === 'tail'
     // A drop swap only where it genuinely fits (the user: "they can't always be done"): B lands on a real drop, A leaves
     // at its boundary, not inside a line, and the energy holds or rises.
     // (A cut inside a line only on a real drop, which masks it: the user's favourite Judas → Cannibal is one.)
@@ -2118,7 +2159,8 @@ function planSeveral(
       // band goes ("B isn't ready to take over"), except on the wordplay cut, where B's answer masks A's end.
       if (!monotonic(stats.shape, placement.variant.callback === true)) return null
       // The wordplay cuts and the drop swap hand over on B's line or event, which masks A's end.
-      if (placement.variant.volume !== 'answer' && placement.variant.volume !== 'jumpcut' && !dropSwap && !readyAtExit(stats)) return null
+      // (A tail overlap is masked by A's own fade.)
+      if (placement.variant.volume !== 'answer' && placement.variant.volume !== 'jumpcut' && !dropSwap && !isTail && !readyAtExit(stats)) return null
     }
     // Beats that drift apart flam audibly from about 25 ms on (and a stretch of the overlap may drift worse than the
     // middle): such a placement is out, a smaller drift costs a little. So is one whose match can't mostly be checked
@@ -2257,7 +2299,9 @@ function labelOf(t: Transition, p?: Placement): string {
   const v = p?.variant
   const bars = v ? v.bars : Math.round(((t.length - t.bAt) * t.tempo.a) / 240)
   const kind =
-    v?.volume === 'jumpcut'
+    v?.volume === 'tail'
+      ? 'Überlappung im Ausklang'
+      : v?.volume === 'jumpcut'
       ? 'Jump-Cut (Wortspiel)'
       : v?.volume === 'answer'
       ? 'Wortspiel'

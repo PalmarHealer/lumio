@@ -70,7 +70,7 @@ export interface PresetContext {
    * both at full volume, one singing over the other's instrumental; the bass hands over gradually on the swap, late,
    * and A leaves under a rising high-pass over the last fifth).
    */
-  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut'
+  volume?: 'overlap' | 'fade' | 'scurve' | 'mashup' | 'answer' | 'jumpcut' | 'tail'
   /** Blend: where the bass changes deck (start, middle) or 'none' (one of the two parts has no bass of its own). */
   bassAt?: 'start' | 'middle' | 'none'
   /**
@@ -564,6 +564,30 @@ export function matchLevels(shape: PresetShape, beat: number, difference: number
  * Needs B beatmatched; the planner loops bars of either song so neither runs into singing or a drop meanwhile.
  */
 /**
+ * The tail overlap (the user's Spotify reference Womanizer → SOS: "A is already in its own fade-out tail"): A plays on
+ * untouched to its recorded end, fading by itself; B comes in under that tail over a beat, its bass on its downbeat.
+ */
+function tail(ctx: PresetContext): PresetShape {
+  const bars = Math.max(1, ctx.bars)
+  const length = bars * 4 * ctx.beat
+  return {
+    preset: 'blend',
+    length,
+    a: automation(length, { gain: [[0, 1], [Math.max(0, length - ctx.beat), 1], [length, 0]] }),
+    b: automation(length, {
+      gain: [
+        [0, 0],
+        [Math.min(ctx.beat, length / 4), 1],
+      ],
+    }),
+    effects: [],
+    anchorA: 0,
+    anchorB: 0,
+    swap: 0,
+  }
+}
+
+/**
  * The jump cut (the user on Heartless → Heartless: "when A says 'heartless', B says it and takes over"): A plays to the
  * end of its line and is cut on the beat (the middle), B starts right there with its answering line; only the lows
  * cross over around the cut, mids and highs switch at once.
@@ -693,6 +717,7 @@ function blend(ctx: PresetContext): PresetShape {
   if (ctx.volume === 'mashup') return mashup(ctx)
   if (ctx.volume === 'answer') return answer(ctx)
   if (ctx.volume === 'jumpcut') return jumpcut(ctx)
+  if (ctx.volume === 'tail') return tail(ctx)
   const bars = Math.max(1, ctx.bars)
   const length = bars * 4 * ctx.beat
   // The swap: on the bar the planner lines up with A's section boundary (0 = the start).

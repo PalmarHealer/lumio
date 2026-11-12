@@ -83,7 +83,7 @@ const TONAL_HEARD = 0.3
  * An echoed voice over B's singing distracts even when quiet: its repeats count as heard down to this level (with the
  * usual feedback of 0.5, the first three repeats).
  */
-const ECHO_HEARD = 0.12
+const ECHO_HEARD = 0.316
 /** Median distance (seconds) between both decks' beats above which a beatmatch is rejected. */
 const MAX_DRIFT = 0.015
 /** How far (seconds) aligning both grids may move B: more means the grids disagree where the songs meet. */
@@ -254,6 +254,14 @@ function outAnchors(a: PreparedTrack, style: MixStyle): Anchor[] {
   if (a.outroStart >= from && a.outroStart < a.end) addAnchor(list, snapToPhrase(a, a.outroStart), party ? 0.15 : 0.05)
   const cues = a.cuesOut.filter((t) => t >= from && t < a.end)
   cues.forEach((t, i) => addAnchor(list, snapToPhrase(a, t), (party ? 0.3 : 0.05) * (1 - i / (cues.length + 1))))
+  // A line's end (and a beat): where a fade, echo or reverb out can leave without cutting a word (on a downbeat when
+  // one comes within half a bar). Blends keep to the phrase grid and pass these by.
+  for (const span of a.vocals) {
+    const t = span.end + a.period
+    if (t < from || t >= a.end) continue
+    const next = a.downbeats[Math.max(0, floorIndex(a.downbeats, t - 0.01) + 1)]
+    addAnchor(list, next !== undefined && next - t <= 2 * a.period ? next : t, 0)
+  }
   if (!party && a.vocals.length > 0 && (a.vocalsKnown || a.vocalsAssumed)) {
     // The first 4-bar point (counted from the analysed phrase before it) after A's last sung line: where a clean mix
     // can leave without cutting a word and still on the phrase grid.
@@ -1231,6 +1239,33 @@ function fadesOut(track: PreparedTrack) {
   return before > 0.05 && tailLevel <= 0.5 * before
 }
 
+/**
+ * The placement with A's mid, high and filter moves held back until A's last sung line within the blend has ended (they
+ * then run over the time left, in the same shape); itself when they already wait; null when A sings to the end.
+ */
+function keepLineClear(p: Placement, a: PreparedTrack): Placement | null {
+  const { stats } = p
+  const length = stats.shape.length
+  if (length <= 0 || stats.dt <= 0) return p
+  let lineEnd = -1
+  for (let t = 0; t <= length; t += 0.05) if (spanAt(a.vocals, positionA(p, t))) lineEnd = t
+  if (lineEnd < 0) return p
+  const shape = stats.shape
+  const moves = (curve: Keyframe[], neutral: number) => curve.findIndex((k) => Math.abs(k.v - neutral) > 0.02)
+  const starts = [moves(shape.a.mid, 1), moves(shape.a.high, 1), moves(shape.a.filter, 0)]
+  const first = Math.min(...[shape.a.mid, shape.a.high, shape.a.filter].map((curve, n) => (starts[n] >= 0 ? curve[Math.max(0, starts[n] - 1)].t : Infinity)))
+  const from = lineEnd + 0.05
+  if (!Number.isFinite(first) || first >= from) return p
+  if (from >= length - stats.beat) return null
+  const remap = (curve: Keyframe[], neutral: number): Keyframe[] => {
+    if (curve.length === 0) return curve
+    const span = length - first
+    return [{ t: 0, v: neutral }, { t: from, v: neutral }, ...curve.filter((k) => k.t >= first).map((k) => ({ t: from + ((k.t - first) * (length - from)) / span, v: k.v }))]
+  }
+  const next: PresetShape = { ...shape, a: { ...shape.a, mid: remap(shape.a.mid, 1), high: remap(shape.a.high, 1), filter: remap(shape.a.filter, 0) } }
+  return { ...p, stats: shapeStats(next, p.variant.meet, stats.beat) }
+}
+
 /** A song's accent spread (seconds); 0 when unknown. */
 function spreadOf(mix: TrackMix) {
   const value: unknown = mix.accentSpread
@@ -2051,6 +2086,13 @@ function planSeveral(
   /** The sampled checks of one placement: its score, or null when it breaks a rule. */
   const judge = (start: Placement): { placement: Placement; score: number } | null => {
     let placement = start
+    // Clean never muffles a sung line: A keeps its mids, highs and an open filter until its last line in the blend has
+    // ended; the EQ-out or filter happens after it (squeezed into what's left).
+    if (!party && placement.variant.preset === 'blend') {
+      const kept = keepLineClear(placement, a)
+      if (!kept) return null
+      placement = kept
+    }
     const isMashup = placement.variant.volume === 'mashup'
     if (isMashup && !mashupFits(placement, a, b, harmony)) return null
     if (placement.variant.preset === 'reverbOut' && !reverbFits(placement, a, b)) return null

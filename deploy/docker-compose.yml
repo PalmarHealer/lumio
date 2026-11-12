@@ -29,8 +29,10 @@ services:
       # only, see docs/SETUP.md).
       # MEILI_URL: http://meilisearch:7700
       # MEILI_KEY: ""
-      # Optional: the editor's stems ("Mix-Modus"): a shared secret for the stem worker(s), see stem-worker below.
-      # STEMS_WORKER_TOKEN: ""
+      # Optional, for the editor's stems ("Mix-Modus"): the address stem workers reach this server at, put into the join
+      # keys you create in Lumio's settings (Administration -> Stem-Worker; it can be changed there too). Use an IP if
+      # the worker's containers can't resolve the name (e.g. a Tailscale IP: http://100.x.y.z:8097/api).
+      # STEMS_WORKER_URL: ""
     volumes:
       - lumio-data:/data
     # Only your reverse proxy needs to reach it; publish the port only without one.
@@ -52,8 +54,9 @@ services:
 
   # Optional: separates songs into stems for the editor on this server's CPU, as a fallback (windows only, low
   # priority, one at a time; it pauses while a stronger primary worker elsewhere is connected). Off unless you enable
-  # it (docker compose --profile stems up). Needs the HTDemucs ONNX model in ./stems-model and STEMS_WORKER_TOKEN set
-  # on both services.
+  # it (docker compose --profile stems up). Add a worker with the role "fallback" in Lumio's settings (Stem-Worker)
+  # and paste its join key below (for this one the address in the key may be http://lumio:8097/api); the HTDemucs
+  # ONNX model goes into ./stems-model.
   # stem-worker:
   #   image: ghcr.io/palmarhealer/lumio-stem-worker:latest
   #   profiles: [stems]
@@ -61,9 +64,7 @@ services:
   #   depends_on:
   #     - lumio
   #   environment:
-  #     LUMIO_URL: http://lumio:8097/api
-  #     STEMS_WORKER_TOKEN: ""
-  #     ROLE: fallback
+  #     LUMIO_JOIN_KEY: ""
   #     NICE: "19"
   #     THREADS: "2"
   #   cpus: 2

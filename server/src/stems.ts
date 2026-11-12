@@ -69,6 +69,8 @@ export interface StemJob {
   leasedUntil: number
   received: Set<Stem>
   error?: string
+  /** The worker holding the lease (see stem-workers.ts; null for the shared secret). */
+  worker?: { id: string | null; name: string }
 }
 
 interface WindowMeta {
@@ -87,7 +89,7 @@ export class Stems {
   private readonly quotaBytes: number
   private readonly ttl: number
   private readonly jobs = new Map<string, StemJob>()
-  private readonly waiters: Array<{ role: WorkerRole; give: (job: StemJob | null) => void }> = []
+  private readonly waiters: Array<{ role: WorkerRole; worker?: StemJob['worker']; give: (job: StemJob | null) => void }> = []
   private primarySeen = 0
 
   constructor(dataDir: string, quotaMb = Number(process.env.STEMS_QUOTA_MB ?? 20_000), ttlHours = Number(process.env.STEMS_TTL_HOURS ?? 72)) {
@@ -210,7 +212,7 @@ export class Stems {
     const at = this.waiters.findIndex((waiter) => waiter.role === 'primary' || this.fallbackMay(job))
     if (at < 0) return
     const [waiter] = this.waiters.splice(at, 1)
-    this.lease(job)
+    this.lease(job, waiter!.worker)
     waiter!.give(job)
   }
 
@@ -219,14 +221,15 @@ export class Stems {
     if (role === 'primary') this.primarySeen = Date.now()
   }
 
-  private lease(job: StemJob) {
+  private lease(job: StemJob, worker?: StemJob['worker']) {
+    job.worker = worker
     job.state = 'running'
     job.attempts++
     job.leasedUntil = Date.now() + LEASE_MS
   }
 
   /** The next job for a worker, waiting up to `waitMs` for one (long-poll); null when none came. */
-  next(waitMs: number, role: WorkerRole = 'primary'): Promise<StemJob | null> {
+  next(waitMs: number, role: WorkerRole = 'primary', worker?: StemJob['worker']): Promise<StemJob | null> {
     this.seen(role)
     const now = Date.now()
     for (const job of this.jobs.values()) {
@@ -240,12 +243,13 @@ export class Stems {
     }
     const queued = [...this.jobs.values()].find((job) => job.state === 'queued' && (role === 'primary' || this.fallbackMay(job)))
     if (queued) {
-      this.lease(queued)
+      this.lease(queued, worker)
       return Promise.resolve(queued)
     }
     return new Promise((resolve) => {
       const waiter = {
         role,
+        worker,
         give: (job: StemJob | null) => {
           clearTimeout(timer)
           resolve(job)
@@ -264,11 +268,26 @@ export class Stems {
     return this.jobs.get(id) ?? null
   }
 
+  /** The jobs a worker holds now (for the settings' worker list). */
+  heldBy(workerId: string) {
+    return [...this.jobs.values()].filter((job) => job.state === 'running' && job.worker?.id === workerId)
+  }
+
+  /** A worker was revoked or deleted: what it held goes back into the queue (not counted as an attempt). */
+  dropWorker(workerId: string) {
+    for (const job of this.heldBy(workerId)) {
+      job.state = 'queued'
+      job.attempts = Math.max(0, job.attempts - 1)
+      job.worker = undefined
+      this.offer(job)
+    }
+  }
+
   /** Keeps one stem a worker uploaded (FLAC); when all four are in, the window is ready and the job done. */
-  async receive(job: StemJob, stem: Stem, flac: Buffer) {
-    if (flac.toString('ascii', 0, 4) !== 'fLaC') return 'FLAC expected'
+  async receive(job: StemJob, stem: Stem, flac: Buffer): Promise<{ error?: string; done?: boolean }> {
+    if (flac.toString('ascii', 0, 4) !== 'fLaC') return { error: 'FLAC expected' }
     const meta = await this.meta(job.item, job.window.id)
-    if (!meta) return 'Released meanwhile'
+    if (!meta) return { error: 'Released meanwhile' }
     await writeFile(this.path(job.item, job.window.id, `${stem}.flac`), flac)
     job.received.add(stem)
     if (!meta.stems.includes(stem)) meta.stems.push(stem)
@@ -276,8 +295,9 @@ export class Stems {
     if (meta.stems.length === STEMS.length) {
       this.jobs.delete(job.id)
       void this.sweep()
+      return { done: true }
     }
-    return null
+    return {}
   }
 
   fail(job: StemJob, error: string) {

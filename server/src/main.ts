@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { lookup } from 'node:dns/promises'
@@ -17,6 +17,7 @@ import { MIX_VERSION } from './mix-analysis.ts'
 import { JellyfinError, analyzeTrack, parsePlaylistMixer, type BakedLookup, type MixTrack } from './mix.ts'
 import { BAKED_PART_LIMIT, BakedClips, isBakedKey, serveFile, type BakedMeta } from './baked.ts'
 import { STEMS, STEM_UPLOAD_LIMIT, Stems, windowAudio, windowOf, type Stem, type StemWindow } from './stems.ts'
+import { StemWorkers } from './stem-workers.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
@@ -194,17 +195,9 @@ const store = new Store(DATA_DIR)
 const lyricsIndex = MEILI_URL && MEILI_KEY ? lyricsSearch(MEILI_URL, MEILI_KEY, MEILI_LYRICS_INDEX) : null
 const bakedClips = new BakedClips(DATA_DIR)
 const stems = new Stems(DATA_DIR)
-/** The separation worker's secret (STEMS_WORKER_TOKEN); without it the worker routes are off. */
-const STEMS_WORKER_TOKEN = process.env.STEMS_WORKER_TOKEN ?? ''
+/** The separation workers and their sign-in (see stem-workers.ts). */
+const stemWorkers = new StemWorkers(store)
 setInterval(() => void stems.sweep().catch((error) => console.warn('Stems sweep:', error)), 3600_000).unref()
-
-function isStemWorker(request: IncomingMessage) {
-  const sent = (request.headers.authorization ?? '').replace(/^Bearer /, '')
-  if (!STEMS_WORKER_TOKEN || !sent) return false
-  const a = Buffer.from(sent)
-  const b = Buffer.from(STEMS_WORKER_TOKEN)
-  return a.length === b.length && timingSafeEqual(a, b)
-}
 
 /** Whether someone may see a library item (Jellyfin answers it for them); remembered for ten minutes. */
 const itemAccess = new Map<string, number>()
@@ -1413,12 +1406,15 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
   // GET /music/stems/jobs/<id>/audio: the job's window as WAV (stereo, 44.1 kHz, 16-bit), streamed from Jellyfin here.
   // PUT /music/stems/jobs/<id>/<vocals|drums|bass|other>: one stem as FLAC. POST /music/stems/jobs/<id>/fail {error}.
   if (path.startsWith('/music/stems/jobs/')) {
-    if (!STEMS_WORKER_TOKEN) return send(response, 404, { error: 'No stem worker configured' })
-    if (!isStemWorker(request)) return send(response, 401, { error: 'Worker token required' })
+    const worker = stemWorkers.authenticate(request.headers.authorization, request.socket.remoteAddress ?? 'unknown')
+    if (worker === 'limited') return send(response, 429, { error: 'Too many failed sign-ins' })
+    if (worker === 'denied') return send(response, 401, { error: 'Worker sign-in required' })
+    // An added worker's role is the one it was added with; the shared (deprecated) secret says its own.
+    const role = worker.id ? worker.role : url.searchParams.get('role') === 'fallback' ? 'fallback' : 'primary'
     if (path === '/music/stems/jobs/next' && request.method === 'GET') {
       const wait = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000
-      const job = await stems.next(wait, url.searchParams.get('role') === 'fallback' ? 'fallback' : 'primary')
-      return job ? send(response, 200, { id: job.id, item: job.item, window: job.window, stems: STEMS }) : send(response, 204)
+      const job = await stems.next(wait, role, { id: worker.id, name: worker.name })
+      return job ? send(response, 200, { id: job.id, item: job.item, window: job.window, stems: STEMS, role }) : send(response, 204)
     }
     const jobPath = path.match(/^\/music\/stems\/jobs\/([0-9a-f-]{36})\/(audio|fail|vocals|drums|bass|other)$/)
     const job = jobPath ? stems.job(jobPath[1]!) : null
@@ -1442,11 +1438,12 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       return send(response, 204)
     }
     if (request.method === 'PUT' && (STEMS as readonly string[]).includes(action)) {
-      if (url.searchParams.get('role') !== 'fallback') stems.seen('primary')
+      if (role === 'primary') stems.seen('primary')
       const flac = await readBody(request, STEM_UPLOAD_LIMIT).catch(() => null)
       if (!flac) return send(response, 413, { error: 'Too large' })
-      const failed = await stems.receive(job, action as Stem, flac)
-      return failed ? send(response, 400, { error: failed }) : send(response, 204)
+      const received = await stems.receive(job, action as Stem, flac)
+      if (received.done) stemWorkers.jobDone(worker)
+      return received.error ? send(response, 400, { error: received.error }) : send(response, 204)
     }
     return send(response, 405, { error: 'Not allowed' })
   }
@@ -2023,7 +2020,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
     }
     if (path === '/music/stems/release') return send(response, 200, await stems.release(playlistId))
-    if (!STEMS_WORKER_TOKEN) return send(response, 503, { error: 'No stem worker configured' })
+    if (!stemWorkers.enabled()) return send(response, 503, { error: 'No stem worker configured' })
     const items = Array.isArray(body?.items) ? body.items : null
     if (!items || items.length > 400) return send(response, 400, { error: 'Bad items' })
     const wanted: Array<{ item: string; window: StemWindow }> = []
@@ -2051,6 +2048,40 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     if (!(await canSeeItem(tokenOf(request, url)!, me.id, item))) return send(response, 404, { error: 'No such song' })
     const file = await stems.file(item, stemFile[2]!, stemFile[3]!)
     return file ? serveFile(response, file) : send(response, 404, { error: 'No such stem' })
+  }
+
+  // Stem workers, for administrators (see stem-workers.ts). GET /admin/stem-workers: {url, workers} (with each one's
+  // current jobs). PUT /admin/stem-workers/config {url}: the address put into join keys. POST /admin/stem-workers
+  // {name, role}: adds a worker and answers its join key, the only time it is shown. POST
+  // /admin/stem-workers/<id>/revoke and DELETE /admin/stem-workers/<id>: cut it off (its jobs go back to the queue).
+  if (path.startsWith('/admin/stem-workers')) {
+    if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
+    if (path === '/admin/stem-workers' && request.method === 'GET') {
+      const workers = stemWorkers.list().map(({ secretHash: _hash, ...worker }) => ({ ...worker, jobs: stems.heldBy(worker.id).map((job) => ({ item: job.item, window: job.window })) }))
+      return send(response, 200, { url: stemWorkers.url(), workers })
+    }
+    if (path === '/admin/stem-workers/config' && request.method === 'PUT') {
+      const body = await readJson<{ url?: unknown }>(request).catch(() => null)
+      const failed = typeof body?.url === 'string' ? stemWorkers.setUrl(body.url) : 'url missing'
+      return failed ? send(response, 400, { error: failed }) : send(response, 200, { url: stemWorkers.url() })
+    }
+    if (path === '/admin/stem-workers' && request.method === 'POST') {
+      const body = await readJson<{ name?: unknown; role?: unknown }>(request).catch(() => null)
+      const role = body?.role === 'fallback' ? 'fallback' : body?.role === 'primary' ? 'primary' : null
+      if (typeof body?.name !== 'string' || !role) return send(response, 400, { error: 'name and role (primary or fallback) needed' })
+      const added = stemWorkers.add(body.name, role, me.id)
+      if (typeof added === 'string') return send(response, 400, { error: added })
+      const { secretHash: _hash, ...worker } = added.worker
+      return send(response, 200, { worker, joinKey: added.joinKey })
+    }
+    const one = path.match(/^\/admin\/stem-workers\/([0-9a-f]{16})(\/revoke)?$/)
+    if (one && ((one[2] && request.method === 'POST') || (!one[2] && request.method === 'DELETE'))) {
+      const done = one[2] ? stemWorkers.revoke(one[1]!) : stemWorkers.remove(one[1]!)
+      if (!done) return send(response, 404, { error: 'No such worker' })
+      stems.dropWorker(one[1]!)
+      return send(response, 204)
+    }
+    return send(response, 404, { error: 'Not found' })
   }
 
   // POST /music/mix/training {playlistId, pair, …}: one transition someone saved in the editor, kept as training data

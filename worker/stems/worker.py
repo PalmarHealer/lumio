@@ -6,17 +6,20 @@ server (which streams it from Jellyfin; no token or library copy here), separate
 outbound HTTP to the Lumio server.
 
 Environment:
-  LUMIO_URL            the server's API base, e.g. http://lumio:8097/api
-  STEMS_WORKER_TOKEN   the shared secret (the same as the server's)
+  LUMIO_JOIN_KEY       the join key from Lumio's settings (Administration -> Stem-Worker -> add a worker): it holds the
+                       server's address, this worker's id and its secret, and the server knows the worker's role
+  LUMIO_URL, STEMS_WORKER_TOKEN
+                       instead of a join key (development, deprecated): the server's API base and its shared secret
   MODEL_PATH           the HTDemucs ONNX graph (input `mix` [1, 2, segment], output `sources` [1, 4, 2, segment],
                        stems drums/bass/other/vocals); default /models/htdemucs.onnx
   PROVIDER             cpu (default) or cuda
   THREADS              CPU threads for onnxruntime (default: all)
-  ROLE                 primary (default: takes every job) or fallback (e.g. on the Lumio server's own CPU: takes
-                       windows only, and nothing while a primary worker is around)
+  ROLE                 with the shared secret only: primary (default: takes every job) or fallback (e.g. on the
+                       Lumio server's own CPU: windows only, and nothing while a primary worker is around)
   NICE                 raise the process's niceness by this much (e.g. 19 for a fallback on a busy server)
 Limit a fallback's CPU with the container (docker --cpus / compose cpus); it runs one job at a time.
 """
+import base64
 import io
 import json
 import os
@@ -30,8 +33,26 @@ import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 
-LUMIO_URL = os.environ.get('LUMIO_URL', 'http://localhost:8097/api').rstrip('/')
-TOKEN = os.environ.get('STEMS_WORKER_TOKEN', '')
+
+
+def from_join_key(key):
+    """(url, 'id.secret') from a join key ('lsw1.' + base64url JSON {u, i, s}), or exits when it isn't one."""
+    if not key.startswith('lsw1.'):
+        sys.exit('LUMIO_JOIN_KEY is not a Lumio join key (it starts with lsw1.)')
+    body = key[5:]
+    try:
+        value = json.loads(base64.urlsafe_b64decode(body + '=' * (-len(body) % 4)))
+        return value['u'].rstrip('/'), f"{value['i']}.{value['s']}"
+    except (ValueError, KeyError, TypeError):
+        sys.exit('LUMIO_JOIN_KEY could not be read (copied completely?)')
+
+
+JOIN_KEY = os.environ.get('LUMIO_JOIN_KEY', '').strip()
+if JOIN_KEY:
+    LUMIO_URL, TOKEN = from_join_key(JOIN_KEY)
+else:
+    LUMIO_URL = os.environ.get('LUMIO_URL', 'http://localhost:8097/api').rstrip('/')
+    TOKEN = os.environ.get('STEMS_WORKER_TOKEN', '')
 MODEL_PATH = os.environ.get('MODEL_PATH', '/models/htdemucs.onnx')
 PROVIDER = os.environ.get('PROVIDER', 'cpu')
 THREADS = int(os.environ.get('THREADS', '0'))
@@ -118,14 +139,27 @@ def run_job(session, segment, job):
 
 def main():
     if not TOKEN:
-        sys.exit('STEMS_WORKER_TOKEN is not set')
+        sys.exit("Set LUMIO_JOIN_KEY (from Lumio's settings: Stem-Worker)")
     if NICE:
         os.nice(NICE)
     session, segment = load_model()
-    print(f'stem worker ({ROLE}): {MODEL_PATH} ({PROVIDER}, segment {segment}), polling {LUMIO_URL}', flush=True)
+    print(f"stem worker ({'join key' if JOIN_KEY else ROLE}): {MODEL_PATH} ({PROVIDER}, segment {segment}), polling {LUMIO_URL}", flush=True)
     while True:
         try:
             status, body = request('GET', f'/music/stems/jobs/next?wait=25&role={ROLE}', timeout=60)
+        except urllib.error.HTTPError as error:
+            # Refused: revoked, deleted or a wrong key (retried slowly, so a fixed server setting is picked up), or
+            # this address failed too often and is shut out for a while.
+            if error.code == 401:
+                print('sign-in refused: the worker was revoked or deleted, or the key is wrong; retrying in 5 min', flush=True)
+                time.sleep(300)
+            elif error.code == 429:
+                print('too many failed sign-ins from this address; retrying in 10 min', flush=True)
+                time.sleep(600)
+            else:
+                print(f'poll failed: HTTP {error.code}', flush=True)
+                time.sleep(10)
+            continue
         except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
             print(f'poll failed: {error}', flush=True)
             time.sleep(10)

@@ -1,18 +1,16 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
-import { getPlaylistApi } from '@jellyfin/sdk/lib/utils/api/playlist-api'
 import { IconAlertTriangle, IconArrowsSort, IconLoader2, IconRefresh, IconVinyl } from '@tabler/icons-react'
-import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogTitle } from '@/components/ui/dialog'
 import { DropdownMenuCheckboxItem, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
-import { useAuthedSession } from '@/features/auth/session'
 import { formatRuntime, secondsToTicks } from '@/lib/format'
 import { defineMessages, useMessages } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
+import { outcomeText, playlistSignature, reorderMessages, useAnnounceReorder, usePlaylistReorder } from '../playlist-reorder'
 import { analysable, MixerSaveError, usePlaylistMixer, useSaveMixer, useTrackMixes } from './queries'
-import { entriesInOrder, hasSharedEntries, planMoves } from './reorder'
+import { hasSharedEntries } from './reorder'
 import type { SortMessage, SortRequest } from './sort-worker'
 import type { MixStyle, PresetId, TrackMix } from './types'
 
@@ -76,26 +74,26 @@ const messages = defineMessages({
     analysed: (done: number, total: number) => `${done} von ${total} Songs analysiert`,
     missing: (n: number) =>
       `${n === 1 ? '1 Song ist' : `${n} Songs sind`} noch nicht analysiert. Lumio analysiert sie gerade; bis dahin behalten sie ihren Platz und bekommen einfache Überblendungen.`,
+    missingOrder: (n: number) =>
+      `${n === 1 ? '1 Song ist' : `${n} Songs sind`} noch nicht analysiert. Lumio analysiert sie gerade; bis dahin behalten sie ihren Platz.`,
     check: 'Erneut prüfen',
     replaced: (n: number) => (n === 1 ? '1 eigener Übergang wird ersetzt' : `${n} eigene Übergänge werden ersetzt`),
     keepCustom: 'Eigene Übergänge behalten, wo das Paar bleibt',
     cancel: 'Abbrechen',
     apply: 'Sortieren & bauen',
-    moving: (done: number, total: number) => `Reihenfolge wird gespeichert … ${done}/${total}`,
     saving: 'Übergänge werden gespeichert …',
     done: (n: number) => (n === 1 ? 'Playlist sortiert, 1 Übergang gebaut' : `Playlist sortiert, ${n} Übergänge gebaut`),
     failed: 'Konnte nicht berechnet werden.',
-    changed: 'Die Playlist hat sich gerade geändert. Lumio rechnet mit der neuen Reihenfolge noch einmal.',
-    partial: (done: number, total: number) =>
-      `Die Reihenfolge wurde nur teilweise gespeichert (${done} von ${total} Verschiebungen). Die Übergänge sind noch nicht gespeichert; versuch es noch einmal.`,
     forbidden: 'Nur wer die Playlist bearbeiten darf, kann den Mixer ändern.',
     conflict: 'Jemand anderes hat die Mixer-Einstellungen gerade geändert. Versuch es noch einmal.',
     saveFailed: 'Die Mixer-Einstellungen konnten nicht gespeichert werden.',
     tooShort: 'Für Übergänge braucht die Playlist mindestens zwei Songs.',
-    notReached:
-      'Jellyfin hat die Songs nicht ganz in die neue Reihenfolge gebracht (vermutlich wegen Songs, die du nicht sehen kannst). Die Übergänge sind nicht gespeichert.',
-    duplicates:
-      'Diese Playlist enthält Songs doppelt. Jellyfin kann doppelte Einträge nicht einzeln verschieben, deshalb lässt sie sich nicht automatisch sortieren. Entferne die doppelten Songs und versuch es noch einmal.',
+    notSaved: 'Die Übergänge sind nicht gespeichert.',
+    sorted: 'Playlist sortiert',
+    sort: 'Sortieren',
+    suitedTitle: 'Passend sortieren',
+    suitedDescription: 'Lumio ordnet die Songs so, dass sie gut ineinander übergehen: nach Tonart, Tempo und Stimmung.',
+    orderReady: 'Die neue Reihenfolge steht.',
   },
   en: {
     mixer: 'Mixer',
@@ -120,26 +118,25 @@ const messages = defineMessages({
     analysed: (done: number, total: number) => `${done} of ${total} songs analysed`,
     missing: (n: number) =>
       `${n === 1 ? '1 song is' : `${n} songs are`} not analysed yet. Lumio is analysing them now; until then they keep their place and get plain crossfades.`,
+    missingOrder: (n: number) => `${n === 1 ? '1 song is' : `${n} songs are`} not analysed yet. Lumio is analysing them now; until then they keep their place.`,
     check: 'Check again',
     replaced: (n: number) => (n === 1 ? '1 custom transition will be replaced' : `${n} custom transitions will be replaced`),
     keepCustom: 'Keep custom transitions where the pair stays',
     cancel: 'Cancel',
     apply: 'Sort & build',
-    moving: (done: number, total: number) => `Saving the order … ${done}/${total}`,
     saving: 'Saving the transitions …',
     done: (n: number) => (n === 1 ? 'Playlist sorted, 1 transition built' : `Playlist sorted, ${n} transitions built`),
     failed: 'Could not be worked out.',
-    changed: 'The playlist just changed. Lumio works it out again with the new order.',
-    partial: (done: number, total: number) =>
-      `The order was only partly saved (${done} of ${total} moves). The transitions aren't saved yet; please try again.`,
     forbidden: 'Only those who may edit the playlist can change its mixer.',
     conflict: 'Someone else just changed the mixer settings. Please try again.',
     saveFailed: 'The mixer settings could not be saved.',
     tooShort: 'Transitions need at least two songs in the playlist.',
-    notReached:
-      "Jellyfin didn't quite put the songs in the new order (probably because of songs you can't see). The transitions aren't saved.",
-    duplicates:
-      "This playlist has songs in it twice. Jellyfin can't move repeated entries one by one, so it can't be sorted automatically. Remove the repeated songs and try again.",
+    notSaved: "The transitions aren't saved.",
+    sorted: 'Playlist sorted',
+    sort: 'Sort',
+    suitedTitle: 'Sort to mix well',
+    suitedDescription: 'Lumio orders the songs so they flow into each other: by key, tempo and mood.',
+    orderReady: 'The new order is ready.',
   },
 })
 
@@ -206,23 +203,38 @@ export function MixerMenuItems({ playlistId, onBuild }: { playlistId: string; on
 /** While the dialog is open, songs without an analysis are asked for again this often (the server works on them). */
 const POLL_MS = 10_000
 
-type Phase = { kind: 'idle' } | { kind: 'moving'; done: number; total: number } | { kind: 'saving' } | { kind: 'error'; text: string }
-
-const trackSignature = (tracks: readonly BaseItemDto[]) => tracks.map((track) => `${track.PlaylistItemId}:${track.Id}`).join(',')
+type Phase = { kind: 'idle' } | { kind: 'moving' } | { kind: 'saving' } | { kind: 'error'; text: string }
 
 /**
  * "Sort & build transitions": asks for the style, shows what it does (how much shorter the playlist gets, how many
  * songs aren't analysed yet, which custom transitions go), then saves the new order to Jellyfin and the transitions
  * and style to the Lumio server.
  *
- * The order is saved with as few moves as possible (see reorder.ts), one after the other. Should one fail, the rest
- * isn't tried, the playlist shows what Jellyfin has now, and the transitions aren't saved (they belong to the order
- * that wasn't reached); trying again works it out from the order as it is.
+ * With `mode` 'order' it is the playlist's "Passend" sorting outside mixer mode: only the order (in clean style's
+ * sense: key, tempo, mood), no transitions.
+ *
+ * The order is saved by `usePlaylistReorder` (as few moves as possible, checked before and after). Should it not be
+ * reached, the transitions aren't saved (they belong to the order that wasn't reached); trying again works it out from
+ * the order as it is. A success can be taken back for the session ("Rückgängig").
  */
-export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { playlistId: string; tracks: BaseItemDto[]; open: boolean; onOpenChange: (open: boolean) => void }) {
+export function SortBuildDialog({
+  playlistId,
+  tracks,
+  open,
+  onOpenChange,
+  mode = 'build',
+}: {
+  playlistId: string
+  tracks: BaseItemDto[]
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  mode?: 'build' | 'order'
+}) {
   const t = useMessages(messages)
-  const { api, session } = useAuthedSession()
-  const queryClient = useQueryClient()
+  const rt = useMessages(reorderMessages)
+  const orderOnly = mode === 'order'
+  const { reorder, progress: moving } = usePlaylistReorder(playlistId)
+  const announce = useAnnounceReorder(playlistId, tracks)
   const mixer = usePlaylistMixer(playlistId)
   const save = useSaveMixer(playlistId)
   const [style, setStyle] = useState<MixStyle>(mixer.data?.style ?? 'clean')
@@ -238,7 +250,7 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
 
   const ids = useMemo(() => tracks.map((track) => track.Id ?? '').filter(analysable), [tracks])
   const analyses = useTrackMixes(ids, { enabled: open, pollMs: POLL_MS })
-  const signature = trackSignature(tracks)
+  const signature = playlistSignature(tracks)
   const duplicates = useMemo(() => hasSharedEntries(tracks.map((track) => track.PlaylistItemId)), [tracks])
   /**
    * The analyses the order is worked out from. Taken once they have all answered, and again only when asked: songs
@@ -255,7 +267,7 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
     setProgress(null)
     setResult(null)
     if (open) {
-      setStyle(mixer.data?.style ?? 'clean')
+      setStyle(orderOnly ? 'clean' : (mixer.data?.style ?? 'clean'))
       setKeepCustom(false)
       setComputeFailed(false)
       setPhase({ kind: 'idle' })
@@ -296,7 +308,7 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
   // What the result must have been worked out from to be applied: an answer for an older style or "keep custom" (the
   // newer one is on its way) must not be saved.
   const sortKey = basis ? `${style}|${signature}|${[...basis.entries()].map(([id, mix]) => (mix ? id : '')).join(',')}` : ''
-  const inputs = `${sortKey}|${keepCustom}|${existing?.updated ?? 0}`
+  const inputs = orderOnly ? `${sortKey}|order` : `${sortKey}|${keepCustom}|${existing?.updated ?? 0}`
   useEffect(() => {
     if (!open || !worker.current || !basis || tracks.length < 2 || duplicates) return
     const sameOrder = sorted.current?.key === sortKey
@@ -309,6 +321,7 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
       keepCustom,
       durations: Object.fromEntries(tracks.map((track) => [track.Id ?? '', (track.RunTimeTicks ?? 0) / 10_000_000])),
       order: sameOrder ? sorted.current!.order : undefined,
+      orderOnly,
     }
     askedKey.current = sortKey
     if (!sameOrder) setOrdered(null)
@@ -316,85 +329,52 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
     setResult(null)
     setComputeFailed(false)
     worker.current.postMessage(request)
-  }, [open, basis, tracks, style, keepCustom, existing, duplicates, sortKey, inputs])
+  }, [open, basis, tracks, style, keepCustom, existing, duplicates, sortKey, inputs, orderOnly])
 
   const apply = async () => {
+    const order = orderOnly ? (ordered?.inputs === inputs ? ordered.order : null) : result?.inputs === inputs ? result.order : null
     // A second click before the dialog shows it is busy must not start a second round of moves.
-    if (!result || result.inputs !== inputs || applying.current) return
+    if (!order || applying.current) return
     applying.current = true
+    setPhase({ kind: 'moving' })
     try {
-      await applyResult(result)
+      const outcome = await reorder(order, tracks)
+      if (outcome.kind !== 'done' && outcome.kind !== 'unchanged') {
+        // Transitions belong to the order they were built for: not saved for one that wasn't reached.
+        setPhase({ kind: 'error', text: `${outcomeText(rt, outcome)}${orderOnly ? '' : ` ${t.notSaved}`}` })
+        return
+      }
+      if (orderOnly) {
+        announce(outcome, t.sorted)
+        onOpenChange(false)
+        return
+      }
+      const transitions = result!.transitions
+      setPhase({ kind: 'saving' })
+      await new Promise<void>((resolve) =>
+        save.mutate(
+          { on: true, style, transitions },
+          {
+            onSuccess: () => {
+              announce(outcome, t.done(Object.keys(transitions).length))
+              onOpenChange(false)
+              resolve()
+            },
+            onError: (error) => {
+              setPhase({ kind: 'error', text: saveErrorText(t, error) })
+              resolve()
+            },
+          },
+        ),
+      )
     } finally {
       applying.current = false
     }
   }
 
-  const applyResult = async (result: Extract<SortMessage, { kind: 'done' }>) => {
-    const basis = signature
-    setPhase({ kind: 'moving', done: 0, total: 0 })
-    const tracksKey = ['playlist-tracks', session.userId, playlistId]
-    try {
-      // What Jellyfin has now must be the order that was sorted (someone may have changed it meanwhile).
-      const playlists = getPlaylistApi(api)
-      const fresh = (await playlists.getPlaylistItems({ playlistId, userId: session.userId })).data.Items ?? []
-      if (hasSharedEntries(fresh.map((track) => track.PlaylistItemId))) {
-        void queryClient.invalidateQueries({ queryKey: tracksKey })
-        setPhase({ kind: 'error', text: t.duplicates })
-        return
-      }
-      if (trackSignature(fresh) !== basis) {
-        void queryClient.invalidateQueries({ queryKey: tracksKey })
-        setPhase({ kind: 'error', text: t.changed })
-        return
-      }
-      const entries = fresh.map((track) => ({ id: track.Id ?? '', entry: track.PlaylistItemId ?? '' }))
-      const moves = planMoves(
-        entries.map((entry) => entry.entry),
-        entriesInOrder(entries, result.order),
-      )
-      let done = 0
-      setPhase({ kind: 'moving', done, total: moves.length })
-      for (const move of moves) {
-        try {
-          await playlists.moveItem({ playlistId, itemId: move.entry, newIndex: move.index })
-        } catch {
-          void queryClient.invalidateQueries({ queryKey: tracksKey })
-          setPhase({ kind: 'error', text: t.partial(done, moves.length) })
-          return
-        }
-        done++
-        setPhase({ kind: 'moving', done, total: moves.length })
-      }
-      if (moves.length) {
-        // Jellyfin counts positions among the songs this person can see; with hidden ones in the playlist a move can
-        // land elsewhere than planned. Transitions are only saved for the order that was really reached.
-        const after = (await playlists.getPlaylistItems({ playlistId, userId: session.userId })).data.Items ?? []
-        await queryClient.invalidateQueries({ queryKey: tracksKey })
-        if (after.map((track) => track.Id).join(',') !== result.order.join(',')) {
-          setPhase({ kind: 'error', text: t.notReached })
-          return
-        }
-      }
-    } catch {
-      setPhase({ kind: 'error', text: t.saveFailed })
-      return
-    }
-    setPhase({ kind: 'saving' })
-    save.mutate(
-      { on: true, style, transitions: result.transitions },
-      {
-        onSuccess: () => {
-          toast.success(t.done(Object.keys(result.transitions).length))
-          onOpenChange(false)
-        },
-        onError: (error) => setPhase({ kind: 'error', text: saveErrorText(t, error) }),
-      },
-    )
-  }
-
   const missing = analyses.total - analyses.analysed
   const shorterBy = result ? Math.round(result.length.shorterBy * 100) : progress?.shorterBy != null ? Math.round(progress.shorterBy * 100) : null
-  const ready = !!result && result.inputs === inputs && !computeFailed && tracks.length >= 2 && !duplicates
+  const ready = (orderOnly ? ordered?.inputs === inputs : result?.inputs === inputs) && !computeFailed && tracks.length >= 2 && !duplicates
   const building = !!ordered && !result && !computeFailed
   const builtCount = result ? (ordered?.pairs ?? 0) : (progress?.done ?? 0)
   // The kinds of transitions built, most used first.
@@ -408,43 +388,47 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
     <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
       <DialogContent className="flex max-h-[calc(100svh-2rem)] flex-col gap-5 overflow-y-auto p-6 sm:max-w-lg">
         <div className="space-y-1 pr-8">
-          <DialogTitle className="text-xl font-bold">{t.build}</DialogTitle>
-          <DialogDescription>{t.buildDescription}</DialogDescription>
+          <DialogTitle className="text-xl font-bold">{orderOnly ? t.suitedTitle : t.build}</DialogTitle>
+          <DialogDescription>{orderOnly ? t.suitedDescription : t.buildDescription}</DialogDescription>
         </div>
 
-        <div role="radiogroup" aria-label={t.style} className="grid gap-2 sm:grid-cols-2">
-          {(['clean', 'party'] as const).map((option) => (
-            <button
-              key={option}
-              type="button"
-              role="radio"
-              aria-checked={style === option}
-              // One tab stop for the group; the arrow keys move between the styles (as with native radio buttons).
-              tabIndex={style === option ? 0 : -1}
-              disabled={busy}
-              onClick={() => setStyle(option)}
-              onKeyDown={(event) => {
-                if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
-                event.preventDefault()
-                const next = option === 'clean' ? 'party' : 'clean'
-                setStyle(next)
-                const sibling = option === 'clean' ? event.currentTarget.nextElementSibling : event.currentTarget.previousElementSibling
-                ;(sibling as HTMLElement | null)?.focus()
-              }}
-              className={cn(
-                'rounded-lg border p-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60',
-                style === option ? 'border-listen bg-listen/10' : 'border-border hover:bg-muted',
-              )}
-            >
-              <span className={cn('block font-semibold', style === option && 'text-listen')}>{option === 'clean' ? t.clean : t.party}</span>
-              <span className="mt-1 block text-sm text-muted-foreground">{option === 'clean' ? t.cleanHint : t.partyHint}</span>
-            </button>
-          ))}
-        </div>
+        {!orderOnly && (
+          <div role="radiogroup" aria-label={t.style} className="grid gap-2 sm:grid-cols-2">
+            {(['clean', 'party'] as const).map((option) => (
+              <button
+                key={option}
+                type="button"
+                role="radio"
+                aria-checked={style === option}
+                // One tab stop for the group; the arrow keys move between the styles (as with native radio buttons).
+                tabIndex={style === option ? 0 : -1}
+                disabled={busy}
+                onClick={() => setStyle(option)}
+                onKeyDown={(event) => {
+                  if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
+                  event.preventDefault()
+                  const next = option === 'clean' ? 'party' : 'clean'
+                  setStyle(next)
+                  const sibling = option === 'clean' ? event.currentTarget.nextElementSibling : event.currentTarget.previousElementSibling
+                  ;(sibling as HTMLElement | null)?.focus()
+                }}
+                className={cn(
+                  'rounded-lg border p-3 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60',
+                  style === option ? 'border-listen bg-listen/10' : 'border-border hover:bg-muted',
+                )}
+              >
+                <span className={cn('block font-semibold', style === option && 'text-listen')}>{option === 'clean' ? t.clean : t.party}</span>
+                <span className="mt-1 block text-sm text-muted-foreground">{option === 'clean' ? t.cleanHint : t.partyHint}</span>
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="space-y-2" aria-live="polite">
           {computeFailed ? (
             <p className="text-sm text-destructive">{t.failed}</p>
+          ) : ordered && orderOnly ? (
+            <p className="text-sm font-medium">{t.orderReady}</p>
           ) : ordered ? (
             <>
               {shorterBy !== null && (
@@ -491,7 +475,7 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
             )
           )}
           {tracks.length < 2 && <p className="text-sm text-muted-foreground">{t.tooShort}</p>}
-          {duplicates && <p className="text-sm text-destructive">{t.duplicates}</p>}
+          {duplicates && <p className="text-sm text-destructive">{rt.duplicates}</p>}
         </div>
 
         {analyses.total > 0 && (
@@ -507,7 +491,7 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
             <div className="h-1.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-valuemin={0} aria-valuemax={analyses.total} aria-valuenow={analyses.analysed}>
               <div className="h-full rounded-full bg-listen transition-[width] duration-500" style={{ width: `${(analyses.analysed / analyses.total) * 100}%` }} />
             </div>
-            {missing > 0 && analyses.loaded && <p className="text-sm text-muted-foreground">{t.missing(missing)}</p>}
+            {missing > 0 && analyses.loaded && <p className="text-sm text-muted-foreground">{orderOnly ? t.missingOrder(missing) : t.missing(missing)}</p>}
             {newAnalyses > 0 && (
               <Button size="sm" variant="outline" disabled={busy} onClick={() => setBasis(analyses.mixes)}>
                 <IconRefresh /> {t.newAnalyses(newAnalyses)}
@@ -516,7 +500,7 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
           </div>
         )}
 
-        {ordered && (ordered.replacedCustom > 0 || keepCustom) && (
+        {!orderOnly && ordered && (ordered.replacedCustom > 0 || keepCustom) && (
           <div className="space-y-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
             {ordered.replacedCustom > 0 && (
               <p className="flex items-center gap-2 text-sm font-medium">
@@ -540,14 +524,14 @@ export function SortBuildDialog({ playlistId, tracks, open, onOpenChange }: { pl
         {phase.kind === 'error' && <p className="text-sm text-destructive">{phase.text}</p>}
 
         <DialogFooter className="items-center gap-2">
-          {phase.kind === 'moving' && phase.total > 0 && <span className="mr-auto text-sm text-muted-foreground tabular-nums">{t.moving(phase.done, phase.total)}</span>}
+          {phase.kind === 'moving' && moving && moving.total > 0 && <span className="mr-auto text-sm text-muted-foreground tabular-nums">{rt.moving(moving.done, moving.total)}</span>}
           {phase.kind === 'saving' && <span className="mr-auto text-sm text-muted-foreground">{t.saving}</span>}
           <Button variant="ghost" disabled={busy} onClick={() => onOpenChange(false)}>
             {t.cancel}
           </Button>
           <Button disabled={!ready || busy} onClick={() => void apply()}>
             {busy && <IconLoader2 className="animate-spin" />}
-            {t.apply}
+            {orderOnly ? t.sort : t.apply}
           </Button>
         </DialogFooter>
       </DialogContent>

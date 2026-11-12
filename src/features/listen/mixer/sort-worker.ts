@@ -33,11 +33,13 @@ export interface SortRequest {
   durations: Record<string, number>
   /** An order already found for this style and these analyses: only the transitions are built again. */
   order?: string[]
+  /** Only the order is wanted ("Passend" sorting outside mixer mode): no transitions are built. */
+  orderOnly?: boolean
 }
 
 export type SortMessage =
   /** The order is found; `pairs` transitions are to be planned. */
-  | { kind: 'order'; ask: number; order: string[]; pairs: number; replacedCustom: number }
+  | { kind: 'order'; ask: number; inputs: string; order: string[]; pairs: number; replacedCustom: number }
   /** `done` of `pairs` planned; `shorterBy` the estimate so far (null before any pair with known lengths). */
   | { kind: 'progress'; ask: number; done: number; pairs: number; shorterBy: number | null }
   | { kind: 'done'; ask: number; inputs: string; order: string[]; transitions: Record<string, Transition>; replacedCustom: number; length: MixLength }
@@ -102,7 +104,8 @@ async function build(request: SortRequest) {
     }
   }
   const replacedCustom = customCount(existing) - kept.size
-  scope.postMessage({ kind: 'order', ask, order, pairs: pairs.length, replacedCustom })
+  scope.postMessage({ kind: 'order', ask, inputs, order, pairs: pairs.length, replacedCustom })
+  if (request.orderOnly) return
 
   // The estimate: what the planned pairs save on average, for all pairs, against the whole playlist played in full.
   const original = order.reduce((sum, id) => sum + (known(id) ? lengthOf(id) : 0), 0)

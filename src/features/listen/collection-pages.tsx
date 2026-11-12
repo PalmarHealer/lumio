@@ -44,6 +44,7 @@ import { DownloadButton, DownloadMenuItem } from './download-ui'
 import { useHeldByDownload } from './download-ui'
 import { MixerBadge, MixerMenuItems, SortBuildDialog } from './mixer/mixer-ui'
 import { useMixInfo, usePlaylistMixer } from './mixer/queries'
+import { PlaylistSortMenu } from './playlist-sort-menu'
 
 const messages = defineMessages({
   de: {
@@ -343,6 +344,8 @@ export function PlaylistPage() {
   const [deleting, setDeleting] = useState(false)
   const [sharing, setSharing] = useState(false)
   const [building, setBuilding] = useState(false)
+  // "Passend" outside mixer mode: the same dialog, the order only.
+  const [suiting, setSuiting] = useState(false)
   const mixer = usePlaylistMixer(id)
   const mixing = mixer.data?.on === true
   const shareInfo = infos.data?.find((info) => info.playlist.Id === id)
@@ -399,6 +402,8 @@ export function PlaylistPage() {
         actions={
           <>
             {!mine && <SaveButton id={id} />}
+            {/* Sorting changes the playlist itself: only its owner may. */}
+            {mine && <PlaylistSortMenu playlistId={id} tracks={list} mixing={mixing} onSuited={() => (mixing ? setBuilding(true) : setSuiting(true))} />}
             <DownloadButton downloadKey={`playlist:${id}`} name={item?.Name ?? ''} items={tracks.data} collection={item} />
             <DropdownMenu>
               <DropdownMenuTrigger aria-label={t.more} className="grid size-10 place-items-center rounded-full text-muted-foreground outline-none hover:text-foreground">
@@ -447,6 +452,7 @@ export function PlaylistPage() {
       )}
 
       {canEdit && <SortBuildDialog playlistId={id} tracks={list} open={building} onOpenChange={setBuilding} />}
+      {mine && <SortBuildDialog playlistId={id} tracks={list} open={suiting} onOpenChange={setSuiting} mode="order" />}
 
       {mine && <PlaylistShareDialog playlistId={id} editors={editors} open={sharing} onOpenChange={setSharing} />}
 

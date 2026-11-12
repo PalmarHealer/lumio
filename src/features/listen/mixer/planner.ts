@@ -49,7 +49,16 @@ export interface PlanOptions {
   preset?: PresetId
   /** Techniques not to use here ("sort & build" keeps a set varied: no two drop swaps in a row, a few of each). */
   avoid?: Technique[]
+  /**
+   * Test only (review round 2, off by default): a party blend may let the two voices be heard together for up to this
+   * many bars (true: 1), and B may come in inside one of its lines while B is filtered (|filter| >= 0.4) there. Its
+   * plans are labelled "Test: Gesang darf sich kurz berühren".
+   */
+  relaxVoices?: boolean | number
 }
+
+/** One-knob filter value from which a deck counts as filtered for `relaxVoices`. */
+const RELAX_FILTERED = 0.4
 
 /** The special techniques a set should vary (the rest are plain blends, echoes, fades). */
 export type Technique = 'dropSwap' | 'callback' | 'wordplay' | 'mashup'
@@ -2268,15 +2277,20 @@ function planSeveral(
         else if (placement.variant.bars <= 4) energyTerm += 0.04 * (1 - energy.busy)
       }
     }
+    const relaxBars = party && opts.relaxVoices && placement.variant.preset === 'blend' ? (opts.relaxVoices === true ? 1 : opts.relaxVoices) : 0
+    const relax = relaxBars > 0
     const { clash: voices, lostA, lostB } = vocalCost(placement, a, b, party)
     // B is never entered inside one of its lines (round 1: God's Plan → Hello cut "Hello" off "Hello from the other
     // side"); A leaving right after it began a new line sets up words that never come (Rock That Body → Outside: "I
     // wanna rock" starts, then fades) and costs.
-    if (entersMidLine(b, positionB(placement, stats.bHere) ?? placement.laneB.start)) return null
+    // (relaxVoices, test: allowed while B is filtered where it becomes audible.)
+    const bFiltered = relax && Math.abs(valueAt(stats.shape.b.filter, stats.bHere, 0)) >= RELAX_FILTERED
+    if (!bFiltered && entersMidLine(b, positionB(placement, stats.bHere) ?? placement.laneB.start)) return null
     const startedLine = lineStartedBefore(a, positionA(placement, stats.aGone), 2)
     // The short S-curve may let one voice end as the other starts (a quarter second at most, about where two voices are
     // heard as two); otherwise never voice over voice.
-    if (voices > (placement.variant.volume === 'scurve' ? Math.min(0.25, stats.beat / 2) : 0.1)) return null
+    // (relaxVoices, test: up to its bars of voices together.)
+    if (voices > (relax ? relaxBars * 4 * stats.beat : placement.variant.volume === 'scurve' ? Math.min(0.25, stats.beat / 2) : 0.1)) return null
     // Clean never cuts A's lines: muffling one under a filter or EQ (no longer intelligible) counts as cutting it.
     if (!party && trustA * lostA > 0.5) return null
     // Any transition that falls off a cliff after A is gone (an EDM drop into a piano ballad) is out, the fallbacks too:
@@ -2391,7 +2405,9 @@ function planSeveral(
               ? 'mashup'
               : undefined
     if (technique) techniques.set(transition, technique)
-    return { transition, label: labelOf(transition, placement) }
+    const label = labelOf(transition, placement)
+    const relaxed = opts.relaxVoices && style === 'party' && transition.preset === 'blend'
+    return { transition, label: relaxed ? `Test: Gesang darf sich kurz berühren · ${label}` : label }
   })
 
   function build(placement: Placement): Transition {

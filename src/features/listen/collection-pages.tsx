@@ -1,4 +1,5 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
+import { ContextMenu } from '@base-ui/react/context-menu'
 import {
   IconCircleCheckFilled,
   IconCirclePlus,
@@ -42,6 +43,8 @@ import { AddToPlaylist } from './library-menu'
 import { TasteMenuItem } from './taste'
 import { DownloadButton, DownloadMenuItem } from './download-ui'
 import { useHeldByDownload } from './download-ui'
+import { MissingCover } from './missing-cover'
+import { PendingMenuItems, pendingMessages, usePendingImports, useRemovePending } from './library-import-state'
 
 const messages = defineMessages({
   de: {
@@ -139,10 +142,63 @@ interface CollectionProps {
   /** A column beside the songs (plays, listeners), by track id, with its heading. */
   extras?: Record<string, ReactNode>
   extraLabel?: string
+  /** Songs not in Jellyfin yet (from an import), greyed out among the others: before the song at `at`. */
+  pending?: PendingSong[]
+}
+
+export interface PendingSong {
+  key: string
+  /** The index of the song it stands before (the list's length: at the end). */
+  at: number
+  title: string
+  artist?: string
+  onRemove: () => void
+}
+
+/** A song waiting for Jellyfin: greyed out, can't be played; its menu removes it. */
+function PendingTrackRow({ song, extra }: { song: PendingSong; extra: boolean }) {
+  const t = useMessages(pendingMessages)
+  return (
+    <ContextMenu.Root>
+      <ContextMenu.Trigger
+        render={
+          <div
+            aria-disabled
+            title={t.notInLibrary}
+            className={cn(
+              'grid cursor-default items-center gap-4 rounded-md px-4 py-2 opacity-45 data-popup-open:bg-foreground/10',
+              extra ? TRACK_GRID_EXTRA : TRACK_GRID,
+              'max-md:gap-3 max-md:px-2',
+            )}
+          >
+            <span className="text-right text-sm text-muted-foreground max-md:hidden">–</span>
+            <span className="flex min-w-0 items-center gap-3">
+              <span className="size-10 shrink-0 overflow-hidden rounded">
+                <MissingCover type="Audio" />
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate text-foreground">{song.title}</span>
+                <span className="block min-h-5 truncate text-sm text-muted-foreground">
+                  {song.artist ? `${song.artist} · ` : ''}
+                  {t.notInLibrary}
+                </span>
+              </span>
+            </span>
+            {extra && <span className="max-md:hidden" />}
+            <span />
+            <span />
+          </div>
+        }
+      />
+      <DropdownMenuContent className="w-56">
+        <PendingMenuItems onRemove={song.onRemove} />
+      </DropdownMenuContent>
+    </ContextMenu.Root>
+  )
 }
 
 /** The layout shared by playlists, official playlists and liked songs: header, actions, track table with albums. */
-export function Collection({ kind, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel }: CollectionProps) {
+export function Collection({ kind, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel, pending = [] }: CollectionProps) {
   const t = useMessages(messages)
   // Dragging reorders right away; the server's order replaces it once it has saved the move.
   const [reordered, setReordered] = useState<{ from: BaseItemDto[]; order: BaseItemDto[] } | null>(null)
@@ -228,8 +284,9 @@ export function Collection({ kind, title, cover, byline, description, tracks: lo
         </div>
         <div className="mt-2">
           {loading && Array.from({ length: 8 }, (_, i) => <Skeleton key={i} className="mb-1 h-14 rounded-md" />)}
-          {!loading && tracks.length === 0 && empty && <p className="px-4 py-8 text-sm text-muted-foreground">{empty}</p>}
-          {tracks.map((track, index) => (
+          {!loading && tracks.length === 0 && !pending.length && empty && <p className="px-4 py-8 text-sm text-muted-foreground">{empty}</p>}
+          {tracks.map((track, index) => [
+            ...pending.filter((song) => song.at === index).map((song) => <PendingTrackRow key={song.key} song={song} extra={!!extras} />),
             <div
               key={`${track.PlaylistItemId ?? track.Id}-${index}`}
               // The row itself is dragged (onto playlists or the queue too); here it also reorders.
@@ -268,8 +325,9 @@ export function Collection({ kind, title, cover, byline, description, tracks: lo
                 onPlay={() => music.play(tracks, index, { source })}
                 onRemove={onRemove ? () => onRemove(track) : undefined}
               />
-            </div>
-          ))}
+            </div>,
+          ])}
+          {!loading && pending.filter((song) => song.at >= tracks.length).map((song) => <PendingTrackRow key={song.key} song={song} extra={!!extras} />)}
         </div>
       </div>
     </div>
@@ -335,6 +393,8 @@ export function PlaylistPage() {
   const [sharing, setSharing] = useState(false)
   const shareInfo = infos.data?.find((info) => info.playlist.Id === id)
   const adds = usePlaylistAdds(id, (shareInfo?.editors.length ?? 0) > 1).data
+  const imported = usePendingImports().playlist(id)
+  const removePending = useRemovePending()
 
   if (playlist.isError) return <Navigate to="/listen" replace />
   const item = playlist.data
@@ -346,6 +406,18 @@ export function PlaylistPage() {
   const editors = shareInfo?.editors ?? (owner ? [owner] : [])
   const shared = editors.length > 1
   const canEdit = mine || editors.includes(session.userId)
+  // Songs of the Spotify playlist Jellyfin doesn't have yet, where they stood among the others.
+  const present = new Set(list.map((track) => track.Id!))
+  const positions = new Map<string, number>()
+  list.forEach((track, index) => !positions.has(track.Id!) && positions.set(track.Id!, index))
+  const entries = imported?.data.entries ?? []
+  const pending: PendingSong[] = entries.flatMap((entry, index) => {
+    if (entry.id) return []
+    // Before the first song that comes after it in Spotify's order (at the end when none does).
+    const nextThere = entries.slice(index + 1).find((later) => later.id && present.has(later.id))
+    const at = nextThere ? positions.get(nextThere.id!)! : list.length
+    return [{ key: `pending-${index}`, at, title: entry.title, artist: entry.artist, onRemove: () => imported && removePending.playlistSong(imported, index) }]
+  })
   let addedBy: Record<string, ReactNode> | undefined
   if (shared) {
     addedBy = {}
@@ -379,6 +451,7 @@ export function PlaylistPage() {
         onRemove={canEdit ? (track) => track.PlaylistItemId && actions.remove.mutate({ playlistId: id, entryIds: [track.PlaylistItemId] }) : undefined}
         onMove={canEdit ? (track, index) => track.PlaylistItemId && actions.move.mutate({ playlistId: id, entryId: track.PlaylistItemId, index }) : undefined}
         onEdit={mine && item ? setEditing : undefined}
+        pending={pending}
         actions={
           <>
             {!mine && <SaveButton id={id} />}
@@ -507,8 +580,13 @@ export function LikedSongsPage() {
   const t = useMessages(messages)
   const { session } = useAuthedSession()
   const liked = useLikedSongs()
+  // Liked on Spotify, not in Jellyfin yet: greyed out after the others.
+  const waiting = usePendingImports().tracks
+  const removePending = useRemovePending()
+  const count = liked.data?.length ?? 0
   return (
     <Collection
+      pending={waiting.map((row) => ({ key: row.extId, at: count, title: row.data.title, artist: row.data.artist, onRemove: () => removePending.entry(row) }))}
       kind={t.playlist}
       title={t.liked}
       cover={<LikedCover />}

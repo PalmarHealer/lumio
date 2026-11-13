@@ -141,6 +141,12 @@ async function itunes<T>(path: string, params: Record<string, string>): Promise<
   return (await response.json()) as T
 }
 
+/** Shows found by name (iTunes' podcast search). */
+export async function searchPodcasts(term: string, limit = 25) {
+  const data = await itunes<{ results: ItunesPodcast[] }>('search', { media: 'podcast', entity: 'podcast', term: term.trim(), limit: String(limit) })
+  return data.results.map(toPodcast)
+}
+
 export function usePodcastSearch(term: string) {
   return useQuery({
     queryKey: ['podcast-search', term, country()],

@@ -14,6 +14,7 @@ import { useMessages } from '@/lib/i18n'
 import { playerBarMessages } from './messages'
 import { connectMusicPlayer, onQueued, setArtworkResolver, setAutoplayProvider, useMusic } from './music-player'
 import { continuation } from '../radio'
+import { useLibraryImportSync } from '../library-import-state'
 
 /** How many of the next tracks get their pictures, artist and lyrics loaded ahead. */
 const AHEAD_ASSETS = 2
@@ -36,6 +37,9 @@ export function MusicPlayerHost() {
     connectPlaybackOutbox(api && userId ? { api, userId } : null)
     void connectRecent(api && userId ? { api, userId } : null)
   }, [api, userId])
+
+  // What the Spotify import still waits for is looked for as Jellyfin gets new music.
+  useLibraryImportSync(api ?? undefined, userId)
 
   // What the next tracks will show is fetched ahead: covers in the sizes the player and the side panel use, the
   // artist (with their picture) and the lyrics. When a track starts, its page and panel are ready at once.

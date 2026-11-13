@@ -11,6 +11,7 @@ import { importSpotify, removeSpotifyImport, spotifyImportSummary, type ImportSt
 import { defineMessages, getLocaleTag, useLocale, useMessages } from '@/lib/i18n'
 import { Row, Section } from './fields'
 import { useBranding } from '@/features/admin/branding'
+import { SpotifyLibraryRow } from './spotify-library-row'
 
 export const listeningHistoryMessages = defineMessages({
   de: {
@@ -172,6 +173,7 @@ export function ListeningHistorySection() {
           )}
         </div>
       </Row>
+      <SpotifyLibraryRow />
       <Row label={t.wrappedLabel} hint={t.wrappedHint}>
         <Button size="sm" variant="outline" nativeButton={false} render={<Link to="/listen/wrapped" />}>
           {t.openWrapped}

@@ -13,6 +13,7 @@ import { latestApps } from './apps.ts'
 import { creditsOfRecording, lookupCredits, sameName, searchRecordings, type Failure, type JobState, type TrackCredits, type TrackMeta } from './credits.ts'
 import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, type Privacy } from './store.ts'
 import { tasteSittings, tasteSignals, type TasteSignals, type TasteSittings } from './taste.ts'
+import { LIBRARY_BATCH, validLibraryImport, wishlist, type LibraryImport } from './library-imports.ts'
 import { SOUND_VERSION } from './sound-analysis.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
@@ -1805,6 +1806,36 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       store.importPlays(me.id, source, plays)
       return send(response, 200, { imported: plays.length })
     }
+  }
+
+  // GET /me/library-imports/:source: what someone brought over from a service's library (found or still missing).
+  // POST {items: [...]}: adds or updates entries (the app found them, placed a playlist's songs). DELETE: all of them,
+  // or with ?kind=&id= one (a greyed-out entry removed).
+  const libraryImports = path.match(/^\/me\/library-imports\/([a-z]+)$/)
+  if (libraryImports) {
+    const source = libraryImports[1]!
+    if (!IMPORT_SOURCES.has(source)) return send(response, 404, { error: 'Unknown service' })
+    if (request.method === 'GET') return send(response, 200, { items: store.libraryImports(me.id, source) })
+    if (request.method === 'DELETE') {
+      const kind = url.searchParams.get('kind') ?? undefined
+      const extId = url.searchParams.get('id') ?? undefined
+      if (!!kind !== !!extId) return send(response, 400, { error: 'Kind and id go together' })
+      store.deleteLibraryImports(me.id, source, kind, extId)
+      return send(response, 204)
+    }
+    if (request.method === 'POST') {
+      const body = await readJson<{ items?: unknown }>(request, IMPORT_BODY_LIMIT).catch(() => null)
+      if (!Array.isArray(body?.items) || body.items.length > LIBRARY_BATCH) return send(response, 400, { error: 'Bad import' })
+      const items = (body.items as unknown[]).map(validLibraryImport).filter((item): item is Omit<LibraryImport, 'at'> => !!item)
+      store.putLibraryImports(me.id, source, items)
+      return send(response, 200, { imported: items.length })
+    }
+  }
+
+  // GET /admin/wishlist: what people brought over from other services and Jellyfin doesn't have yet, most wanted first.
+  if (path === '/admin/wishlist' && request.method === 'GET') {
+    if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
+    return send(response, 200, wishlist(store.missingLibraryImports()))
   }
 
   // GET /me/wrapped?tz=: the years whose Wrapped is ready (the running one from 12 December on).

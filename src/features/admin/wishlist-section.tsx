@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { Section } from '@/features/settings/fields'
-import { lumioGet } from '@/features/social/social'
+import { useLumioFetch } from '@/features/social/social'
 import { defineMessages, getLocaleTag, useLocale, useMessages } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
@@ -50,12 +50,16 @@ export function WishlistSection() {
   const t = useMessages(messages)
   const number = new Intl.NumberFormat(getLocaleTag(useLocale()))
   const [tab, setTab] = useState<(typeof TABS)[number]>('albums')
+  // Ready from the first render (lumioGet has no connection yet right after a page load).
+  const request = useLumioFetch()
   const wishlist = useQuery({
     queryKey: ['admin-wishlist'],
+    // Fresh on every visit (a kept answer from before the server was reachable mustn't hide it).
+    refetchOnMount: 'always',
     staleTime: 5 * 60_000,
     retry: false,
     queryFn: async (): Promise<Wishlist | null> => {
-      const response = await lumioGet('/admin/wishlist')
+      const response = await request('/admin/wishlist')
       return response?.ok ? ((await response.json()) as Wishlist) : null
     },
   })

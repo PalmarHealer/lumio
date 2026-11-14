@@ -65,12 +65,14 @@ export function DevicesSection() {
     queryKey: ['account-devices', session.userId, isAdmin],
     queryFn: async (): Promise<Device[]> => {
       if (isAdmin) {
+        // The server's userId filter lets every device through for an admin (it filters by "can access"), so keep only
+        // the devices this account last signed in on.
         const items = (await getDeviceApi(api).getDevices({ userId: session.userId })).data.Items ?? []
-        return items.map((item) => ({ id: item.Id ?? '', name: item.CustomName || item.Name || '—', app: [item.AppName, item.AppVersion].filter(Boolean).join(' '), lastActive: item.DateLastActivity ?? null }))
+        return items.filter((item) => item.LastUserId?.replace(/-/g, '').toLowerCase() === session.userId.replace(/-/g, '').toLowerCase()).map((item) => ({ id: item.Id ?? '', name: item.CustomName || item.Name || '—', app: [item.AppName, item.AppVersion].filter(Boolean).join(' '), lastActive: item.DateLastActivity ?? null }))
       }
       const sessions = (await getSessionApi(api).getSessions({ activeWithinSeconds: MONTH_S })).data
       return sessions
-        .filter((entry) => entry.UserId === session.userId)
+        .filter((entry) => entry.UserId?.replace(/-/g, '').toLowerCase() === session.userId.replace(/-/g, '').toLowerCase())
         .map((entry) => ({ id: entry.DeviceId ?? '', name: entry.DeviceName || '—', app: [entry.Client, entry.ApplicationVersion].filter(Boolean).join(' '), lastActive: entry.LastActivityDate ?? null }))
     },
     select: (list) => [...list].sort((a, b) => (b.lastActive ?? '').localeCompare(a.lastActive ?? '')),

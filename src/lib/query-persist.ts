@@ -13,8 +13,12 @@ const SAVE_AFTER_MS = 2000
 /** Restoring may hold the first render this long at most; a slow disk mustn't slow the start down. */
 export const RESTORE_TIMEOUT_MS = 400
 
-/** Queries not worth keeping: typed searches, answers that change by the minute, and what the browser measures itself. */
-const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'remote-sessions', 'server-clock-offset'])
+/**
+ * Queries not worth keeping: typed searches, answers that change by the minute, and what the browser measures itself.
+ * Never stream info ('playback'): it holds one playback's session and, for a stored episode, a blob: URL that is dead
+ * after a restart; restored, the player opened that dead address and the title "could not be played".
+ */
+const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'remote-sessions', 'server-clock-offset', 'playback'])
 
 interface Saved {
   savedAt: number
@@ -46,7 +50,8 @@ export async function restoreQueryCache(client: QueryClient) {
   if (!available()) return
   try {
     const saved = (await run('readonly', (store) => store.get(KEY))) as Saved | undefined
-    if (saved && Date.now() - saved.savedAt < MAX_AGE_MS) hydrate(client, saved.state)
+    // Filtered here too: data saved by an older version may hold what is skipped now.
+    if (saved && Date.now() - saved.savedAt < MAX_AGE_MS) hydrate(client, { ...saved.state, queries: saved.state.queries.filter((query) => !SKIP.has(String(query.queryKey[0]))) })
   } catch {
     // Nothing kept (or the browser blocks IndexedDB): the app loads from the server as usual.
   }

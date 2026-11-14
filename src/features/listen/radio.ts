@@ -14,7 +14,7 @@ import type { OfficialPlaylist } from './official'
 import { assemble } from './mix-engine'
 import { localDate } from './mixes'
 import { seeded, weightedShuffle } from './official'
-import { music } from './player/music-player'
+import { music, START } from './player/music-player'
 import { countsForTaste, NO_EXCLUSIONS, useTasteFilter } from './taste'
 import { buildTasteModel, fetchTasteSignals } from './taste-model'
 
@@ -176,14 +176,14 @@ export function useRadioPlaylist(artistId: string | undefined) {
   return { playlist: artistId ? query.data : undefined, isLoading: !!artistId && (!artist || query.isPending) }
 }
 
-/** Starts an artist's radio (today's, the same as its page shows). */
+/** Plays an artist's radio as its page's play button does (today's, with the playlist's own shuffle setting). */
 export function useArtistRadio() {
   const { api, session } = useAuthedSession()
   const queryClient = useQueryClient()
   const taste = useTasteFilter()
   return async (artist: BaseItemDto) => {
     const radio = await queryClient.fetchQuery(radioQuery(api, session.userId, queryClient, artist, taste))
-    if (radio.tracks.length) music.play(radio.tracks, 0, { source: `official:${radio.slug}`, shuffle: false })
+    if (radio.tracks.length) music.play(radio.tracks, START, { source: `official:${radio.slug}` })
   }
 }
 

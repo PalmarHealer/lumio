@@ -12,6 +12,7 @@ import {
 } from '@tabler/icons-react'
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
+import { useNavigate } from 'react-router'
 import { FadeImage } from '@/components/media/fade-image'
 import { ImageLightbox } from '@/components/media/image-lightbox'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
@@ -25,7 +26,6 @@ import { backdropImageUrl, portraitImageUrl } from '@/lib/images'
 import { cn, tintWash } from '@/lib/utils'
 import { TrackTableRow } from './album-view'
 import { ArtistAboutDialog } from './artist-about'
-import { useArtistRadio } from './radio'
 import { ArtistConcerts } from './concert-pages'
 import { sameName, useLastfmArtist, useLastfmTopTracks } from './external'
 import { CardRow, MusicCard, MusicRow } from './music-card'
@@ -131,7 +131,7 @@ export function ArtistPage({ item }: { item: BaseItemDto }) {
   const tracks = useArtistTracks(item.Id ?? undefined)
   const albums = useArtistAlbums(item.Id ?? undefined)
   const state = useNowPlaying()
-  const radio = useArtistRadio()
+  const navigate = useNavigate()
 
   const banner = backdropImageUrl(api, item, { fillWidth: 1600 })
   const ownPhoto = portraitImageUrl(api, item, { fillHeight: 480 })
@@ -237,7 +237,7 @@ export function ArtistPage({ item }: { item: BaseItemDto }) {
             <DropdownMenuItem onClick={() => music.addToQueue(library)}>
               <IconPlaylistAdd /> {t.addToQueue}
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => void radio(item)}>
+            <DropdownMenuItem onClick={() => void navigate(`/listen/official/radio-${item.Id}`)}>
               <IconRadio /> {t.radio}
             </DropdownMenuItem>
             {lastfm.data?.url && (

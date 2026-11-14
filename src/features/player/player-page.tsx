@@ -157,7 +157,8 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
   // Loading progress: the furthest real milestone reached so far, and whether the stream has played yet.
   const [loadStage, setLoadStage] = useState(0)
   const [started, setStarted] = useState(false)
-  const [failed, setFailed] = useState(false)
+  /** Why the stream couldn't be played (shown small on the error screen, so a screenshot tells what went wrong). */
+  const [failed, setFailed] = useState<string | null>(null)
 
   // "Start after the intro": the stream is only requested once the segments are known, so it can be opened right at the
   // end of the intro instead of loading the intro first and jumping. (Not when the group decides the position.)
@@ -351,6 +352,18 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
       call.catch(keep)
     }
 
+    // What doesn't play as it is (a codec the device claims but can't decode, a broken remux, a damaged stored copy)
+    // gets one more try converted by the server, from where it stopped. Only then the error screen, with the reason.
+    let gaveUp = false
+    const fail = (reason: string) => {
+      if (gaveUp) return
+      gaveUp = true
+      console.warn('[player] stream failed', reason, data.stats)
+      if (!choice.transcode && navigator.onLine) {
+        setChoice((current) => ({ ...current, transcode: true, startTicks: positionTicks.current() }))
+      } else setFailed(reason)
+    }
+
     let hls: Hls | undefined
     const seekToStart = () => {
       if (startTicks) element.currentTime = ticksToSeconds(startTicks)
@@ -372,7 +385,7 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
         } else if (details.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries++ < 2) {
           instance.startLoad()
         } else {
-          setFailed(true)
+          fail(`hls ${details.type}: ${details.details}${details.response?.code ? ` (${details.response.code})` : ''}`)
         }
       })
       instance.on(Hls.Events.MANIFEST_PARSED, () => setLoadStage((stage) => Math.max(stage, LOAD_STAGE.playlist)))
@@ -387,7 +400,10 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
     element.addEventListener('timeupdate', checkStart)
     element.addEventListener('seeked', checkStart)
 
-    const onError = () => setFailed(true)
+    const onError = () => {
+      const error = element.error
+      fail(`media ${error?.code ?? '?'}${error?.message ? `: ${error.message}` : ''}`)
+    }
     const onMetadata = () => setLoadStage((stage) => Math.max(stage, LOAD_STAGE.metadata))
     const onLoadedData = () => setLoadStage((stage) => Math.max(stage, LOAD_STAGE.data))
     const onFirstPlay = () => setStarted(true)
@@ -479,7 +495,7 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
         element.load()
       }
     }
-  }, [api, id, data, choice.startTicks, failed, isAudio])
+  }, [api, id, data, choice.startTicks, choice.transcode, failed, isAudio])
 
   // Audio track, quality and burned-in subtitles need a new stream; resume where we are.
   const restartWith = (patch: Partial<PlaybackChoice>) => {
@@ -939,6 +955,7 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
       <div className="dark grid min-h-svh place-items-center bg-black p-8 text-center text-white">
         <div className="space-y-4">
           <p>{t.cannotPlay}</p>
+          {(failed || playback.error) && <p className="font-mono text-xs text-white/40">{failed ?? playback.error?.message}</p>}
           <div className="flex justify-center gap-2">
             <Button variant="outline" onClick={() => window.location.reload()}>
               {t.retry}

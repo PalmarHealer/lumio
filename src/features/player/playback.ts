@@ -84,6 +84,8 @@ export interface PlaybackChoice {
   maxAudioChannels?: number
   /** Streams even though a stored copy exists (another quality was picked in the player). */
   stream?: boolean
+  /** The file (or its remux) failed to play here: the server converts it, neither played nor copied as it is. */
+  transcode?: boolean
 }
 
 /**
@@ -160,7 +162,7 @@ export function playbackOptions(
     retry: false,
     queryFn: async (): Promise<Playback> => {
       // An episode stored ahead plays from the browser (instant, offline), unless another audio track is asked for.
-      const stored = isAudio || choice.stream ? null : await cachedVideo(itemId)
+      const stored = isAudio || choice.stream || choice.transcode ? null : await cachedVideo(itemId)
       if (stored && (choice.audio == null || choice.audio === stored.audioIndex)) {
         const subtitles = Object.keys(stored.subtitleUrls).map(Number)
         return {
@@ -195,8 +197,8 @@ export function playbackOptions(
               MaxStreamingBitrate: choice.maxBitrate,
               MaxAudioChannels: choice.maxAudioChannels,
               DeviceProfile: profile,
-              EnableDirectPlay: enableDirectPlay,
-              EnableDirectStream: true,
+              EnableDirectPlay: enableDirectPlay && !choice.transcode,
+              EnableDirectStream: !choice.transcode,
               EnableTranscoding: true,
               AutoOpenLiveStream: true,
             },

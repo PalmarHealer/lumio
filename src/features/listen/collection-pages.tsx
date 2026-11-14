@@ -12,9 +12,11 @@ import {
   IconPlaylistAdd,
   IconTrash,
   IconUsersPlus,
+  IconVinyl,
   IconWorld,
 } from '@tabler/icons-react'
-import { useState, type ReactNode } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { useMemo, useState, type ReactNode } from 'react'
 import { Navigate, useNavigate, useParams } from 'react-router'
 import { ModeTile } from '@/components/app-switcher'
 import { Link } from '@/components/link'
@@ -44,6 +46,11 @@ import { AddToPlaylist } from './library-menu'
 import { TasteMenuItem } from './taste'
 import { DownloadButton, DownloadMenuItem } from './download-ui'
 import { useHeldByDownload } from './download-ui'
+import { MixerBadge, MixerMenuItems, SortBuildDialog } from './mixer/mixer-ui'
+import { mixerKey, useMixInfo, usePlaylistMixer, useStableLumioFetch } from './mixer/queries'
+import { PlaylistSortMenu } from './playlist-sort-menu'
+import { dropStaleBakes } from './mixer/mixmode/bake'
+import { MixModeBanner, MixModeMenuItem } from './mixer/mixmode/mix-mode-ui'
 import { MissingCover } from './missing-cover'
 import { PendingMenuItems, pendingMessages, usePendingImports, useRemovePending } from './library-import-state'
 
@@ -81,6 +88,8 @@ const messages = defineMessages({
     likedEmpty: 'Songs, die du mit dem Herz markierst, landen hier.',
     madeFor: (name: string) => `Von ${name}`,
     madeForPrefix: 'Für',
+    tempoKey: 'Tempo · Tonart',
+    editTransition: 'Übergang zum nächsten Song bearbeiten',
   },
   en: {
     playlist: 'Playlist',
@@ -115,11 +124,15 @@ const messages = defineMessages({
     likedEmpty: 'Songs you like with the heart end up here.',
     madeFor: (name: string) => `By ${name}`,
     madeForPrefix: 'For',
+    tempoKey: 'Tempo · key',
+    editTransition: 'Edit the transition into the next song',
   },
 })
 
 interface CollectionProps {
   kind: string
+  /** A mark beside the kind (a mixer playlist's). */
+  badge?: ReactNode
   title: string
   cover: ReactNode
   /** Owner and stats line under the title. */
@@ -143,6 +156,10 @@ interface CollectionProps {
   /** A column beside the songs (plays, listeners), by track id, with its heading. */
   extras?: Record<string, ReactNode>
   extraLabel?: string
+  /** A strip above the songs (a playlist in Mix-Modus: how far its stems are). */
+  notice?: ReactNode
+  /** Items on top of a row's menu (in the list's order as shown). */
+  rowMenu?: (track: BaseItemDto, index: number, tracks: BaseItemDto[]) => ReactNode
   /** Songs not in Jellyfin yet (from an import), greyed out among the others: before the song at `at`. */
   pending?: PendingSong[]
 }
@@ -199,7 +216,7 @@ function PendingTrackRow({ song, extra }: { song: PendingSong; extra: boolean })
 }
 
 /** The layout shared by playlists, official playlists and liked songs: header, actions, track table with albums. */
-export function Collection({ kind, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel, pending = [] }: CollectionProps) {
+export function Collection({ kind, badge, title, cover, byline, description, tracks: loaded, loading, source, tint, actions, empty, onRemove, onMove, onEdit, extras, extraLabel, rowMenu, notice, pending = [] }: CollectionProps) {
   const t = useMessages(messages)
   // Dragging reorders right away; the server's order replaces it once it has saved the move.
   const [reordered, setReordered] = useState<{ from: BaseItemDto[]; order: BaseItemDto[] } | null>(null)
@@ -239,7 +256,10 @@ export function Collection({ kind, title, cover, byline, description, tracks: lo
             <div className="size-48 shrink-0 overflow-hidden rounded-md bg-muted shadow-2xl shadow-black/50 sm:size-56">{cover}</div>
           )}
           <div className="min-w-0 space-y-3">
-            <p className="text-sm font-medium">{kind}</p>
+            <p className="flex items-center gap-2 text-sm font-medium">
+              {kind}
+              {badge}
+            </p>
             {onEdit ? (
               <button type="button" onClick={() => onEdit('title')} className="block text-left outline-none focus-visible:ring-2 focus-visible:ring-ring">
                 <h1 className="line-clamp-2 text-4xl font-black leading-none tracking-tight text-balance sm:text-6xl xl:text-7xl">{title}</h1>
@@ -267,6 +287,8 @@ export function Collection({ kind, title, cover, byline, description, tracks: lo
         <ShuffleToggle source={source} />
         {actions}
       </div>
+
+      {notice && <div className="px-4 pb-4 sm:px-8">{notice}</div>}
 
       <div className="px-4 sm:px-8">
         <div
@@ -325,6 +347,7 @@ export function Collection({ kind, title, cover, byline, description, tracks: lo
                 extra={extras ? (extras[track.Id ?? ''] ?? '') : undefined}
                 onPlay={() => music.play(tracks, index, { source })}
                 onRemove={onRemove ? () => onRemove(track) : undefined}
+                menuExtra={rowMenu?.(track, index, tracks)}
               />
             </div>,
           ])}
@@ -392,8 +415,19 @@ export function PlaylistPage() {
   const [editing, setEditing] = useState<'title' | 'cover' | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [sharing, setSharing] = useState(false)
+  const [building, setBuilding] = useState(false)
+  // "Passend" outside mixer mode: the same dialog, the order only.
+  const [suiting, setSuiting] = useState(false)
+  const mixer = usePlaylistMixer(id)
+  const mixing = mixer.data?.on === true
+  const lumioFetch = useStableLumioFetch()
+  const queryClient = useQueryClient()
   const shareInfo = infos.data?.find((info) => info.playlist.Id === id)
   const adds = usePlaylistAdds(id, (shareInfo?.editors.length ?? 0) > 1).data
+  // A mixer playlist shows each song's tempo and key (what its transitions are planned with) where a shared one shows
+  // who added it.
+  const trackIds = useMemo(() => (tracks.data ?? []).map((track) => track.Id ?? ''), [tracks.data])
+  const mixInfo = useMixInfo(trackIds, mixing && (shareInfo?.editors.length ?? 0) <= 1)
   const imported = usePendingImports().playlist(id)
   const removePending = useRemovePending()
 
@@ -443,19 +477,56 @@ export function PlaylistPage() {
         description={item?.Overview ?? undefined}
         cover={item ? <PlaylistCover playlist={item} tracks={list} /> : null}
         byline={owner ? <OwnerByline userId={owner} /> : null}
+        badge={mixing ? <MixerBadge /> : undefined}
         tracks={list}
         loading={tracks.isLoading}
         source={`playlist:${id}`}
         empty={canEdit ? t.empty : undefined}
-        extras={addedBy}
-        extraLabel={t.addedBy}
+        extras={addedBy ?? (mixing ? mixInfo : undefined)}
+        extraLabel={addedBy ? t.addedBy : t.tempoKey}
+        notice={mixing ? <MixModeBanner playlistId={id} tracks={list} mixer={mixer.data} canLeave={canEdit} /> : undefined}
+        rowMenu={
+          mixing && canEdit
+            ? (track, index, shown) => {
+                const next = shown[index + 1]
+                return next?.Id && track.Id ? (
+                  <DropdownMenuItem onClick={() => void navigate(`/listen/playlist/${id}/mix/${track.Id}/${next.Id}`)}>
+                    <IconVinyl /> {t.editTransition}
+                  </DropdownMenuItem>
+                ) : null
+              }
+            : undefined
+        }
         onRemove={canEdit ? (track) => track.PlaylistItemId && actions.remove.mutate({ playlistId: id, entryIds: [track.PlaylistItemId] }) : undefined}
-        onMove={canEdit ? (track, index) => track.PlaylistItemId && actions.move.mutate({ playlistId: id, entryId: track.PlaylistItemId, index }) : undefined}
+        onMove={
+          canEdit
+            ? (track, index) => {
+                if (!track.PlaylistItemId) return
+                // The order after the move: baked clips of pairs that are no longer neighbours are let go (as when sorting).
+                const order = list.map((entry) => entry.Id ?? '')
+                const from = list.findIndex((entry) => entry.PlaylistItemId === track.PlaylistItemId)
+                if (from >= 0) order.splice(index, 0, ...order.splice(from, 1))
+                actions.move.mutate(
+                  { playlistId: id, entryId: track.PlaylistItemId, index },
+                  {
+                    onSuccess: () => {
+                      if (!mixing) return
+                      void dropStaleBakes(lumioFetch, id, order).then((changed) => {
+                        if (changed) void queryClient.invalidateQueries({ queryKey: mixerKey(id) })
+                      })
+                    },
+                  },
+                )
+              }
+            : undefined
+        }
         onEdit={mine && item ? setEditing : undefined}
         pending={pending}
         actions={
           <>
             {!mine && <SaveButton id={id} />}
+            {/* Sorting changes the playlist itself: only its owner may. */}
+            {mine && <PlaylistSortMenu playlistId={id} tracks={list} mixing={mixing} onSuited={() => (mixing ? setBuilding(true) : setSuiting(true))} />}
             <DownloadButton downloadKey={`playlist:${id}`} name={item?.Name ?? ''} items={tracks.data} collection={item} />
             <DropdownMenu>
               <DropdownMenuTrigger aria-label={t.more} className="grid size-10 place-items-center rounded-full text-muted-foreground outline-none hover:text-foreground">
@@ -468,6 +539,8 @@ export function PlaylistPage() {
                 <AddToPlaylist tracks={async () => list} label={t.addToOtherPlaylist} exclude={id} />
                 <DownloadMenuItem downloadKey={`playlist:${id}`} name={item?.Name ?? ''} items={tracks.data} collection={item} />
                 <TasteMenuItem kind="playlists" id={id} />
+                {canEdit && <MixerMenuItems playlistId={id} onBuild={() => setBuilding(true)} />}
+                {canEdit && mixing && <MixModeMenuItem playlistId={id} tracks={list} mixer={mixer.data} />}
                 {mine && (
                   <>
                     <DropdownMenuSeparator />
@@ -501,6 +574,9 @@ export function PlaylistPage() {
           focus={editing === 'cover' ? 'none' : 'name'}
         />
       )}
+
+      {canEdit && <SortBuildDialog playlistId={id} tracks={list} open={building} onOpenChange={setBuilding} />}
+      {mine && <SortBuildDialog playlistId={id} tracks={list} open={suiting} onOpenChange={setSuiting} mode="order" />}
 
       {mine && <PlaylistShareDialog playlistId={id} editors={editors} open={sharing} onOpenChange={setSharing} />}
 

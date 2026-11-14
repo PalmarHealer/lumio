@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>EQ check</title>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      import { checkLowKill } from './eq-check.ts'
+      const result = await checkLowKill()
+      window.eqResult = result
+      document.getElementById('out').textContent = JSON.stringify(result, null, 1) + (result.pass ? '\nPASS' : '\nFAIL')
+      window.eqDone = true
+    </script>
+  </body>
+</html>

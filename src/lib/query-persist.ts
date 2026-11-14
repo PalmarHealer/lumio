@@ -14,11 +14,16 @@ const SAVE_AFTER_MS = 2000
 export const RESTORE_TIMEOUT_MS = 400
 
 /**
- * Queries not worth keeping: typed searches, answers that change by the minute, and what the browser measures itself.
+ * Queries not worth keeping: typed searches, answers that change by the minute, what the browser measures itself, the
+ * mixer's whole-track analyses (tens of kilobytes a song; the server has them at hand) and playlists' mixer settings
+ * (their transitions add up, and an old copy would make a playlist mix or not mix by what it was once).
  * Never stream info ('playback'): it holds one playback's session and, for a stored episode, a blob: URL that is dead
  * after a restart; restored, the player opened that dead address and the title "could not be played".
  */
-const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'remote-sessions', 'server-clock-offset', 'playback'])
+const SKIP = new Set([
+  'storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'remote-sessions', 'server-clock-offset',
+  'playback', 'track-mix', 'playlist-mixer',
+])
 
 interface Saved {
   savedAt: number

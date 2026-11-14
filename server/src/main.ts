@@ -15,6 +15,11 @@ import { DEFAULT_PRIVACY, Store, type Activity, type ImportedPlay, type Person, 
 import { tasteSittings, tasteSignals, type TasteSignals, type TasteSittings } from './taste.ts'
 import { LIBRARY_BATCH, validLibraryImport, wishlist, type LibraryImport } from './library-imports.ts'
 import { SOUND_VERSION } from './sound-analysis.ts'
+import { MIX_VERSION } from './mix-analysis.ts'
+import { JellyfinError, analyzeTrack, parsePlaylistMixer, type BakedLookup, type MixTrack } from './mix.ts'
+import { BAKED_PART_LIMIT, BakedClips, isBakedKey, serveFile, type BakedMeta } from './baked.ts'
+import { STEMS, STEM_UPLOAD_LIMIT, Stems, sweepOriginals, windowAudio, windowOf, type Stem, type StemWindow } from './stems.ts'
+import { StemWorkers } from './stem-workers.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
@@ -83,6 +88,8 @@ const UPLOAD_DIR = join(DATA_DIR, 'localized-images')
 const TEXT_BODY_LIMIT = 64 * 1024
 /** Largest part of an imported listening history (the app sends it in parts of a few thousand plays). */
 const IMPORT_BODY_LIMIT = 4 * 1024 * 1024
+/** Largest playlist mixer body (up to 1000 transitions of about 1 KB, at most 3 KB with long equal-power blends). */
+const MIXER_BODY_LIMIT = 4 * 1024 * 1024
 /** Most plays in one part of an import. */
 const IMPORT_BATCH = 5000
 /** Services whose listening history can be imported. */
@@ -188,6 +195,26 @@ if (!JELLYFIN_URL) {
 
 const store = new Store(DATA_DIR)
 const lyricsIndex = MEILI_URL && MEILI_KEY ? lyricsSearch(MEILI_URL, MEILI_KEY, MEILI_LYRICS_INDEX) : null
+const bakedClips = new BakedClips(DATA_DIR)
+const stems = new Stems(DATA_DIR)
+/** The separation workers and their sign-in (see stem-workers.ts). */
+const stemWorkers = new StemWorkers(store)
+setInterval(() => void stems.sweep().catch((error) => console.warn('Stems sweep:', error)), 3600_000).unref()
+setInterval(() => void sweepOriginals().catch((error) => console.warn('Originals sweep:', error)), 300_000).unref()
+
+/** Whether someone may see a library item (Jellyfin answers it for them); remembered for ten minutes. */
+const itemAccess = new Map<string, number>()
+async function canSeeItem(token: string, userId: string, item: string) {
+  const key = `${token}|${item}`
+  if ((itemAccess.get(key) ?? 0) > Date.now()) return true
+  const response = await fetch(`${JELLYFIN_URL}/Users/${userId}/Items/${item}`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal: AbortSignal.timeout(15_000) }).catch(() => null)
+  if (!response?.ok) return false
+  if (itemAccess.size > 20_000) itemAccess.clear()
+  itemAccess.set(key, Date.now() + 600_000)
+  return true
+}
+// Clips no saved transition refers to any more (a reorder, an edit) are freed after a day; the quota is kept.
+setInterval(() => void bakedClips.sweep(store.bakedKeysInUse()).catch((error) => console.warn('Baked clips sweep:', error)), 3600_000).unref()
 
 // ---- authentication: the user's own Jellyfin token ----
 
@@ -754,7 +781,7 @@ async function creditsFor(id: string, meta: TrackMeta): Promise<TrackCredits | n
   return lookup
 }
 
-type JobName = 'credits' | 'artists' | 'languages' | 'sound' | 'lyrics'
+type JobName = 'credits' | 'artists' | 'languages' | 'sound' | 'lyrics' | 'mix'
 
 /** The administrators' tasks on the library, each running on its own (one run at a time). */
 const jobs: Record<JobName, JobState & { stop?: boolean }> = {
@@ -763,6 +790,7 @@ const jobs: Record<JobName, JobState & { stop?: boolean }> = {
   languages: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
   sound: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
   lyrics: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
+  mix: { running: false, total: 0, done: 0, found: 0, failed: 0, failures: [] },
 }
 
 /**
@@ -1027,6 +1055,140 @@ function queueSound(id: string, token: string) {
   })()
 }
 
+// ---- whole songs analysed for the mixer mode (see mix.ts, mix-analysis.ts) ----
+
+/** A song that couldn't be analysed is tried again after a week (Jellyfin may have been away, the file replaced). */
+const MIX_RETRY = 7 * 24 * HOUR
+/** Songs being analysed right now (by the library run or the queue), by lower-case id, so none is done twice at once. */
+const mixing = new Set<string>()
+/**
+ * Songs whose analysis failed for a passing reason (Jellyfin away, a timeout, the worker failing), by lower-case id,
+ * with until when they aren't asked again (an hour), so the apps' asking doesn't retry them on every request.
+ */
+const mixBackoff = new Map<string, number>()
+const MIX_BACKOFF = HOUR
+
+/**
+ * Analyses a song and keeps the result (null: it can't be, also when Jellyfin says the song can't be fetched at all).
+ * Returns whether it could be analysed; throws on a passing failure (after noting it for the backoff).
+ */
+async function mixOf(token: string, track: MixTrack) {
+  const id = track.Id.toLowerCase()
+  if (mixing.has(id)) return false
+  mixing.add(id)
+  try {
+    const mix = await analyzeTrack(JELLYFIN_URL, token, track, store.lyrics(id)?.data as Parameters<typeof analyzeTrack>[3])
+    store.setTrackMix(id, mix)
+    mixBackoff.delete(id)
+    return !!mix
+  } catch (error) {
+    if (error instanceof JellyfinError && error.definitive) {
+      store.setTrackMix(id, null)
+      return false
+    }
+    if (mixBackoff.size > 10_000) mixBackoff.clear()
+    mixBackoff.set(id, Date.now() + MIX_BACKOFF)
+    throw error
+  } finally {
+    mixing.delete(id)
+  }
+}
+
+/** Analyses every song not analysed yet (with this version of the analysis); a few seconds each. */
+function scanMix(token: string, userId: string, scope: Scope = NO_SCOPE) {
+  return runJob<MixTrack & { Genres?: string[] }>(
+    jobs.mix,
+    async () => {
+      const done = store.currentTrackMixes(MIX_VERSION, MIX_RETRY)
+      const tracks = await libraryItems<MixTrack & { Genres?: string[] }>(token, userId, '/Users/{user}/Items', { Recursive: 'true', IncludeItemTypes: 'Audio', Fields: 'Genres' }, scope.libraries)
+      return tracks.filter((track) => !done.has(track.Id.toLowerCase()) && !leftOut(scope, [...(track.Artists ?? []), track.AlbumArtist], track.Genres))
+    },
+    (track) => (store.hasTrackMix(track.Id.toLowerCase(), MIX_VERSION, MIX_RETRY) ? Promise.resolve(true) : mixOf(token, track)),
+    (track) => ({ id: track.Id, title: track.Name ?? '', artist: track.Artists?.[0] ?? track.AlbumArtist ?? '' }),
+  )
+}
+
+/**
+ * Songs the apps asked for (GET /music/mix) that aren't analysed yet, done one after another in the background with
+ * the asker's token (a mixer-mode playlist fills in as it is played, without an administrator's run). Bounded, so a
+ * flood of requests can't grow it without end; what didn't fit is asked for again by the apps later.
+ */
+const mixQueue = new Map<string, string>()
+const MIX_QUEUE_MAX = 2000
+let mixRunning = false
+
+/** Queues a song (by lower-case id) unless it is queued, under way, backing off, or the queue is full. */
+function queueMix(id: string, token: string) {
+  if (mixQueue.has(id) || mixing.has(id) || (mixBackoff.get(id) ?? 0) > Date.now() || mixQueue.size >= MIX_QUEUE_MAX) return
+  mixQueue.set(id, token)
+  if (mixRunning) return
+  mixRunning = true
+  void (async () => {
+    try {
+      while (mixQueue.size) {
+        const [next, nextToken] = mixQueue.entries().next().value as [string, string]
+        mixQueue.delete(next)
+        try {
+          const person = tokens.get(nextToken)?.person
+          if (!person || store.hasTrackMix(next, MIX_VERSION, MIX_RETRY)) continue
+          const item = await fetch(`${JELLYFIN_URL}/Users/${person.id}/Items/${next}`, { headers: { Authorization: `MediaBrowser Token="${nextToken}"` }, signal: AbortSignal.timeout(15_000) })
+          if (!item.ok) {
+            // Not there for this person (or not at all): asked again only after the backoff.
+            mixBackoff.set(next, Date.now() + MIX_BACKOFF)
+            continue
+          }
+          const track = (await item.json()) as MixTrack & { Type?: string }
+          if (track.Type !== 'Audio') {
+            mixBackoff.set(next, Date.now() + MIX_BACKOFF)
+            continue
+          }
+          await mixOf(nextToken, track)
+        } catch (error) {
+          mixBackoff.set(next, Date.now() + MIX_BACKOFF)
+          console.warn(`Mix of ${next}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        // A breath between songs, for Jellyfin's transcoder and the other requests.
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+      }
+    } finally {
+      mixRunning = false
+    }
+  })()
+}
+
+/**
+ * What someone may do with a playlist, as Jellyfin decides it with their token: see it (it is a playlist they can
+ * open), and edit it (they own it, or it is shared with them for editing). Only a playlist someone may see is
+ * remembered, for a minute and for reading only: saving always asks Jellyfin afresh, and a Jellyfin error is never
+ * taken for a no (it throws).
+ */
+const playlistAccess = new Map<string, { see: boolean; edit: boolean; until: number }>()
+
+async function accessToPlaylist(token: string, userId: string, playlistId: string, fresh: boolean) {
+  const key = `${token}|${playlistId}`
+  const cached = playlistAccess.get(key)
+  if (!fresh && cached && cached.until > Date.now()) return cached
+  const headers = { Authorization: `MediaBrowser Token="${token}"` }
+  const access = { see: false, edit: false, until: Date.now() + 60_000 }
+  const item = await fetch(`${JELLYFIN_URL}/Users/${userId}/Items/${playlistId}?${new URLSearchParams({ Fields: 'CanDelete' })}`, { headers, signal: AbortSignal.timeout(15_000) })
+  if (item.status >= 500) throw new Error(`Jellyfin ${item.status}`)
+  if (item.ok) {
+    const playlist = (await item.json()) as { Type?: string; CanDelete?: boolean }
+    access.see = playlist.Type === 'Playlist'
+    // Who may delete a playlist owns it (or administers the server); others edit it when it is shared with them so.
+    if (access.see && playlist.CanDelete) access.edit = true
+    else if (access.see) {
+      const share = await fetch(`${JELLYFIN_URL}/Playlists/${playlistId}/Users/${userId}`, { headers, signal: AbortSignal.timeout(15_000) })
+      if (share.status >= 500) throw new Error(`Jellyfin ${share.status}`)
+      access.edit = share.ok && !!((await share.json()) as { CanEdit?: boolean }).CanEdit
+    }
+  }
+  if (playlistAccess.size > 5000) playlistAccess.clear()
+  if (access.see) playlistAccess.set(key, access)
+  else playlistAccess.delete(key)
+  return access
+}
+
 // ---- finding songs by their lyrics (see lyrics-search.ts) ----
 
 /**
@@ -1257,6 +1419,61 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     return serveKept(response, () => (image.src.startsWith('upload:') ? uploadedImage(image.src.slice('upload:'.length)) : keptImage(image.src)))
   }
 
+  // The separation worker (see stems.ts), with its own secret instead of a Jellyfin sign-in. GET
+  // /music/stems/jobs/next?wait=<s>[&role=fallback]: the next job ({id, item, window}), waiting up to 30 s for one
+  // (204: none); a fallback worker gets windows only, and nothing while a primary worker is around.
+  // GET /music/stems/jobs/<id>/audio: the job's window as WAV (stereo, 44.1 kHz, 16-bit), streamed from Jellyfin here.
+  // PUT /music/stems/jobs/<id>/<vocals|drums|bass|other>: one stem as FLAC. POST /music/stems/jobs/<id>/fail {error}.
+  if (path.startsWith('/music/stems/jobs/')) {
+    const worker = stemWorkers.authenticate(request.headers.authorization, request.socket.remoteAddress ?? 'unknown')
+    if (worker === 'limited') return send(response, 429, { error: 'Too many failed sign-ins' })
+    if (worker === 'denied') return send(response, 401, { error: 'Worker sign-in required' })
+    // An added worker's role is the one it was added with; the shared (deprecated) secret says its own.
+    const role = worker.id ? worker.role : url.searchParams.get('role') === 'fallback' ? 'fallback' : 'primary'
+    if (path === '/music/stems/jobs/next' && request.method === 'GET') {
+      const wait = Math.min(30, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000
+      // A worker that hangs up while waiting must not be handed a job (it would sit leased for 20 minutes).
+      const gone = new AbortController()
+      response.on('close', () => !response.writableFinished && gone.abort())
+      const job = await stems.next(wait, role, { id: worker.id, name: worker.name }, gone.signal)
+      if (job && gone.signal.aborted) {
+        stems.giveBack(job)
+        return
+      }
+      return job ? send(response, 200, { id: job.id, item: job.item, window: job.window, stems: STEMS, role }) : send(response, 204)
+    }
+    const jobPath = path.match(/^\/music\/stems\/jobs\/([0-9a-f-]{36})\/(audio|fail|vocals|drums|bass|other)$/)
+    const job = jobPath ? stems.job(jobPath[1]!) : null
+    if (!jobPath || !job) return send(response, 404, { error: 'No such job' })
+    const action = jobPath[2]!
+    if (action === 'audio' && request.method === 'GET') {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 5 * 60_000)
+      try {
+        const wav = await windowAudio(JELLYFIN_URL, job.token, job.item, job.window, controller.signal).catch(() => null)
+        if (!wav) return send(response, 502, { error: 'Jellyfin gave no audio' })
+        response.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length })
+        return response.end(wav)
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    if (action === 'fail' && request.method === 'POST') {
+      const body = await readJson<{ error?: unknown }>(request).catch(() => ({ error: undefined }))
+      stems.fail(job, typeof body.error === 'string' ? body.error : 'Worker failed')
+      return send(response, 204)
+    }
+    if (request.method === 'PUT' && (STEMS as readonly string[]).includes(action)) {
+      if (role === 'primary') stems.seen('primary')
+      const flac = await readBody(request, STEM_UPLOAD_LIMIT).catch(() => null)
+      if (!flac) return send(response, 413, { error: 'Too large' })
+      const received = await stems.receive(job, action as Stem, flac)
+      if (received.done) stemWorkers.jobDone(worker)
+      return received.error ? send(response, 400, { error: received.error }) : send(response, 204)
+    }
+    return send(response, 405, { error: 'Not allowed' })
+  }
+
   const me = await authenticate(tokenOf(request, url))
   if (!me) return send(response, 401, { error: 'Not signed in' })
 
@@ -1421,11 +1638,11 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     }
   }
 
-  // /admin/jobs/<credits|artists|languages|sound|lyrics>: an admin's task on the whole library (POST starts, DELETE
-  // stops, GET tells how far it is): looking up every track's credits, fetching every artist's information into the
-  // caches, filling in films and series in both languages, measuring every song's sound and fetching its tags, or
-  // putting every song's lyrics into the search index.
-  const jobName = path.match(/^\/admin\/jobs\/(credits|artists|languages|sound|lyrics)$/)?.[1] as JobName | undefined
+  // /admin/jobs/<credits|artists|languages|sound|lyrics|mix>: an admin's task on the whole library (POST starts,
+  // DELETE stops, GET tells how far it is): looking up every track's credits, fetching every artist's information into
+  // the caches, filling in films and series in both languages, measuring every song's sound and fetching its tags,
+  // putting every song's lyrics into the search index, or analysing every whole song for the mixer mode.
+  const jobName = path.match(/^\/admin\/jobs\/(credits|artists|languages|sound|lyrics|mix)$/)?.[1] as JobName | undefined
   if (jobName) {
     if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
     const job = jobs[jobName]
@@ -1443,6 +1660,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
       }
       if (jobName === 'credits') void scanCredits(token, me.id, scope)
       else if (jobName === 'lyrics') void scanLyrics(token, me.id, scope)
+      else if (jobName === 'mix') void scanMix(token, me.id, scope)
       else if (jobName === 'languages') void scanLanguages(token, me.id, isTmdbKey(body.tmdbKey) ? body.tmdbKey : undefined, scope.libraries)
       else {
         const lastfmKey = typeof body.lastfmKey === 'string' && /^[0-9a-f]{32}$/i.test(body.lastfmKey) ? body.lastfmKey : undefined
@@ -1697,6 +1915,234 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     }
     const artists = Object.fromEntries(Object.entries(store.artistTags()).map(([id, entry]) => [id, entry.tags]))
     return send(response, 200, { tracks, artists })
+  }
+
+  // GET /music/mix?ids=a,b,c: the whole-track analyses of up to 200 songs ({id: TrackMix | null}, see mix-analysis.ts).
+  // null: not analysed yet (it is now queued, with the asker's token) or it can't be (too long, silent). With
+  // summary=1 only {bpm, bpmConfidence, key, minor, keyClarity, duration} per song (for lists; the whole analysis is
+  // some 50 KB a song), queued alike.
+  if (path === '/music/mix' && request.method === 'GET') {
+    const ids = (url.searchParams.get('ids') ?? '').split(',').filter(Boolean)
+    if (!ids.length || ids.length > 200 || !ids.every((id) => /^[0-9a-f]{32}$/i.test(id))) return send(response, 400, { error: 'Bad ids' })
+    // Kept and queued by lower-case id; answered by the ids as asked.
+    const known = store.trackMixes(ids.map((id) => id.toLowerCase()), url.searchParams.get('summary') === '1')
+    const token = tokenOf(request, url)!
+    const entries = ids.map((id) => {
+      const entry = known[id.toLowerCase()]
+      const current = entry?.json && entry.version === MIX_VERSION
+      if (!current && !(entry && !entry.json && Date.now() - entry.at < MIX_RETRY)) queueMix(id.toLowerCase(), token)
+      // The kept JSON as it is (it is large: no parsing and writing again).
+      return `${JSON.stringify(id)}:${current ? entry.json : 'null'}`
+    })
+    response.writeHead(200, { 'Content-Type': 'application/json' })
+    return response.end(`{${entries.join(',')}}`)
+  }
+
+  // GET /music/mixer/<playlistId>: a playlist's mixer settings and transitions (PlaylistMixer; off and empty when never
+  // saved), for anyone who can see the playlist. PUT: saves them, for its owner and those it is shared with for editing.
+  // Once settings are kept, a PUT must name the `updated` it started from; an older one (or none) is turned down with
+  // 409 and the kept settings: someone else saved in between. Transitions that don't pass the checks are left out
+  // (their pairs get automatic ones); the answer says how many in `dropped`.
+  const mixer = path.match(/^\/music\/mixer\/([0-9a-f]{32})$/i)
+  if (mixer && (request.method === 'GET' || request.method === 'PUT')) {
+    const playlistId = mixer[1]!.toLowerCase()
+    const token = tokenOf(request, url)!
+    let access: { see: boolean; edit: boolean }
+    try {
+      access = await accessToPlaylist(token, me.id, playlistId, request.method === 'PUT')
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+    }
+    if (!access.see) return send(response, 404, { error: 'No such playlist' })
+    const kept = () => {
+      const stored = store.playlistMixer(playlistId)
+      return { stored, current: stored ? { ...(stored.data as object), updated: stored.updated } : { on: false, style: 'clean', transitions: {}, updated: 0 } }
+    }
+    if (request.method === 'GET') return send(response, 200, kept().current)
+    if (!access.edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+    const body = await readJson<Record<string, unknown>>(request, MIXER_BODY_LIMIT).catch(() => null)
+    // The baked clips the transitions name, read first (the check itself doesn't wait).
+    const clips = new Map<string, BakedMeta>()
+    const transitions = body && typeof body.transitions === 'object' && body.transitions ? Object.values(body.transitions as Record<string, unknown>) : []
+    for (const entry of transitions.slice(0, 1000)) {
+      const key = (entry as { baked?: { key?: unknown } } | null)?.baked?.key
+      if (typeof key === 'string' && isBakedKey(key) && !clips.has(key)) {
+        const meta = await bakedClips.meta(key)
+        if (meta && meta.playlistId === playlistId) clips.set(key, meta)
+      }
+    }
+    const lookup: BakedLookup = (key) => clips.get(key) ?? null
+    const parsed = parsePlaylistMixer(body, lookup)
+    if (!parsed) return send(response, 400, { error: 'Bad mixer settings' })
+    // Read again now that the body is in (another save may have landed meanwhile); from here on nothing waits.
+    const { stored, current } = kept()
+    if (stored && (typeof body?.updated !== 'number' || body.updated < stored.updated)) return send(response, 409, current)
+    if (parsed.dropped) console.warn(`Mixer of ${playlistId}: ${parsed.dropped} transition(s) left out`)
+    const updated = Math.max(Date.now(), (stored?.updated ?? 0) + 1)
+    store.setPlaylistMixer(playlistId, parsed.settings, me.id, updated)
+    return send(response, 200, { ...parsed.settings, updated, dropped: parsed.dropped })
+  }
+
+  // Baked transitions (see baked.ts). PUT /music/mix/baked/<key> {playlistId, from, to, start, length, engine}: describes a
+  // clip (replacing an earlier one and its parts), for those who may edit the playlist; then PUT …?part=a|b with the
+  // part as WAV (stereo, at most 48 kHz and 120 s). GET …?part=a|b&quality=original|<kbps>: the part as kept (24-bit
+  // FLAC) or as AAC at about that bitrate, for those who can see the playlist. DELETE: frees the clip (editors).
+  const baked = path.match(/^\/music\/mix\/baked\/([0-9a-f]{32})$/)
+  if (baked && ['GET', 'PUT', 'DELETE'].includes(request.method ?? '')) {
+    const key = baked[1]!
+    const part = url.searchParams.get('part')
+    if (part !== null && part !== 'a' && part !== 'b') return send(response, 400, { error: 'part is a or b' })
+    const token = tokenOf(request, url)!
+    const existing = await bakedClips.meta(key)
+    if (request.method === 'PUT' && part === null) {
+      const body = await readJson<Record<string, unknown>>(request, 16_384).catch(() => null)
+      const playlistId = typeof body?.playlistId === 'string' ? body.playlistId.toLowerCase() : ''
+      if (!/^[0-9a-f]{32}$/.test(playlistId)) return send(response, 400, { error: 'Bad playlistId' })
+      try {
+        if (!(await accessToPlaylist(token, me.id, playlistId, true)).edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+        if (existing && existing.playlistId !== playlistId && !(await accessToPlaylist(token, me.id, existing.playlistId, true)).edit) return send(response, 403, { error: 'The clip belongs to another playlist' })
+      } catch (error) {
+        return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+      }
+      const meta = await bakedClips.putMeta(key, body, me.id)
+      return typeof meta === 'string' ? send(response, 400, { error: meta }) : send(response, 200, meta)
+    }
+    if (!existing) return send(response, 404, { error: 'No such clip' })
+    let access: { see: boolean; edit: boolean }
+    try {
+      access = await accessToPlaylist(token, me.id, existing.playlistId, request.method !== 'GET')
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+    }
+    if (!access.see) return send(response, 404, { error: 'No such clip' })
+    if (request.method === 'GET') {
+      if (part === null) return send(response, 200, existing)
+      const file = await bakedClips.file(key, part, url.searchParams.get('quality') ?? 'original').catch((error) => {
+        console.warn(`Baked clip ${key}:`, error)
+        return null
+      })
+      return file ? serveFile(response, file) : send(response, 404, { error: 'No such part' })
+    }
+    if (!access.edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+    if (request.method === 'DELETE') {
+      await bakedClips.remove(key)
+      return send(response, 204)
+    }
+    if (part === null) return send(response, 400, { error: 'part is a or b' })
+    const wav = await readBody(request, BAKED_PART_LIMIT).catch(() => null)
+    if (!wav) return send(response, 413, { error: 'Too large' })
+    try {
+      const failed = await bakedClips.putPart(key, part, wav)
+      return failed ? send(response, 400, { error: failed }) : send(response, 204)
+    } catch (error) {
+      console.warn(`Baked clip ${key}:`, error)
+      return send(response, 500, { error: 'Could not keep the part' })
+    }
+  }
+
+  // Stems ("Mix-Modus", see stems.ts). POST /music/stems/preheat {playlistId, items: [{id, windows?: [{start, end}]}]}:
+  // asks for the songs' stems (whole songs without windows; windows up to 300 s), held for the playlist, for those who
+  // may edit it ({queued, ready}; 503 when no worker is configured). POST /music/stems/release {playlistId}: lets go of
+  // them (deleted unless another playlist holds them). GET /music/stems/status?ids=…: per song its windows' state.
+  // GET /music/stems/<item>/<window>/<stem>: one stem as FLAC, for those who can see the song.
+  if ((path === '/music/stems/preheat' || path === '/music/stems/release') && request.method === 'POST') {
+    const body = await readJson<{ playlistId?: unknown; items?: unknown }>(request, 262_144).catch(() => null)
+    const playlistId = typeof body?.playlistId === 'string' ? body.playlistId.toLowerCase() : ''
+    if (!/^[0-9a-f]{32}$/.test(playlistId)) return send(response, 400, { error: 'Bad playlistId' })
+    const token = tokenOf(request, url)!
+    try {
+      if (!(await accessToPlaylist(token, me.id, playlistId, true)).edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+    }
+    if (path === '/music/stems/release') return send(response, 200, await stems.release(playlistId))
+    if (!stemWorkers.enabled()) return send(response, 503, { error: 'No stem worker configured' })
+    const items = Array.isArray(body?.items) ? body.items : null
+    if (!items || items.length > 400) return send(response, 400, { error: 'Bad items' })
+    const wanted: Array<{ item: string; window: StemWindow }> = []
+    for (const entry of items as Array<{ id?: unknown; windows?: unknown }>) {
+      const item = typeof entry?.id === 'string' ? entry.id.toLowerCase() : ''
+      if (!/^[0-9a-f]{32}$/.test(item)) return send(response, 400, { error: 'Bad item id' })
+      const windows = entry.windows === undefined ? [{ start: 0, end: 0 }] : entry.windows
+      if (!Array.isArray(windows) || windows.length > 8) return send(response, 400, { error: 'Bad windows' })
+      for (const value of windows as Array<{ start?: unknown; end?: unknown }>) {
+        const window = windowOf(Number(value?.start), Number(value?.end))
+        if (!window) return send(response, 400, { error: 'Bad window' })
+        wanted.push({ item, window })
+      }
+    }
+    return send(response, 200, await stems.preheat(playlistId, token, wanted))
+  }
+  if (path === '/music/stems/status' && request.method === 'GET') {
+    const ids = (url.searchParams.get('ids') ?? '').toLowerCase().split(',').filter(Boolean)
+    if (!ids.length || ids.length > 400 || !ids.every((id) => /^[0-9a-f]{32}$/.test(id))) return send(response, 400, { error: 'Bad ids' })
+    return send(response, 200, await stems.status(ids))
+  }
+  const stemFile = path.match(/^\/music\/stems\/([0-9a-f]{32})\/(whole|\d{1,7}-\d{1,7})\/(vocals|drums|bass|other)$/i)
+  if (stemFile && request.method === 'GET') {
+    const item = stemFile[1]!.toLowerCase()
+    if (!(await canSeeItem(tokenOf(request, url)!, me.id, item))) return send(response, 404, { error: 'No such song' })
+    const file = await stems.file(item, stemFile[2]!, stemFile[3]!)
+    return file ? serveFile(response, file) : send(response, 404, { error: 'No such stem' })
+  }
+
+  // Stem workers, for administrators (see stem-workers.ts). GET /admin/stem-workers: {url, workers} (with each one's
+  // current jobs). PUT /admin/stem-workers/config {url}: the address put into join keys. POST /admin/stem-workers
+  // {name, role}: adds a worker and answers its join key, the only time it is shown. POST
+  // /admin/stem-workers/<id>/revoke and DELETE /admin/stem-workers/<id>: cut it off (its jobs go back to the queue).
+  if (path.startsWith('/admin/stem-workers')) {
+    if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
+    if (path === '/admin/stem-workers' && request.method === 'GET') {
+      const workers = stemWorkers.list().map(({ secretHash: _hash, ...worker }) => ({ ...worker, jobs: stems.heldBy(worker.id).map((job) => ({ item: job.item, window: job.window })) }))
+      return send(response, 200, { url: stemWorkers.url(), workers })
+    }
+    if (path === '/admin/stem-workers/config' && request.method === 'PUT') {
+      const body = await readJson<{ url?: unknown }>(request).catch(() => null)
+      const failed = typeof body?.url === 'string' ? stemWorkers.setUrl(body.url) : 'url missing'
+      return failed ? send(response, 400, { error: failed }) : send(response, 200, { url: stemWorkers.url() })
+    }
+    if (path === '/admin/stem-workers' && request.method === 'POST') {
+      const body = await readJson<{ name?: unknown; role?: unknown }>(request).catch(() => null)
+      const role = body?.role === 'fallback' ? 'fallback' : body?.role === 'primary' ? 'primary' : null
+      if (typeof body?.name !== 'string' || !role) return send(response, 400, { error: 'name and role (primary or fallback) needed' })
+      const added = stemWorkers.add(body.name, role, me.id)
+      if (typeof added === 'string') return send(response, 400, { error: added })
+      const { secretHash: _hash, ...worker } = added.worker
+      return send(response, 200, { worker, joinKey: added.joinKey })
+    }
+    const one = path.match(/^\/admin\/stem-workers\/([0-9a-f]{16})(\/revoke)?$/)
+    if (one && ((one[2] && request.method === 'POST') || (!one[2] && request.method === 'DELETE'))) {
+      const done = one[2] ? stemWorkers.revoke(one[1]!) : stemWorkers.remove(one[1]!)
+      if (!done) return send(response, 404, { error: 'No such worker' })
+      stems.dropWorker(one[1]!)
+      return send(response, 204)
+    }
+    return send(response, 404, { error: 'Not found' })
+  }
+
+  // POST /music/mix/training {playlistId, pair, …}: one transition someone saved in the editor, kept as training data
+  // for the planner (what it started from, the result, the edit, versions; the app decides the fields, at most 256 KB),
+  // for those who may edit the playlist. GET /admin/mix/training?after=<id>&limit=<n>: the kept rows as JSON lines,
+  // oldest first (administrators).
+  if (path === '/music/mix/training' && request.method === 'POST') {
+    const body = await readJson<Record<string, unknown>>(request, 262_144).catch(() => null)
+    const playlistId = typeof body?.playlistId === 'string' ? body.playlistId.toLowerCase() : ''
+    const pair = typeof body?.pair === 'string' ? body.pair : ''
+    if (!/^[0-9a-f]{32}$/.test(playlistId) || !/^[0-9a-f-]{32,36}>[0-9a-f-]{32,36}$/i.test(pair)) return send(response, 400, { error: 'Bad playlistId or pair' })
+    try {
+      if (!(await accessToPlaylist(tokenOf(request, url)!, me.id, playlistId, true)).edit) return send(response, 403, { error: 'Only those who may edit the playlist' })
+    } catch (error) {
+      return send(response, 502, { error: error instanceof Error ? error.message : 'Jellyfin unavailable' })
+    }
+    store.addMixTraining(me.id, playlistId, pair, body)
+    return send(response, 204)
+  }
+  if (path === '/admin/mix/training' && request.method === 'GET') {
+    if (!isAdmin(tokenOf(request, url))) return send(response, 403, { error: 'Administrators only' })
+    const after = Math.max(0, Number(url.searchParams.get('after')) || 0)
+    const limit = Math.min(10_000, Math.max(1, Number(url.searchParams.get('limit')) || 1000))
+    response.writeHead(200, { 'Content-Type': 'application/x-ndjson' })
+    return response.end(store.mixTraining(after, limit).map((row) => JSON.stringify(row)).join('\n') + '\n')
   }
 
   // GET /music/lyrics-search?q=…: songs whose lyrics have these words ({items, snippets: {id: lines around the match}}),

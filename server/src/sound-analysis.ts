@@ -27,8 +27,9 @@ export interface SoundFeatures {
 
 export const SOUND_VERSION = 1
 
-const MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
-const MINOR = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+/** Krumhansl–Kessler key profiles (major and minor), from C. */
+export const MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+export const MINOR = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
 
 /** The samples of a 16-bit PCM WAV (mono, or the first channel), with its sample rate; streaming WAVs (no sizes) too. */
 export function readWav(bytes: Uint8Array): { samples: Float32Array; rate: number } | null {
@@ -61,8 +62,28 @@ export function readWav(bytes: Uint8Array): { samples: Float32Array; rate: numbe
   return null
 }
 
+/**
+ * The twiddle factors of each FFT stage, made once per stage size (the same values the butterflies would compute, so the
+ * results don't change, only the time: long analyses run tens of thousands of transforms).
+ */
+const twiddles = new Map<number, { cos: Float64Array; sin: Float64Array }>()
+
+function twiddlesOf(size: number) {
+  let table = twiddles.get(size)
+  if (!table) {
+    const step = (-2 * Math.PI) / size
+    table = { cos: new Float64Array(size / 2), sin: new Float64Array(size / 2) }
+    for (let k = 0; k < size / 2; k++) {
+      table.cos[k] = Math.cos(step * k)
+      table.sin[k] = Math.sin(step * k)
+    }
+    twiddles.set(size, table)
+  }
+  return table
+}
+
 /** In-place radix-2 FFT (re, im of a power-of-two length). */
-function fft(re: Float64Array, im: Float64Array) {
+export function fft(re: Float64Array, im: Float64Array) {
   const n = re.length
   for (let i = 1, j = 0; i < n; i++) {
     let bit = n >> 1
@@ -74,11 +95,11 @@ function fft(re: Float64Array, im: Float64Array) {
     }
   }
   for (let size = 2; size <= n; size <<= 1) {
-    const step = (-2 * Math.PI) / size
+    const { cos: cosines, sin: sines } = twiddlesOf(size)
     for (let start = 0; start < n; start += size) {
       for (let k = 0; k < size / 2; k++) {
-        const cos = Math.cos(step * k)
-        const sin = Math.sin(step * k)
+        const cos = cosines[k]!
+        const sin = sines[k]!
         const a = start + k
         const b = a + size / 2
         const tre = re[b]! * cos - im[b]! * sin
@@ -92,8 +113,11 @@ function fft(re: Float64Array, im: Float64Array) {
   }
 }
 
-/** Magnitude spectra of windowed frames (Hann), `size` long, every `hop` samples. */
-function* spectra(samples: Float32Array, size: number, hop: number) {
+/**
+ * Magnitude spectra of windowed frames (Hann), `size` long, every `hop` samples. The yielded array is reused for the
+ * next frame: copy what has to outlive it.
+ */
+export function* spectra(samples: Float32Array, size: number, hop: number) {
   const window = Float64Array.from({ length: size }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / size))
   const re = new Float64Array(size)
   const im = new Float64Array(size)
@@ -109,7 +133,8 @@ function* spectra(samples: Float32Array, size: number, hop: number) {
   }
 }
 
-function pearson(a: number[], b: number[]) {
+/** Pearson correlation of two equally long lists (0 when either is flat). */
+export function pearson(a: number[], b: number[]) {
   const mean = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
   const ma = mean(a)
   const mb = mean(b)

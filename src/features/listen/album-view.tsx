@@ -302,6 +302,7 @@ export function TrackTableRow({
   extra,
   note,
   onRemove,
+  menuExtra,
 }: {
   track: BaseItemDto
   number: number
@@ -314,6 +315,8 @@ export function TrackTableRow({
   note?: ReactNode
   /** For a playlist's own entries: removes this one from the playlist. */
   onRemove?: () => void
+  /** Items of the list on top of the row's menu (a mixer playlist: edit the transition into the next song). */
+  menuExtra?: ReactNode
 }) {
   const { api } = useAuthedSession()
   const state = useNowPlaying()
@@ -323,7 +326,7 @@ export function TrackTableRow({
   const image = cover ? portraitImageUrl(api, track, { fillHeight: 80 }) : undefined
   return (
     <SwipeToQueue onQueue={() => music.addToQueue([track])} className="rounded-md">
-      <TrackContextMenu track={track} onRemove={onRemove}>
+      <TrackContextMenu track={track} onRemove={onRemove} extra={menuExtra}>
         <div
           role="button"
           tabIndex={0}
@@ -379,7 +382,7 @@ export function TrackTableRow({
             {/* Unknown until the scan has probed the file. */}
             <span className="max-md:hidden">{track.RunTimeTicks ? formatClock(ticksToSeconds(track.RunTimeTicks)) : '–'}</span>
           </span>
-          <TrackMenu track={track} onRemove={onRemove} />
+          <TrackMenu track={track} onRemove={onRemove} extra={menuExtra} />
         </div>
       </TrackContextMenu>
     </SwipeToQueue>

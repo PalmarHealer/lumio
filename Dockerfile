@@ -8,6 +8,8 @@ FROM node:24-alpine AS web
 WORKDIR /build
 RUN corepack enable
 COPY package.json pnpm-lock.yaml ./
+# pnpm applies these to dependencies while installing (patchedDependencies in package.json).
+COPY patches ./patches
 # The desktop app's Electron is not needed for the web build.
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 RUN pnpm install --frozen-lockfile
@@ -24,6 +26,8 @@ ARG LUMIO_BUILD
 RUN pnpm build
 
 FROM node:24-alpine
+# ffmpeg encodes baked transitions (FLAC masters, AAC copies for the player's quality setting): about +50 MB.
+RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY server/package.json ./server/
 COPY server/src ./server/src

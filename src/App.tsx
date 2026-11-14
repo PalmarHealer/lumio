@@ -27,6 +27,9 @@ import { EpisodePage, PodcastPage, PodcastsPage, SavedEpisodesPage } from '@/fea
 import { FollowListPage, ProfilePage as ListenProfilePage } from '@/features/listen/profile-page'
 import { ListenShell } from '@/features/listen/listen-shell'
 import { MusicPlayerHost } from '@/features/listen/player/music-host'
+import { MixerHost } from '@/features/listen/mixer/mixer-host'
+import { MixModeHost } from '@/features/listen/mixer/mixmode/mix-mode-host'
+import { TransitionEditorPage } from '@/features/listen/mixer/editor/editor-page'
 import { VideoDownloadsHost } from '@/features/player/video-download-ui'
 import { PlayEntry } from '@/features/listen/player/play-entry'
 import { DetailPage } from '@/features/items/detail-page'
@@ -41,6 +44,7 @@ import { DisplayPage } from '@/features/admin/display-page'
 import { MetadataPage } from '@/features/admin/metadata-page'
 import { PluginSettingsPage } from '@/features/admin/plugin-settings-page'
 import { StatsPage } from '@/features/admin/stats-page'
+import { StemWorkersPage } from '@/features/admin/stem-workers-page'
 import { BrandingEffects } from '@/features/admin/branding'
 import { BrandingPage } from '@/features/admin/branding-page'
 import { PluginRoutePage } from '@/features/admin/plugin-route-page'
@@ -86,12 +90,14 @@ function RootLayout() {
   )
 }
 
-/** The Lumio server connection (and the video downloads) exist only while someone is signed in. */
+/** The Lumio server connection (and the video downloads, the mixer mode) exist only while someone is signed in. */
 function SocialHostWhenSignedIn() {
   return useSession().session ? (
     <>
       <SocialHost />
       <VideoDownloadsHost />
+      <MixerHost />
+      <MixModeHost />
     </>
   ) : null
 }
@@ -118,6 +124,7 @@ function settingsRoutes() {
       <Route path="metadata" element={<MetadataPage />} />
       <Route path="plugin/:id" element={<PluginSettingsPage />} />
       <Route path="stats" element={<StatsPage />} />
+      <Route path="stem-workers" element={<StemWorkersPage />} />
     </Route>
   )
 }
@@ -158,6 +165,7 @@ const router = createBrowserRouter(
         <Route path="browse/:category" element={<CategoryPage />} />
         <Route path="library" element={<ListenLibraryPage />} />
         <Route path="playlist/:id" element={<PlaylistPage />} />
+        <Route path="playlist/:id/mix/:from/:to" element={<TransitionEditorPage />} />
         <Route path="official/:slug" element={<OfficialPlaylistPage />} />
         <Route path="liked" element={<LikedSongsPage />} />
         <Route path="user/:id" element={<ListenProfilePage />} />

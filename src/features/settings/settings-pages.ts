@@ -1,4 +1,4 @@
-import { IconBadgeCc, IconCards, IconChartBar, IconDatabase, IconDeviceDesktop, IconHome, IconInfoCircle, IconKeyboard, IconLayoutDashboard, IconLock, IconMovie, IconMusic, IconPalette, IconPlug, IconPuzzle, IconTags, IconUserCircle } from '@tabler/icons-react'
+import { IconBadgeCc, IconCards, IconChartBar, IconCpu, IconDatabase, IconDeviceDesktop, IconHome, IconInfoCircle, IconKeyboard, IconLayoutDashboard, IconLock, IconMovie, IconMusic, IconPalette, IconPlug, IconPuzzle, IconTags, IconUserCircle } from '@tabler/icons-react'
 import { inMode, useAppMode } from '@/lib/app-mode'
 import { inCapacitor } from '@/lib/capacitor'
 import { desktop } from '@/lib/desktop'
@@ -24,6 +24,7 @@ const labels = defineMessages({
     plugins: 'Plugins',
     metadata: 'Metadaten',
     stats: 'Wiedergabe-Statistik',
+    stemWorkers: 'Stem-Worker',
     groupAccount: 'Du',
     groupPlayback: 'Wiedergabe',
     groupLumio: 'Lumio',
@@ -47,6 +48,7 @@ const labels = defineMessages({
     plugins: 'Plugins',
     metadata: 'Metadata',
     stats: 'Playback statistics',
+    stemWorkers: 'Stem workers',
     groupAccount: 'You',
     groupPlayback: 'Playback',
     groupLumio: 'Lumio',
@@ -77,6 +79,7 @@ const PAGES = [
   { key: 'plugins', to: '/settings/plugins', icon: IconPuzzle, group: 'admin' },
   { key: 'metadata', to: '/settings/metadata', icon: IconTags, group: 'admin' },
   { key: 'stats', to: '/settings/stats', icon: IconChartBar, group: 'admin' },
+  { key: 'stemWorkers', to: '/settings/stem-workers', icon: IconCpu, group: 'admin' },
 ] as const
 
 /** Whether Lumio runs as one of its own apps (Android, desktop) rather than in a browser. */

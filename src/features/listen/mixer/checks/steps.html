@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Steps check</title>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      import { checkReverbStep, checkSteps } from './steps-check.ts'
+      const results = [...(await checkSteps()), await checkReverbStep()]
+      window.stepResults = results
+      document.getElementById('out').textContent = results.map((r) => JSON.stringify(r)).join('\n') + (results.every((r) => r.pass) ? '\nPASS' : '\nFAIL')
+      window.stepsDone = true
+    </script>
+  </body>
+</html>

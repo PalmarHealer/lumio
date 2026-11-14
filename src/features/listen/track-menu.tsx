@@ -14,7 +14,7 @@ import {
   IconTrash,
   IconUser,
 } from '@tabler/icons-react'
-import { useState, type ReactElement } from 'react'
+import { useState, type ReactElement, type ReactNode } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import {
@@ -122,7 +122,7 @@ export function LikeToggle({ track, className }: { track: BaseItemDto; className
  * What can be done with a track, shared by its "…" button and its right-click menu (as in Spotify): playlists, liked
  * songs, the queue, and the way to its album and artist. Podcast episodes only offer the queue and their show.
  */
-export function TrackMenuItems({ track, onRemove, removeLabel }: { track: BaseItemDto; onRemove?: () => void; removeLabel?: string }) {
+export function TrackMenuItems({ track, onRemove, removeLabel, extra }: { track: BaseItemDto; onRemove?: () => void; removeLabel?: string; extra?: ReactNode }) {
   const t = useMessages(messages)
   const navigate = useNavigate()
   const playlists = usePlaylists()
@@ -170,6 +170,13 @@ export function TrackMenuItems({ track, onRemove, removeLabel }: { track: BaseIt
 
   return (
     <>
+      {/* What the list itself adds for this row (a mixer playlist: its transition into the next song). */}
+      {extra && (
+        <>
+          {extra}
+          <DropdownMenuSeparator />
+        </>
+      )}
       <DropdownMenuSub>
         <DropdownMenuSubTrigger>
           <IconPlus /> {t.addToPlaylist}
@@ -241,11 +248,14 @@ export function TrackMenu({
   onRemove,
   removeLabel,
   visible,
+  extra,
 }: {
   track: BaseItemDto
   onRemove?: () => void
   removeLabel?: string
   visible?: boolean
+  /** Items of the list the row is in, on top of the menu. */
+  extra?: ReactNode
 }) {
   const t = useMessages(messages)
   return (
@@ -262,7 +272,7 @@ export function TrackMenu({
         <IconDots className="size-5" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-64" onClick={(event) => event.stopPropagation()}>
-        <TrackMenuItems track={track} onRemove={onRemove} removeLabel={removeLabel} />
+        <TrackMenuItems track={track} onRemove={onRemove} removeLabel={removeLabel} extra={extra} />
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -276,19 +286,22 @@ export function TrackContextMenu({
   track,
   onRemove,
   removeLabel,
+  extra,
   children,
 }: {
   track: BaseItemDto
   onRemove?: () => void
   /** What removing means here ("Remove from queue"); a playlist's own entries by default. */
   removeLabel?: string
+  /** Items of the list the row is in, on top of the menu. */
+  extra?: ReactNode
   children: ReactElement
 }) {
   return (
     <ContextMenu.Root>
       <ContextMenu.Trigger render={children} />
       <DropdownMenuContent className="w-64" onClick={(event) => event.stopPropagation()}>
-        <TrackMenuItems track={track} onRemove={onRemove} removeLabel={removeLabel} />
+        <TrackMenuItems track={track} onRemove={onRemove} removeLabel={removeLabel} extra={extra} />
       </DropdownMenuContent>
     </ContextMenu.Root>
   )

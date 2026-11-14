@@ -9,7 +9,8 @@ import type { Label, Localized, LocalizedMeta } from './languages.ts'
  * them, so others can see who they are), who follows whom, each person's privacy choices, what they last played, and
  * their Lumio settings that follow the account (the app decides which; the server keeps them as one JSON object),
  * the credits looked up for the library's tracks (see credits.ts), lyrics found outside Jellyfin, and films' and series' texts and pictures in both
- * languages (see languages.ts), shared by everyone.
+ * languages (see languages.ts), shared by everyone; and for the mixer mode, each song's whole-track analysis (see
+ * mix-analysis.ts) and each playlist's mixer settings and transitions.
  */
 export interface Privacy {
   /** Others see the person's public playlists on their profile. */
@@ -20,6 +21,33 @@ export interface Privacy {
   showFollowers: boolean
   /** Friends (people who follow each other) see what the person plays. */
   shareActivity: boolean
+}
+
+/** A separation worker as kept (see stem-workers.ts). */
+export interface StemWorkerRow {
+  id: string
+  name: string
+  role: 'primary' | 'fallback'
+  secretHash: string
+  created: number
+  createdBy: string
+  lastSeen: number | null
+  jobsDone: number
+  revoked: boolean
+}
+
+function stemWorkerRow(row: Record<string, unknown>): StemWorkerRow {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    role: row.role === 'fallback' ? 'fallback' : 'primary',
+    secretHash: String(row.secret_hash),
+    created: Number(row.created),
+    createdBy: String(row.created_by),
+    lastSeen: row.last_seen === null || row.last_seen === undefined ? null : Number(row.last_seen),
+    jobsDone: Number(row.jobs_done),
+    revoked: !!row.revoked,
+  }
 }
 
 export const DEFAULT_PRIVACY: Privacy = { showPlaylists: true, showFollowing: true, showFollowers: true, shareActivity: true }
@@ -163,6 +191,11 @@ export class Store {
       CREATE TABLE IF NOT EXISTS artist_tags (artist_id TEXT PRIMARY KEY, name TEXT NOT NULL, tags TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS lyrics (item_id TEXT PRIMARY KEY, data TEXT NOT NULL, source TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS playlist_adds (playlist_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (playlist_id, item_id));
+      CREATE TABLE IF NOT EXISTS track_mix (item_id TEXT PRIMARY KEY, data TEXT, at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS playlist_mixer (playlist_id TEXT PRIMARY KEY, data TEXT NOT NULL, user_id TEXT NOT NULL, updated INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS stem_workers (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, secret_hash TEXT NOT NULL, created INTEGER NOT NULL, created_by TEXT NOT NULL, last_seen INTEGER, jobs_done INTEGER NOT NULL DEFAULT 0, revoked INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS mix_training (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, user_id TEXT NOT NULL, playlist_id TEXT NOT NULL, pair TEXT NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS library_imports (user_id TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, ext_id TEXT NOT NULL, data TEXT NOT NULL, matched_id TEXT, at INTEGER NOT NULL, PRIMARY KEY (user_id, source, kind, ext_id));
     `)
     // How a play went (music too): why it started and ended, where it came from, shuffle, from the device, buffering.
@@ -535,6 +568,119 @@ export class Store {
     this.db
       .prepare('INSERT INTO lyrics (item_id, data, source, at) VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET data = excluded.data, source = excluded.source, at = excluded.at')
       .run(id, JSON.stringify(data), source, Date.now())
+  }
+
+  /**
+   * The whole-track analyses of these songs (see mix-analysis.ts) as kept, with when: `json` null means it was tried
+   * and the song couldn't be analysed. Songs never analysed are left out. The JSON is handed on as it is stored; with
+   * `summary`, only its tempo, key and length (bpm, bpmConfidence, key, minor, keyClarity, duration), cut out by SQLite.
+   */
+  trackMixes(ids: string[], summary = false): Record<string, { json: string | null; version: number; at: number }> {
+    const result: Record<string, { json: string | null; version: number; at: number }> = {}
+    const fields = ['bpm', 'bpmConfidence', 'key', 'minor', 'keyClarity', 'duration'].map((field) => `'${field}', data -> '$.${field}'`).join(', ')
+    const column = summary ? `CASE WHEN data IS NULL THEN NULL ELSE json_object(${fields}) END` : 'data'
+    const query = this.db.prepare(`SELECT ${column} AS data, json_extract(data, '$.v') AS v, at FROM track_mix WHERE item_id = ?`)
+    for (const id of ids) {
+      const row = query.get(id) as { data: string | null; v: number | null; at: number } | undefined
+      if (row) result[id] = { json: row.data, version: row.v ?? 0, at: row.at }
+    }
+    return result
+  }
+
+  setTrackMix(id: string, data: unknown) {
+    this.db
+      .prepare('INSERT INTO track_mix (item_id, data, at) VALUES (?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET data = excluded.data, at = excluded.at')
+      .run(id, data === null ? null : JSON.stringify(data), Date.now())
+  }
+
+  /**
+   * Whether a song's analysis is there and current: analysed with this version, or tried and failed less than `retry`
+   * ms ago (a failure is tried again later: Jellyfin may have been away, the file replaced).
+   */
+  hasTrackMix(id: string, version: number, retry: number) {
+    const row = this.db.prepare("SELECT data IS NULL AS failed, json_extract(data, '$.v') AS v, at FROM track_mix WHERE item_id = ?").get(id) as
+      | { failed: number; v: number | null; at: number }
+      | undefined
+    return !!row && (row.failed ? Date.now() - row.at < retry : row.v === version)
+  }
+
+  /** Every song whose analysis is current (see hasTrackMix), for the library run to skip. */
+  currentTrackMixes(version: number, retry: number): Set<string> {
+    const rows = this.db.prepare("SELECT item_id, data IS NULL AS failed, json_extract(data, '$.v') AS v, at FROM track_mix").all() as Array<{ item_id: string; failed: number; v: number | null; at: number }>
+    const now = Date.now()
+    return new Set(rows.filter((row) => (row.failed ? now - row.at < retry : row.v === version)).map((row) => row.item_id))
+  }
+
+  /** A playlist's mixer settings and transitions (the app's PlaylistMixer), null when never saved. */
+  playlistMixer(playlistId: string): { data: unknown; userId: string; updated: number } | null {
+    const row = this.db.prepare('SELECT data, user_id, updated FROM playlist_mixer WHERE playlist_id = ?').get(playlistId) as { data: string; user_id: string; updated: number } | undefined
+    return row ? { data: JSON.parse(row.data) as unknown, userId: row.user_id, updated: row.updated } : null
+  }
+
+  /** Every kept playlist mixer's transitions' baked clip keys (for keeping the clips they refer to). */
+  bakedKeysInUse(): Set<string> {
+    const keys = new Set<string>()
+    for (const row of this.db.prepare('SELECT data FROM playlist_mixer').all() as Array<{ data: string }>) {
+      const data = JSON.parse(row.data) as { transitions?: Record<string, { baked?: { key?: string } }> }
+      for (const transition of Object.values(data.transitions ?? {})) if (typeof transition.baked?.key === 'string') keys.add(transition.baked.key)
+    }
+    return keys
+  }
+
+  /** A server-wide setting an administrator made (see stem-workers.ts); null when never set. */
+  serverSetting(key: string): string | null {
+    const row = this.db.prepare('SELECT value FROM server_settings WHERE key = ?').get(key) as { value: string } | undefined
+    return row?.value ?? null
+  }
+
+  setServerSetting(key: string, value: string) {
+    this.db.prepare('INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
+  }
+
+  /** The separation workers administrators added (see stem-workers.ts), newest first; the secrets only as hashes. */
+  stemWorkers(): StemWorkerRow[] {
+    const rows = this.db.prepare('SELECT * FROM stem_workers ORDER BY created DESC').all() as Array<Record<string, unknown>>
+    return rows.map(stemWorkerRow)
+  }
+
+  stemWorker(id: string): StemWorkerRow | null {
+    const row = this.db.prepare('SELECT * FROM stem_workers WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    return row ? stemWorkerRow(row) : null
+  }
+
+  addStemWorker(worker: { id: string; name: string; role: string; secretHash: string; createdBy: string }) {
+    this.db.prepare('INSERT INTO stem_workers (id, name, role, secret_hash, created, created_by) VALUES (?, ?, ?, ?, ?, ?)').run(worker.id, worker.name, worker.role, worker.secretHash, Date.now(), worker.createdBy)
+  }
+
+  /** `seen` sets when it was last heard from; `jobDone` counts a finished job. */
+  touchStemWorker(id: string, change: { seen?: number; jobDone?: boolean }) {
+    if (change.seen !== undefined) this.db.prepare('UPDATE stem_workers SET last_seen = ? WHERE id = ?').run(change.seen, id)
+    if (change.jobDone) this.db.prepare('UPDATE stem_workers SET jobs_done = jobs_done + 1 WHERE id = ?').run(id)
+  }
+
+  revokeStemWorker(id: string) {
+    return this.db.prepare('UPDATE stem_workers SET revoked = 1 WHERE id = ?').run(id).changes > 0
+  }
+
+  deleteStemWorker(id: string) {
+    return this.db.prepare('DELETE FROM stem_workers WHERE id = ?').run(id).changes > 0
+  }
+
+  /** Keeps one saved transition as training data for the planner (see POST /music/mix/training). */
+  addMixTraining(userId: string, playlistId: string, pair: string, data: unknown) {
+    this.db.prepare('INSERT INTO mix_training (at, user_id, playlist_id, pair, data) VALUES (?, ?, ?, ?, ?)').run(Date.now(), userId, playlistId, pair, JSON.stringify(data))
+  }
+
+  /** The kept training data from `after` (an id) on, oldest first, at most `limit` rows. */
+  mixTraining(after: number, limit: number): Array<{ id: number; at: number; userId: string; playlistId: string; pair: string; data: unknown }> {
+    const rows = this.db.prepare('SELECT id, at, user_id, playlist_id, pair, data FROM mix_training WHERE id > ? ORDER BY id LIMIT ?').all(after, limit) as Array<{ id: number; at: number; user_id: string; playlist_id: string; pair: string; data: string }>
+    return rows.map((row) => ({ id: row.id, at: row.at, userId: row.user_id, playlistId: row.playlist_id, pair: row.pair, data: JSON.parse(row.data) as unknown }))
+  }
+
+  setPlaylistMixer(playlistId: string, data: unknown, userId: string, updated: number) {
+    this.db
+      .prepare('INSERT INTO playlist_mixer (playlist_id, data, user_id, updated) VALUES (?, ?, ?, ?) ON CONFLICT(playlist_id) DO UPDATE SET data = excluded.data, user_id = excluded.user_id, updated = excluded.updated')
+      .run(playlistId, JSON.stringify(data), userId, updated)
   }
 
   /** The credits looked up for these tracks (null: looked up, none found); tracks never looked up are left out. */

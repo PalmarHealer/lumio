@@ -40,8 +40,6 @@ interface Prefetch {
 }
 
 const inFlight = new Map<string, Prefetch>()
-/** The object URL handed to the audio element last; released when the next one is made. */
-let lastUrl: string | null = null
 
 function summarize() {
   const entries = Object.values(index)
@@ -95,9 +93,8 @@ export async function cachedAudioUrl(key: string): Promise<string | null> {
       saveIndex()
       return null
     }
-    if (lastUrl) URL.revokeObjectURL(lastUrl)
-    lastUrl = URL.createObjectURL(await response.blob())
-    return lastUrl
+    // A new object URL each time; the player releases it once no element plays it any more.
+    return URL.createObjectURL(await response.blob())
   } catch {
     return null
   }

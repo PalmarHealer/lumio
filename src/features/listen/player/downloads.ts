@@ -262,8 +262,6 @@ export async function clearDownloads() {
 
 export const isDownloaded = (id: string | null | undefined) => !!id && !!index.tracks[id]
 
-/** The object URL handed to the audio element last; released when the next one is made. */
-let lastUrl: string | null = null
 
 /** A playable address for a downloaded song, or null when it isn't downloaded. */
 export async function downloadedAudioUrl(id: string | null | undefined): Promise<string | null> {
@@ -276,9 +274,8 @@ export async function downloadedAudioUrl(id: string | null | undefined): Promise
       void reconcile()
       return null
     }
-    if (lastUrl) URL.revokeObjectURL(lastUrl)
-    lastUrl = URL.createObjectURL(await response.blob())
-    return lastUrl
+    // A new object URL each time; the player releases it once no element plays it any more.
+    return URL.createObjectURL(await response.blob())
   } catch {
     return null
   }

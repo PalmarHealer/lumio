@@ -14,7 +14,7 @@ import type { OfficialPlaylist } from './official'
 import { assemble } from './mix-engine'
 import { localDate } from './mixes'
 import { seeded, weightedShuffle } from './official'
-import { music } from './player/music-player'
+import { music, START } from './player/music-player'
 import { countsForTaste, NO_EXCLUSIONS, useTasteFilter } from './taste'
 import { buildTasteModel, fetchTasteSignals } from './taste-model'
 
@@ -132,11 +132,14 @@ export function useSimilarLibraryArtists(artist: BaseItemDto | undefined) {
   })
 }
 
-/** Today's radio of an artist for this listener: its query, shared by the page, the cards and "Go to radio". */
+/**
+ * Today's radio of an artist for this listener: its query, shared by the page, the cards and "Go to radio". What is
+ * left out of the taste profile counts from its next build on; leaving something out doesn't rebuild it.
+ */
 function radioQuery(api: Api, userId: string, queryClient: QueryClient, artist: BaseItemDto, taste: ReturnType<typeof useTasteFilter>) {
   const day = localDate(Date.now())
   return {
-    queryKey: ['radio-playlist', userId, artist.Id, day, taste.key, getLocale()],
+    queryKey: ['radio-playlist', userId, artist.Id, day, getLocale()],
     staleTime: 60 * 60_000,
     queryFn: async (): Promise<OfficialPlaylist> => {
       const t = messagesFor(messages)
@@ -173,14 +176,14 @@ export function useRadioPlaylist(artistId: string | undefined) {
   return { playlist: artistId ? query.data : undefined, isLoading: !!artistId && (!artist || query.isPending) }
 }
 
-/** Starts an artist's radio (today's, the same as its page shows). */
+/** Plays an artist's radio as its page's play button does (today's, with the playlist's own shuffle setting). */
 export function useArtistRadio() {
   const { api, session } = useAuthedSession()
   const queryClient = useQueryClient()
   const taste = useTasteFilter()
   return async (artist: BaseItemDto) => {
     const radio = await queryClient.fetchQuery(radioQuery(api, session.userId, queryClient, artist, taste))
-    if (radio.tracks.length) music.play(radio.tracks, 0, { source: `official:${radio.slug}`, shuffle: false })
+    if (radio.tracks.length) music.play(radio.tracks, START, { source: `official:${radio.slug}` })
   }
 }
 

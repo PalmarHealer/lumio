@@ -5,10 +5,11 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useAuthedSession } from '@/features/auth/session'
 import { useRemote, type RemoteTarget } from '@/features/remote/remote-provider'
+import { useRemoteSession } from '@/features/remote/remote-session'
 import { readLocalSettings } from '@/features/settings/local-settings'
 import { secondsToTicks, ticksToSeconds } from '@/lib/format'
 import { continuation } from '../radio'
-import { currentTrack, music, useMusic, useMusicTime, type MusicTime, type RepeatMode } from './music-player'
+import { currentTrack, music, useMusic, useMusicTime, useRemoteStart, type MusicTime, type RepeatMode } from './music-player'
 
 /**
  * What Listen's player shows and steers — the player bar, the side panel (lyrics, queue, now playing), the big view:
@@ -53,6 +54,21 @@ export function usePlayerControls(): PlayerControls {
   return controls
 }
 
+/**
+ * What plays — on this device, or on the one Lumio controls — for pages marking "this is playing": the track, whether
+ * it runs, and the collection it was started from (null when unknown, e.g. started on the device itself).
+ */
+export function useNowPlaying(): { track: BaseItemDto | undefined; playing: boolean; source: string | null; toggle: () => void } {
+  const controls = useContext(PlayerControlsContext)
+  const state = useMusic()
+  const started = useRemoteStart()
+  if (controls?.remote) {
+    const track = controls.track
+    return { track, playing: controls.playing, source: track?.Id && started.ids.has(track.Id) ? started.source : null, toggle: controls.toggle }
+  }
+  return { track: currentTrack(state), playing: state.playing, source: state.index >= 0 ? state.source : null, toggle: music.toggle }
+}
+
 /** Where the playing track is, in seconds (this device's, or the controlled one's). */
 export function usePlayerTime(): MusicTime {
   return useContext(PlayerTimeContext)
@@ -79,7 +95,6 @@ function useLocalControls(): PlayerControls {
   }
 }
 
-const POLL_MS = 2000
 const REPEAT_TO_JELLYFIN: Record<RepeatMode, string> = { off: 'RepeatNone', all: 'RepeatAll', one: 'RepeatOne' }
 const REPEAT_FROM_JELLYFIN: Record<string, RepeatMode> = { RepeatNone: 'off', RepeatAll: 'all', RepeatOne: 'one' }
 
@@ -98,13 +113,7 @@ interface RemoteClock {
  */
 function useRemoteControls(target: RemoteTarget | null, disconnect: () => void): { controls: PlayerControls; clock: RemoteClock } | null {
   const { api, session } = useAuthedSession()
-  const sessions = useQuery({
-    queryKey: ['remote-session', target?.sessionId],
-    enabled: !!target,
-    refetchInterval: POLL_MS,
-    queryFn: async () => (await getSessionApi(api).getSessions({ controllableByUserId: session.userId })).data,
-  })
-  const remote = target ? sessions.data?.find((entry) => entry.Id === target.sessionId) : undefined
+  const { query: sessions, remote, anchor } = useRemoteSession(target?.sessionId)
   const queueIds = (remote?.NowPlayingQueue ?? []).map((entry) => entry.Id!).filter(Boolean)
   const queueItems = useQuery({
     queryKey: ['remote-queue', queueIds.join(',')],
@@ -156,9 +165,8 @@ function useRemoteControls(target: RemoteTarget | null, disconnect: () => void):
   const clock: RemoteClock =
     fresh.position !== undefined
       ? { position: fresh.position, at: fresh.at, paused, duration }
-      : // The position is as of the device's last report (devices report every few seconds), not of our last asking:
-        // moving on from then keeps lyrics and the bar in time with it. Never later than our asking (clock skew).
-        { position: ticksToSeconds(state?.PositionTicks ?? 0), at: Math.min(reportedAt, Date.parse(remote?.LastPlaybackCheckIn ?? '') || reportedAt), paused, duration }
+      : // Where the device's playback stood and when (see useRemoteAnchor), so lyrics and the bar keep time with it.
+        { position: anchor?.position ?? 0, at: anchor?.at ?? reportedAt, paused, duration }
   const positionNow = () => Math.min(duration || Infinity, clock.position + (clock.paused ? 0 : Math.max(0, Date.now() - clock.at) / 1000))
 
   const byId = new Map((queueItems.data ?? []).map((item) => [item.Id, item]))

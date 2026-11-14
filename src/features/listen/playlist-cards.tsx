@@ -11,7 +11,8 @@ import { OfficialMenuItems, PlaylistMenuItems } from './library-menu'
 import { CardShell } from './music-card'
 import type { OfficialPlaylist } from './official'
 import { coverFontsReady, drawCover, type CoverStyle } from './official-covers'
-import { music, START, useMusic } from './player/music-player'
+import { music, START } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { hasCustomCover, mosaicSources, usePlaylistTracks } from './playlists'
 import { RadioCover } from './radio-card'
 
@@ -179,8 +180,8 @@ export function LikedCover({ className }: { className?: string }) {
 }
 
 function usePlayingSource(source: string) {
-  const state = useMusic()
-  const here = state.source === source && state.index >= 0
+  const state = useNowPlaying()
+  const here = state.source === source
   return { here, playing: here && state.playing }
 }
 

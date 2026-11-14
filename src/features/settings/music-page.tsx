@@ -12,9 +12,9 @@ import { networkTypeKnown } from '@/lib/network'
 import { playbackMessages, musicMessages } from './messages'
 import { ListeningHistorySection } from './spotify-import-section'
 
-const QUALITIES = [320, 256, 192, 128]
+const QUALITIES = [320, 256, 192, 160, 128]
 
-const RESET_KEYS = ['musicAutoplay', 'musicNormalization', 'musicQuality', 'musicQualityCellular'] as const
+const RESET_KEYS = ['musicAutoplay', 'musicNormalization', 'musicQuality', 'musicQualityMobile'] as const
 
 export function MusicPage() {
   const t = useMessages(musicMessages)
@@ -78,9 +78,9 @@ export function MusicPage() {
             id="music-quality-cellular"
             label={p.musicQualityCellularLabel}
             hint={p.musicQualityCellularHint}
-            value={settings.musicQualityCellular ?? 0}
+            value={settings.musicQualityMobile ?? 0}
             options={[{ value: SAME_AS_WIFI, label: p.sameAsWifi }, ...qualityOptions]}
-            onChange={(value) => update({ musicQualityCellular: value || null })}
+            onChange={(value) => update({ musicQualityMobile: value || null })}
           />
         )}
       </Section>

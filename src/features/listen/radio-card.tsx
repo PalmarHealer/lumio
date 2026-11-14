@@ -9,7 +9,7 @@ import { ArtistMenuItems } from './library-menu'
 import { CardShell } from './music-card'
 import { useFollowedArtists } from './playlists'
 import { useListeningStats } from './profiles'
-import { music, useMusic } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { useArtistRadio, useSimilarLibraryArtists } from './radio'
 
 const messages = defineMessages({
@@ -68,9 +68,9 @@ export function RadioCard({ artist }: { artist: BaseItemDto }) {
   const t = useMessages(messages)
   const radio = useArtistRadio()
   const similarFound = useSimilarLibraryArtists(artist).data ?? []
-  const state = useMusic()
+  const state = useNowPlaying()
   const source = `official:radio-${artist.Id}`
-  const here = state.source === source && state.index >= 0
+  const here = state.source === source
   return (
     <CardShell
       href={`/listen/official/radio-${artist.Id}`}
@@ -79,7 +79,7 @@ export function RadioCard({ artist }: { artist: BaseItemDto }) {
       subtitle={similarFound.length ? t.subtitle(similarFound.slice(0, 3).map((entry) => entry.Name).join(', ')) : undefined}
       here={here}
       playing={here && state.playing}
-      onPlay={() => (here ? music.toggle() : void radio(artist))}
+      onPlay={() => (here ? state.toggle() : void radio(artist))}
       cover={<RadioCover artist={artist} />}
     />
   )

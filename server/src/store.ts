@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
+import type { LibraryImport } from './library-imports.ts'
 import { DatabaseSync } from 'node:sqlite'
 import type { Label, Localized, LocalizedMeta } from './languages.ts'
 
@@ -195,6 +196,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS stem_workers (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, secret_hash TEXT NOT NULL, created INTEGER NOT NULL, created_by TEXT NOT NULL, last_seen INTEGER, jobs_done INTEGER NOT NULL DEFAULT 0, revoked INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS mix_training (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, user_id TEXT NOT NULL, playlist_id TEXT NOT NULL, pair TEXT NOT NULL, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS library_imports (user_id TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, ext_id TEXT NOT NULL, data TEXT NOT NULL, matched_id TEXT, at INTEGER NOT NULL, PRIMARY KEY (user_id, source, kind, ext_id));
     `)
     // How a play went (music too): why it started and ended, where it came from, shuffle, from the device, buffering.
     const playColumns = (this.db.prepare('PRAGMA table_info(plays)').all() as Array<{ name: string }>).map((column) => column.name)
@@ -374,6 +376,45 @@ export class Store {
     }
   }
 
+  /** Someone's library brought over from a service (see library-imports.ts), oldest first. */
+  libraryImports(userId: string, source: string): LibraryImport[] {
+    const rows = this.db
+      .prepare('SELECT kind, ext_id, data, matched_id, at FROM library_imports WHERE user_id = ? AND source = ? ORDER BY at, rowid')
+      .all(userId, source) as Array<{ kind: LibraryImport['kind']; ext_id: string; data: string; matched_id: string | null; at: number }>
+    return rows.map((row) => ({ kind: row.kind, extId: row.ext_id, data: JSON.parse(row.data) as LibraryImport['data'], matchedId: row.matched_id, at: row.at }))
+  }
+
+  /** Adds or updates entries (found since, a playlist's songs placed); one that is already there keeps its time. */
+  putLibraryImports(userId: string, source: string, items: Array<Omit<LibraryImport, 'at'>>) {
+    const statement = this.db.prepare(
+      `INSERT INTO library_imports (user_id, source, kind, ext_id, data, matched_id, at) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, source, kind, ext_id) DO UPDATE SET data = excluded.data, matched_id = excluded.matched_id`,
+    )
+    const now = Date.now()
+    this.db.exec('BEGIN')
+    try {
+      for (const item of items) statement.run(userId, source, item.kind, item.extId, JSON.stringify(item.data), item.matchedId, now)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  /** Forgets one entry, or (without a kind) all of a service's. */
+  deleteLibraryImports(userId: string, source: string, kind?: string, extId?: string) {
+    if (kind && extId) this.db.prepare('DELETE FROM library_imports WHERE user_id = ? AND source = ? AND kind = ? AND ext_id = ?').run(userId, source, kind, extId)
+    else this.db.prepare('DELETE FROM library_imports WHERE user_id = ? AND source = ?').run(userId, source)
+  }
+
+  /** Everyone's entries still missing something (for the wishlist). */
+  missingLibraryImports(): Array<LibraryImport & { userId: string }> {
+    const rows = this.db
+      .prepare("SELECT user_id, kind, ext_id, data, matched_id, at FROM library_imports WHERE matched_id IS NULL OR kind = 'playlist'")
+      .all() as Array<{ user_id: string; kind: LibraryImport['kind']; ext_id: string; data: string; matched_id: string | null; at: number }>
+    return rows.map((row) => ({ userId: row.user_id, kind: row.kind, extId: row.ext_id, data: JSON.parse(row.data) as LibraryImport['data'], matchedId: row.matched_id, at: row.at }))
+  }
+
   /** How much of a service's history someone brought in: plays, how many of them are songs in the library, first, last. */
   importedSummary(userId: string, source: string) {
     const row = this.db
@@ -417,12 +458,12 @@ export class Store {
       .all(userId, before) as Array<{ artist: string | null; subtitle: string | null; first: number }>
   }
 
-  /** Someone's song plays since a moment (imported ones too), for the taste signals the mixes are built from. */
+  /** Someone's song plays since a moment, oldest first (imported ones too), for the taste signals the mixes are built from. */
   tasteRows(userId: string, since: number) {
     const rows = this.db
-      .prepare("SELECT item_key, started_at, seconds, reason_end FROM plays WHERE user_id = ? AND kind = 'audio' AND started_at >= ?")
-      .all(userId, since) as Array<{ item_key: string; started_at: number; seconds: number; reason_end: string | null }>
-    return rows.map((row) => ({ key: row.item_key, startedAt: row.started_at, seconds: row.seconds, reasonEnd: row.reason_end }))
+      .prepare("SELECT item_key, started_at, seconds, reason_start, reason_end FROM plays WHERE user_id = ? AND kind = 'audio' AND started_at >= ? ORDER BY started_at")
+      .all(userId, since) as Array<{ item_key: string; started_at: number; seconds: number; reason_start: string | null; reason_end: string | null }>
+    return rows.map((row) => ({ key: row.item_key, startedAt: row.started_at, seconds: row.seconds, reasonStart: row.reason_start, reasonEnd: row.reason_end }))
   }
 
   /** What someone played from (album, playlist …) since a moment: the player's source per play, and how long it ran. */

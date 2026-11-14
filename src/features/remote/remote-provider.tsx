@@ -22,6 +22,7 @@ import { ticksToSeconds } from '@/lib/format'
 import { jellyfin } from '@/lib/jellyfin'
 import { remoteMessages } from './messages'
 import { RemoteBar } from './remote-bar'
+import { measureClockOffset } from './remote-session'
 import { readLocalSettings } from '@/features/settings/local-settings'
 import { handOverSnapshot, music, setRemoteSink } from '@/features/listen/player/music-player'
 import { handoffMessages } from './messages'
@@ -88,7 +89,6 @@ export function useRemote() {
 
 /** Reasons for a new play queue after which every member should open the new current item. */
 const QUEUE_REASONS_THAT_NAVIGATE = new Set(['NewPlaylist', 'SetCurrentItem', 'NextItem', 'PreviousItem'])
-const CLOCK_SAMPLES = 4
 /** A SyncPlay command only moves the playhead if it is off by more than this (0.5 s); smaller gaps would just cause stalls. */
 const SYNC_TOLERANCE_TICKS = 5_000_000
 const SOCKET_OPEN = 1
@@ -130,25 +130,6 @@ function answerTabProbes() {
   return () => channel.close()
 }
 
-/**
- * Time offset between this browser and the server: a few NTP-style round trips, keeping the one with the lowest latency.
- * SyncPlay commands carry server timestamps, so a client has to know what "now" is on the server.
- */
-async function measureClockOffset(request: () => Promise<{ RequestReceptionTime?: string; ResponseTransmissionTime?: string }>) {
-  let best: { offset: number; ping: number } | null = null
-  for (let i = 0; i < CLOCK_SAMPLES; i++) {
-    const sent = Date.now()
-    const reply = await request()
-    const received = Date.now()
-    const serverIn = Date.parse(reply.RequestReceptionTime ?? '')
-    const serverOut = Date.parse(reply.ResponseTransmissionTime ?? '')
-    if (Number.isNaN(serverIn) || Number.isNaN(serverOut)) continue
-    const ping = received - sent - (serverOut - serverIn)
-    const offset = (serverIn - sent + (serverOut - received)) / 2
-    if (!best || ping < best.ping) best = { offset, ping }
-  }
-  return best?.offset ?? 0
-}
 
 
 /**
@@ -544,12 +525,9 @@ export function RemoteProvider({ children }: { children: ReactNode }) {
     }
     setRemoteSink({
       play: (items, startIndex) => {
-        // Not here as well.
+        // Not here as well. No toast: the player bar already says where it plays, a toast on every song is noise.
         music.pause()
-        sessions
-          .play({ sessionId: target.sessionId, playCommand: 'PlayNow', itemIds: items.map((item) => item.Id!), startIndex })
-          .then(() => toast.success(messagesFor(handoffMessages).playingOn(target.name)))
-          .catch(failed)
+        sessions.play({ sessionId: target.sessionId, playCommand: 'PlayNow', itemIds: items.map((item) => item.Id!), startIndex }).catch(failed)
       },
       enqueue: (items, how) => {
         sessions

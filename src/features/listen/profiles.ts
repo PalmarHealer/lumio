@@ -117,10 +117,10 @@ const MONTH_MS = 30 * 24 * 60 * 60_000
  */
 export function useListeningStats() {
   const { api, session } = useAuthedSession()
-  // What is left out of the taste profile doesn't make anyone a top artist.
+  // What is left out of the taste profile doesn't make anyone a top artist (from the next regular build on).
   const taste = useTasteFilter()
   return useQuery({
-    queryKey: ['listening-stats', session.userId, taste.key],
+    queryKey: ['listening-stats', session.userId],
     enabled: taste.ready,
     staleTime: 10 * 60_000,
     queryFn: async () => {

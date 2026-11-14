@@ -12,8 +12,8 @@ import { podcastProgress, recordPodcastProgress } from '../podcasts'
 import { reportActivity } from '@/features/social/social'
 import { flushPlayback, rememberPlayback } from '@/lib/playback-outbox'
 import { recordRecent } from '../recent'
-import { adoptIntoCache, audioCacheAvailable, cachedAudioUrl, isCached, prefetchAudio, recordCachedPlay } from './audio-cache'
-import { isOffline } from '@/lib/network'
+import { adoptIntoCache, audioCacheAvailable, cachedAudioUrl, cachedKey, cancelPrefetches, prefetchAudio, prefetchDone, prefetchProgress, recordCachedPlay } from './audio-cache'
+import { isOffline, onCellular } from '@/lib/network'
 import { inJellyfinApp, setAppPlaybackManager, updateAppMediaSession } from '@/lib/native-app'
 import { inCapacitor } from '@/lib/capacitor'
 import { desktop } from '@/lib/desktop'
@@ -549,7 +549,38 @@ function wire(element: HTMLAudioElement) {
 /** The current track can't be played: the next transition's B takes over, or it is skipped (not the whole queue). */
 function failed(element: HTMLAudioElement) {
   if (running && running.a === element && !running.handedOver) return finishRunning(running)
+  if (retryStream(element)) return
   if (state.index < state.queue.length - 1) void go(state.index + 1, undefined, 'trackerror')
+}
+
+/** How often a broken stream of the same song is picked up again before it is skipped. */
+const STREAM_RETRIES = 3
+let streamRetries = 0
+
+/**
+ * A stream that broke off (mobile data, a tunnel) is picked up again where it stopped, a few times, before the song
+ * counts as unplayable: otherwise one bad stretch of network skipped through the whole queue. False when it isn't
+ * tried again (not the current track's element, a cached or downloaded song, or tried often enough).
+ */
+function retryStream(element: HTMLAudioElement) {
+  const item = currentTrack()
+  if (!item || !connection || element !== audio || element.src.startsWith('blob:') || streamRetries >= STREAM_RETRIES) return false
+  streamRetries++
+  // The connection is this song's alone while it recovers.
+  cancelPrefetches()
+  const at = element.currentTime || time.position
+  const cors = corsLoads.has(element)
+  setState({ buffering: true })
+  window.setTimeout(() => {
+    if (currentTrack() !== item || !connection || audio !== element) return
+    const fresh = load(element, streamUrl(item), cors)
+    holds.set(fresh, item)
+    trackGains.set(fresh, trackGains.get(element) ?? 1)
+    applyVolume()
+    if (at) fresh.addEventListener('loadedmetadata', () => (fresh.currentTime = at), { once: true })
+    void fresh.play().catch(() => setState({ playing: false, buffering: false }))
+  }, 2000 * streamRetries)
+  return true
 }
 
 /** Transcoded streams don't always know their length; the library does. */
@@ -657,12 +688,26 @@ async function go(index: number, startAt?: number, reason: StartReason = 'clickr
   // Paused: Jellyfin was told already; the play log still learns why it ended.
   else if (previous) logPlay('stopped', previous, false, playSessionId, { reasonEnd: endFor(reason) })
   playSessionId = crypto.randomUUID()
+  streamRetries = 0
   setState({ index, buffering: true })
   setTime({ position: startAt, duration: ticksToSeconds(item.RunTimeTicks ?? 0) })
   // Downloaded songs always play from the download, whatever its quality; then from the cache (instant, and without
   // a connection), else streamed.
   const downloaded = await downloadedAudioUrl(downloadId(item, externalOf(item)?.guid))
-  const key = downloaded ? null : cacheKey(item)
+  const wanted = downloaded ? null : cacheKey(item)
+  // The song starting gets the connection: downloads of other songs into the cache stop (they go on once it is
+  // loaded, see cacheAhead). One of this very song that is well on its way is waited for rather than loading the song
+  // a second time beside it.
+  aheadRound++
+  const progress = wanted ? prefetchProgress(wanted) : null
+  const waitFor = wanted && progress !== null && progress >= PREFETCH_WAIT_FROM ? wanted : null
+  cancelPrefetches(waitFor)
+  if (waitFor) {
+    await prefetchDone(waitFor)
+    if (currentTrack() !== item) return
+  }
+  // On mobile data (or offline) a copy cached in another quality plays rather than streaming the song again.
+  const key = wanted ? cachedKey(wanted, onCellular() || isOffline()) : null
   const cached = key ? await cachedAudioUrl(key) : null
   // Another track may have been chosen meanwhile.
   if (currentTrack() !== item || !audio) {
@@ -762,12 +807,12 @@ function shareActivity(playing: boolean) {
 
 // ---- downloading ahead ----
 
-/** Whether a track can play without a connection: downloaded, or in the cache (in the current quality). */
+/** Whether a track can play without a connection: downloaded, or in the cache (in any quality). */
 export function playableOffline(item: BaseItemDto) {
   const external = externalOf(item)
   if (isDownloaded(downloadId(item, external?.guid))) return true
   const key = cacheKey(item)
-  return !!key && isCached(key)
+  return !!key && !!cachedKey(key, true)
 }
 
 /** The cache key of a library track: its id and the quality it plays in (a different limit is a different file). */
@@ -779,25 +824,43 @@ function cacheKey(item: BaseItemDto) {
 /** Bumped on every track change, so a running round of downloads stops when the queue moved on. */
 let aheadRound = 0
 
+/** A download of the song about to start that is this far is waited for instead of streaming the song beside it. */
+const PREFETCH_WAIT_FROM = 0.5
+
 /**
- * While a song plays, the next ones (as many as set) are downloaded into the cache one after another, then the song
- * playing itself, so a song heard again comes from the cache. Off when "ahead" is set to none.
+ * Once the song playing is fully loaded (it always goes first), the next ones (as many as set; one on mobile data)
+ * are downloaded into the cache one after another, so they start from the cache: no song is loaded twice. Off when
+ * "ahead" is set to none.
  */
 async function cacheAhead() {
   if (!connection || !audioCacheAvailable) return
   const settings = readLocalSettings(connection.userId)
   if (!settings.musicPrefetch) return
-  const round = ++aheadRound
+  const round = aheadRound
   const limits = { maxBytes: settings.musicCacheMb * 1024 * 1024, keepOftenPlayed: settings.musicKeepOften }
-  const upcoming = state.queue.slice(state.index + 1, state.index + 1 + settings.musicPrefetch)
-  const playing = currentTrack()
-  for (const item of [...upcoming, ...(playing ? [playing] : [])]) {
+  if (!(await fullyBuffered(round))) return
+  const cellular = onCellular()
+  const upcoming = state.queue.slice(state.index + 1, state.index + 1 + (cellular ? 1 : settings.musicPrefetch))
+  for (const item of upcoming) {
     if (round !== aheadRound || !connection) return
     const key = cacheKey(item)
-    // Downloaded songs need no copy in the cache.
-    if (!key || isDownloaded(item.Id)) continue
-    await prefetchAudio(key, streamUrl(item, crypto.randomUUID()), limits, item === playing ? 1 : 0)
+    // Downloaded songs need no copy in the cache, nor do songs cached already (in any quality on mobile data).
+    if (!key || isDownloaded(item.Id) || cachedKey(key, cellular)) continue
+    await prefetchAudio(key, streamUrl(item, crypto.randomUUID()), limits)
   }
+}
+
+/** Waits until the song playing now is loaded to its end (false when the track changed meanwhile). */
+async function fullyBuffered(round: number) {
+  while (round === aheadRound && audio) {
+    // Converted streams don't always know their length; the library does.
+    const duration = durationOf()
+    const ranges = audio.buffered
+    if (audio.src.startsWith('blob:')) return true
+    if (duration > 0 && ranges.length && ranges.end(ranges.length - 1) >= duration - 1) return true
+    await new Promise((resolve) => setTimeout(resolve, 3000))
+  }
+  return false
 }
 
 function onEnded() {
@@ -869,6 +932,30 @@ export function setRemoteSink(next: RemoteSink | null) {
   } else planSoon()
 }
 
+/** What this app last started on the controlled device: from which collection, and its songs. */
+export interface RemoteStart {
+  source: string | null
+  ids: ReadonlySet<string>
+}
+let remoteStart: RemoteStart = { source: null, ids: new Set() }
+const remoteStartListeners = new Set<() => void>()
+
+/** Which collection the controlled device plays (pages mark it as playing, as they do for this device's queue). */
+export function useRemoteStart(): RemoteStart {
+  return useSyncExternalStore(
+    (listener) => {
+      remoteStartListeners.add(listener)
+      return () => remoteStartListeners.delete(listener)
+    },
+    () => remoteStart,
+  )
+}
+
+function startedRemotely(items: BaseItemDto[], source: string | undefined) {
+  remoteStart = { source: source ?? null, ids: new Set(items.map((item) => item.Id!)) }
+  for (const listener of remoteStartListeners) listener()
+}
+
 /**
  * What plays here right now, to hand over to another device: the current track and what follows it (podcasts left
  * out, as other devices can't play them), and where in the current track it is. null when nothing music is loaded.
@@ -918,6 +1005,7 @@ export const music = {
         const first = playable[startIndex === START ? Math.floor(Math.random() * playable.length) : at]!
         remoteSink!.play([first, ...shuffled(playable.filter((item) => item !== first))], 0)
       } else remoteSink!.play(playable, at)
+      startedRemotely(playable, options.source)
       if (options.source) recordRecent(options.source)
       return
     }
@@ -2003,6 +2091,9 @@ function handOver(r: Running) {
   audio = r.b
   standby = r.a
   playSessionId = r.plan.sessionId
+  streamRetries = 0
+  // A new track: the last one's round of downloads ahead stops (cacheAhead starts the next round).
+  aheadRound++
   setState({ index, buffering: false, playing: !r.b.paused && !fadingOut })
   setTime({ position: r.b.currentTime, duration: durationOf() })
   startContext = { reasonStart: 'trackdone', source: sourceOf(index), shuffle: state.shuffle, offline: r.plan.offline }

@@ -88,6 +88,15 @@ export async function lumioSend(method: 'POST' | 'PUT' | 'DELETE', path: string,
   })
 }
 
+/** A request to the Lumio server outside React, as useLumioFetch's; fails while there is no connection yet. */
+export const lumioFetch: LumioFetch = async (path, init) => {
+  if (!connection) throw new Error('Not connected')
+  return fetch(`${connection.base}${path}`, {
+    ...init,
+    headers: { Authorization: `MediaBrowser Token="${connection.token}"`, ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...init?.headers },
+  })
+}
+
 /** A file to the Lumio server (its bytes as the body, its type as the content type); null when there is no connection yet. */
 export async function lumioUpload(path: string, file: Blob): Promise<Response | null> {
   if (!connection) return null

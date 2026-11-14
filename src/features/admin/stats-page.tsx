@@ -9,6 +9,7 @@ import { defineMessages, getLocaleTag, useLocale, useMessages } from '@/lib/i18n
 import { cn } from '@/lib/utils'
 import { ProfileAvatar } from '@/features/listen/profile-page'
 import { useIsAdmin } from './use-admin-config'
+import { WishlistSection } from './wishlist-section'
 
 const messages = defineMessages({
   de: {
@@ -671,6 +672,7 @@ export function StatsPage() {
           )}
         </>
       )}
+      <WishlistSection />
     </SettingsPage>
   )
 }

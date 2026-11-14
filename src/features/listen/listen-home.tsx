@@ -16,7 +16,8 @@ import { CardRow, MusicRow, usePlayCollection } from './music-card'
 import { FollowedPodcastsRow } from './podcast-pages'
 import { useOfficialPlaylist, useOfficialPlaylists, type OfficialPlaylist } from './official'
 import { playCircle } from './play-circle'
-import { music, START, useMusic } from './player/music-player'
+import { music, START } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { LikedCover, OfficialCard, OfficialCover, PlaylistCard, PlaylistCover } from './playlist-cards'
 import { useFollowedArtists, useLikedSongs, usePlaylists, usePlaylistTracks } from './playlists'
 import { usePodcast } from './podcasts'
@@ -375,8 +376,8 @@ function TileShell({
   menu?: ReactNode
 }) {
   const t = useMessages(messages)
-  const state = useMusic()
-  const here = state.source === source && state.index >= 0
+  const state = useNowPlaying()
+  const here = state.source === source
   const playing = here && state.playing
   const tile = (
     <div className="group relative flex h-14 items-center gap-3 overflow-hidden rounded-md bg-foreground/[0.08] pr-2 transition-colors hover:bg-foreground/[0.16] data-popup-open:bg-foreground/[0.16] max-md:h-12 max-md:gap-2">
@@ -388,7 +389,7 @@ function TileShell({
       <button
         type="button"
         aria-label={playing ? t.pause(title) : t.play(title)}
-        onClick={() => (here ? music.toggle() : onPlay())}
+        onClick={() => (here ? state.toggle() : onPlay())}
         className={cn(
           playCircle.listen,
           'size-8 shrink-0 shadow-lg shadow-black/40 transition-opacity',

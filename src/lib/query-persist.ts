@@ -17,8 +17,13 @@ export const RESTORE_TIMEOUT_MS = 400
  * Queries not worth keeping: typed searches, answers that change by the minute, what the browser measures itself, the
  * mixer's whole-track analyses (tens of kilobytes a song; the server has them at hand) and playlists' mixer settings
  * (their transitions add up, and an old copy would make a playlist mix or not mix by what it was once).
+ * Never stream info ('playback'): it holds one playback's session and, for a stored episode, a blob: URL that is dead
+ * after a restart; restored, the player opened that dead address and the title "could not be played".
  */
-const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'track-mix', 'playlist-mixer'])
+const SKIP = new Set([
+  'storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'remote-sessions', 'server-clock-offset',
+  'playback', 'track-mix', 'playlist-mixer',
+])
 
 interface Saved {
   savedAt: number
@@ -50,7 +55,8 @@ export async function restoreQueryCache(client: QueryClient) {
   if (!available()) return
   try {
     const saved = (await run('readonly', (store) => store.get(KEY))) as Saved | undefined
-    if (saved && Date.now() - saved.savedAt < MAX_AGE_MS) hydrate(client, saved.state)
+    // Filtered here too: data saved by an older version may hold what is skipped now.
+    if (saved && Date.now() - saved.savedAt < MAX_AGE_MS) hydrate(client, { ...saved.state, queries: saved.state.queries.filter((query) => !SKIP.has(String(query.queryKey[0]))) })
   } catch {
     // Nothing kept (or the browser blocks IndexedDB): the app loads from the server as usual.
   }

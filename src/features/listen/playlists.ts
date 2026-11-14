@@ -1,3 +1,4 @@
+import type { Api } from '@jellyfin/sdk'
 import { BaseItemKind, ItemFields, ItemFilter, ItemSortBy, MediaType, SortOrder, type BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
 import { getDisplayPreferenceApi } from '@jellyfin/sdk/lib/utils/api/display-preference-api'
 import { getImageApi } from '@jellyfin/sdk/lib/utils/api/image-api'
@@ -297,6 +298,21 @@ export const PREFS_ID = 'lumio-listen'
 export const CLIENT = 'lumio'
 
 const EMPTY_LIBRARY: ListenLibrary = { saved: [], folders: [], pinned: DEFAULT_PINS }
+
+/** Adds entries (`podcast:<id>` …) to the saved ones, newest first, outside React (an import). */
+export async function addToListenLibrary(api: Api, userId: string, ids: string[]) {
+  const prefs = getDisplayPreferenceApi(api)
+  const { data } = await prefs.getDisplayPreferences({ displayPreferencesId: PREFS_ID, userId, client: CLIENT })
+  const saved = data.CustomPrefs?.saved ? (JSON.parse(data.CustomPrefs.saved) as string[]) : []
+  const added = ids.filter((id) => !saved.includes(id))
+  if (!added.length) return
+  await prefs.updateDisplayPreferences({
+    displayPreferencesId: PREFS_ID,
+    userId,
+    client: CLIENT,
+    displayPreferencesDto: { ...data, CustomPrefs: { ...data.CustomPrefs, saved: JSON.stringify([...added, ...saved]) } },
+  })
+}
 
 export function useListenLibrary() {
   const { api, session } = useAuthedSession()

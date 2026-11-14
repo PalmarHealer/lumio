@@ -199,13 +199,15 @@ interface LibrarySong {
   albumId?: string
   album: string
   artists: Set<string>
+  /** Its title names another version (remix, live …): never found by the bare title. */
+  version: boolean
 }
 
 /** The library's songs, as far as matching needs them. */
 export type LibraryItem = Pick<BaseItemDto, 'Id' | 'Name' | 'Album' | 'AlbumId' | 'AlbumArtist' | 'Artists' | 'AlbumArtists'>
 
 /** Every song in the library (fetched in pages). */
-async function librarySongs(api: Api, userId: string, onStep: (step: ImportStep) => void) {
+export async function librarySongs(api: Api, userId: string, onStep: (step: ImportStep) => void) {
   const items: LibraryItem[] = []
   const page = 5000
   let total = Infinity
@@ -237,6 +239,7 @@ function libraryIndex(items: LibraryItem[]) {
       id: item.Id,
       albumId: item.AlbumId ?? undefined,
       album: looseName(item.Album ?? ''),
+      version: otherVersion(item.Name),
       artists: new Set([...(item.Artists ?? []), ...(item.AlbumArtists?.map((artist) => artist.Name ?? '') ?? []), item.AlbumArtist ?? ''].filter(Boolean).map((name) => looseName(name))),
     }
     for (const [map, key] of [[byTitle, looseName(item.Name)], [byBareTitle, looseName(item.Name, true)]] as const) {
@@ -248,28 +251,49 @@ function libraryIndex(items: LibraryItem[]) {
   return { byTitle, byBareTitle }
 }
 
+/** Notes in a title that make it another recording than the plain title ("Monster - Robin Schulz Remix"). */
+const VERSION = /\b(remix|rmx|mix|instrumental|live|acoustic|unplugged|karaoke|sped up|slowed|nightcore|cover|club edit|extended|vip|bootleg|rework|flip)\b/i
+
+function otherVersion(title: string) {
+  const notes = [...title.matchAll(/[([]([^)\]]*)[)\]]/g)].map((match) => match[1]).join(' ') + ' ' + (title.match(/\s+-\s+(.*)$/)?.[1] ?? '')
+  return VERSION.test(notes)
+}
+
+/**
+ * Finds songs in the library: the same title and artist, the same album if it can (a title without its notes, "Live",
+ * "Remix" …, when the full one isn't there).
+ */
+export function songFinder(items: LibraryItem[]) {
+  const library = libraryIndex(items)
+  const found = new Map<string, LibrarySong | null>()
+  return (title: string, artistName: string, albumName?: string) => {
+    const cacheKey = `${title}|${artistName}|${albumName ?? ''}`
+    let song = found.get(cacheKey)
+    if (song === undefined) {
+      const artist = looseName(artistName)
+      const album = looseName(albumName ?? '')
+      const pick = (candidates: LibrarySong[] | undefined) => {
+        const byArtist = candidates?.filter((candidate) => candidate.artists.has(artist)) ?? []
+        return byArtist.find((candidate) => candidate.album === album) ?? byArtist[0]
+      }
+      // Without its notes only when they don't name another version (a remix isn't the original).
+      song = pick(library.byTitle.get(looseName(title))) ?? (otherVersion(title) ? undefined : pick(library.byBareTitle.get(looseName(title, true))?.filter((candidate) => !candidate.version))) ?? null
+      found.set(cacheKey, song)
+    }
+    return song ? { id: song.id, albumId: song.albumId } : undefined
+  }
+}
+
 /**
  * Points each song to the library's, when the library has it (same title and artist; the same album if it can).
  * Returns how many plays found their song.
  */
 export function matchLibrary(plays: ImportPlay[], items: LibraryItem[]) {
-  const library = libraryIndex(items)
-  const found = new Map<string, LibrarySong | null>()
+  const find = songFinder(items)
   let matched = 0
   for (const play of plays) {
     if (play.kind !== 'audio' || !play.artist) continue
-    const cacheKey = `${play.title}|${play.artist}|${play.album ?? ''}`
-    let song = found.get(cacheKey)
-    if (song === undefined) {
-      const artist = looseName(play.artist)
-      const album = looseName(play.album ?? '')
-      const pick = (candidates: LibrarySong[] | undefined) => {
-        const byArtist = candidates?.filter((candidate) => candidate.artists.has(artist)) ?? []
-        return byArtist.find((candidate) => candidate.album === album) ?? byArtist[0]
-      }
-      song = pick(library.byTitle.get(looseName(play.title))) ?? pick(library.byBareTitle.get(looseName(play.title, true))) ?? null
-      found.set(cacheKey, song)
-    }
+    const song = find(play.title, play.artist, play.album)
     if (!song) continue
     play.key = song.id
     play.contextId = song.albumId

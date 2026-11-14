@@ -11,7 +11,7 @@ import { useLumioFetch } from '@/features/social/social'
 import { fetchSound } from './sound'
 import { useRadioPlaylist } from './radio'
 import { useTasteFilter } from './taste'
-import { buildTasteModel, fetchTasteSignals, slotOf, type TasteModel } from './taste-model'
+import { buildTasteModel, fetchTasteSignals, fetchTasteSittings, slotOf, type TasteModel } from './taste-model'
 
 /**
  * Official playlists: made by the platform (shown under the instance's name and logo, like Spotify's own playlists),
@@ -108,16 +108,17 @@ export function useOfficialPlaylists() {
   const get = (path: string) => lumioFetch(path)
   const { categories, isLoading: categoriesLoading } = useCategories('listen')
   const views = categories.find((category) => category.id === 'music')?.views ?? []
-  // The personal mixes follow the taste profile (what is left out of it doesn't count).
+  // The personal mixes follow the taste profile (what is left out of it doesn't count). Leaving something out doesn't
+  // rebuild them: the next regular build (day part, half an hour) uses it, as Spotify's mixes do.
   const taste = useTasteFilter()
   // Made anew when the day part turns over (the daylist), so a page left open switches too.
   const period = useMixPeriod()
   const query = useQuery({
-    queryKey: ['official-playlists', session.userId, views.map((view) => view.Id), getLocale(), taste.key, period],
+    queryKey: ['official-playlists', session.userId, views.map((view) => view.Id), getLocale(), period],
     enabled: views.length > 0 && taste.ready,
     staleTime: 30 * 60_000,
     queryFn: async (): Promise<OfficialPlaylist[]> => {
-      const [lists, signals, sound] = await Promise.all([
+      const [lists, signals, sound, sittings] = await Promise.all([
         Promise.all(
           views.map(
             async (view) =>
@@ -135,14 +136,15 @@ export function useOfficialPlaylists() {
         ),
         fetchTasteSignals(queryClient, session.userId, get),
         fetchSound(queryClient, get),
+        fetchTasteSittings(queryClient, session.userId, get),
       ])
       const tracks = lists.flat()
       const now = Date.now()
       const t = messagesFor(officialMessages)
       // Last.fm's similar artists to the listener's favourites point the discoveries outward (a failure: without).
-      const first = buildTasteModel(tracks, signals, taste.counts, now)
+      const first = buildTasteModel(tracks, signals, taste.counts, now, undefined, sittings)
       const similar = await similarToFavourites(tracks, first).catch(() => new Set<string>())
-      const model = similar.size ? buildTasteModel(tracks, signals, taste.counts, now, similar) : first
+      const model = similar.size ? buildTasteModel(tracks, signals, taste.counts, now, similar, sittings) : first
       const mixes = await madeForYou({ tracks, model, now, userId: session.userId }, sound, seeded)
       const playlists = buildPlaylists(tracks, t, taste.counts)
       // The charts come from Last.fm; a failure just leaves them out.

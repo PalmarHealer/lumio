@@ -29,11 +29,12 @@ import { useSocialMe } from '@/features/social/social'
 import { externalOf } from '@/lib/external-items'
 import { cn } from '@/lib/utils'
 import { useOfficialPlaylist, useOfficialPlaylists } from './official'
-import { useMusic } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { LikedCover, OfficialCover, PlaylistCover, SavedEpisodesCover } from './playlist-cards'
 import { ProfileAvatar } from './profile-page'
 import { useProfile } from './profiles'
 import { useFollowedPodcasts, useSavedEpisodes, type Podcast } from './podcasts'
+import { PendingMenuItems, pendingMessages, usePendingImports, useRemovePending } from './library-import-state'
 import {
   AlbumMenuItems,
   ArtistMenuItems,
@@ -134,6 +135,9 @@ export function LibrarySidebar({ compact, className, titleClassName }: { compact
   const podcasts = useFollowedPodcasts()
   const savedEpisodes = useSavedEpisodes()
   const like = useLikeTracks()
+  const pending = usePendingImports()
+  const removePending = useRemovePending()
+  const pendingT = useMessages(pendingMessages)
   const [openFolders, setOpenFolders] = useOpenFolders()
   const [renaming, setRenaming] = useState<{ id: string; name: string } | null>(null)
 
@@ -229,6 +233,25 @@ export function LibrarySidebar({ compact, className, titleClassName }: { compact
       kinds: ['albums'] as Filter[],
       render: (props: EntryExtra) => (
         <ItemEntry key={album.Id} item={album} compact={compact} subtitle={`${t.album} · ${album.AlbumArtist ?? ''}`} menu={<AlbumMenuItems album={album} />} {...props} />
+      ),
+    })),
+    // From the Spotify import, not in Jellyfin yet: greyed out until they arrive (or are removed).
+    ...[...pending.artists, ...pending.albums].map((row) => ({
+      key: `pending:${row.kind}:${row.extId}`,
+      kinds: [row.kind === 'artist' ? 'artists' : 'albums'] as Filter[],
+      render: (props: EntryExtra) => (
+        <Entry
+          key={row.extId}
+          compact={compact}
+          to=""
+          unavailable
+          title={row.data.title}
+          subtitle={`${row.kind === 'artist' ? t.artist : `${t.album} · ${row.data.artist ?? ''}`} · ${pendingT.notInLibrary}`}
+          round={row.kind === 'artist'}
+          cover={<MissingCover type={row.kind === 'artist' ? 'MusicArtist' : 'MusicAlbum'} />}
+          menu={<PendingMenuItems onRemove={() => removePending.entry(row)} />}
+          {...props}
+        />
       ),
     })),
   ]
@@ -853,14 +876,48 @@ interface EntryProps {
   onTracksDrop?: (tracks: BaseItemDto[]) => void
   /** Its right-click menu. */
   menu?: ReactNode
+  /** Not in Jellyfin yet (from an import): greyed out, leads nowhere; only its menu works. */
+  unavailable?: boolean
 }
 
-function Entry({ to, title, subtitle, cover, compact, round, source, onTracksDrop, menu, pinned, nested, target }: EntryProps & EntryExtra) {
-  const state = useMusic()
-  const playing = !!source && state.source === source && state.index >= 0
+function Entry({ to, title, subtitle, cover, compact, round, source, onTracksDrop, menu, unavailable, pinned, nested, target }: EntryProps & EntryExtra) {
+  const state = useNowPlaying()
+  const playing = !!source && state.source === source
   const drop = useTrackDrop((tracks) => onTracksDrop?.(tracks), !!onTracksDrop)
   const entryDnd = useEntryDnd(target)
-  const link = (
+  const inner = (
+    <>
+      <span data-cover className={cn('shrink-0 overflow-hidden bg-muted', compact ? 'size-10' : 'size-12', round ? 'rounded-full' : 'rounded')}>{cover}</span>
+      {!compact && (
+        <span className="min-w-0 flex-1">
+          <span data-title className={cn('block truncate text-sm font-medium', playing && 'text-listen')}>{title}</span>
+          <span className="flex items-center gap-1 truncate text-xs text-muted-foreground">
+            {pinned && <IconPinnedFilled className="size-3 shrink-0 text-listen" />}
+            <span className="truncate">{subtitle}</span>
+          </span>
+        </span>
+      )}
+      {!compact && playing && <IconVolume className="size-4 shrink-0 text-listen" />}
+    </>
+  )
+  const link = unavailable ? (
+    <div
+      {...entryDnd.drag}
+      {...entryDnd.drop}
+      title={compact ? title : undefined}
+      aria-label={title}
+      aria-disabled
+      className={cn(
+        'flex cursor-default items-center gap-3 rounded-md p-1.5 opacity-45 outline-none transition-colors hover:bg-foreground/[0.04]',
+        'data-popup-open:bg-foreground/10',
+        nested && !compact && 'pl-2',
+        compact ? 'mx-auto w-fit justify-center p-1' : '',
+        dropMark(entryDnd.part, target),
+      )}
+    >
+      {inner}
+    </div>
+  ) : (
     <NavLink
       {...entryDnd.drag}
       {...mergeHandlers(drop.handlers, entryDnd.drop)}
@@ -882,17 +939,7 @@ function Entry({ to, title, subtitle, cover, compact, round, source, onTracksDro
         )
       }
     >
-      <span data-cover className={cn('shrink-0 overflow-hidden bg-muted', compact ? 'size-10' : 'size-12', round ? 'rounded-full' : 'rounded')}>{cover}</span>
-      {!compact && (
-        <span className="min-w-0 flex-1">
-          <span data-title className={cn('block truncate text-sm font-medium', playing && 'text-listen')}>{title}</span>
-          <span className="flex items-center gap-1 truncate text-xs text-muted-foreground">
-            {pinned && <IconPinnedFilled className="size-3 shrink-0 text-listen" />}
-            <span className="truncate">{subtitle}</span>
-          </span>
-        </span>
-      )}
-      {!compact && playing && <IconVolume className="size-4 shrink-0 text-listen" />}
+      {inner}
     </NavLink>
   )
   if (!menu) return link

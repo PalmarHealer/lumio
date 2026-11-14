@@ -12,6 +12,7 @@ import {
 } from '@tabler/icons-react'
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
+import { useNavigate } from 'react-router'
 import { FadeImage } from '@/components/media/fade-image'
 import { ImageLightbox } from '@/components/media/image-lightbox'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
@@ -25,14 +26,14 @@ import { backdropImageUrl, portraitImageUrl } from '@/lib/images'
 import { cn, tintWash } from '@/lib/utils'
 import { TrackTableRow } from './album-view'
 import { ArtistAboutDialog } from './artist-about'
-import { useArtistRadio } from './radio'
 import { ArtistConcerts } from './concert-pages'
 import { sameName, useLastfmArtist, useLastfmTopTracks } from './external'
 import { CardRow, MusicCard, MusicRow } from './music-card'
 import { useReleaseLine } from './artist-discography'
 import { LikedFromArtist } from './artist-liked'
 import { Link } from '@/components/link'
-import { currentTrack, music, START, useMusic } from './player/music-player'
+import { music, START } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { ShuffleToggle } from './shuffle-toggle'
 import { playCircle } from './play-circle'
 import { useArtistBio, useArtistPhoto } from './artist-photo'
@@ -129,8 +130,8 @@ export function ArtistPage({ item }: { item: BaseItemDto }) {
   const topTracks = useLastfmTopTracks(item.Name ?? undefined)
   const tracks = useArtistTracks(item.Id ?? undefined)
   const albums = useArtistAlbums(item.Id ?? undefined)
-  const state = useMusic()
-  const radio = useArtistRadio()
+  const state = useNowPlaying()
+  const navigate = useNavigate()
 
   const banner = backdropImageUrl(api, item, { fillWidth: 1600 })
   const ownPhoto = portraitImageUrl(api, item, { fillHeight: 480 })
@@ -157,9 +158,9 @@ export function ArtistPage({ item }: { item: BaseItemDto }) {
   const [expanded, setExpanded] = useState(false)
   const shownPopular = popular.slice(0, expanded ? 10 : 5)
 
-  const playingHere = currentTrack(state) && library.some((track) => track.Id === currentTrack(state)?.Id)
+  const playingHere = state.track && library.some((track) => track.Id === state.track?.Id)
   const source = `artist:${item.Id}`
-  const playAll = () => (playingHere ? music.toggle() : music.play(popular.map((entry) => entry.track), START, { source }))
+  const playAll = () => (playingHere ? state.toggle() : music.play(popular.map((entry) => entry.track), START, { source }))
 
   const [following, setFollowing] = useState<boolean | null>(null)
   const isFollowing = following ?? !!item.UserData?.IsFavorite
@@ -236,7 +237,7 @@ export function ArtistPage({ item }: { item: BaseItemDto }) {
             <DropdownMenuItem onClick={() => music.addToQueue(library)}>
               <IconPlaylistAdd /> {t.addToQueue}
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => void radio(item)}>
+            <DropdownMenuItem onClick={() => void navigate(`/listen/official/radio-${item.Id}`)}>
               <IconRadio /> {t.radio}
             </DropdownMenuItem>
             {lastfm.data?.url && (

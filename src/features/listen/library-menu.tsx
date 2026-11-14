@@ -26,7 +26,6 @@ import { defineMessages, useMessages } from '@/lib/i18n'
 import type { OfficialPlaylist } from './official'
 import { music } from './player/music-player'
 import { useFollowedArtists, useListenLibrary, usePlaylistActions, usePlaylists, usePlaylistTracks, useSavedAlbums } from './playlists'
-import { useArtistRadio } from './radio'
 import { TasteMenuItem } from './taste'
 import { useEditablePlaylists } from './profiles'
 import { useHeldByDownload } from './download-ui'
@@ -183,14 +182,15 @@ export function AddToPlaylist({ tracks, label, exclude }: { tracks: () => Promis
 export function ArtistMenuItems({ artist }: { artist: BaseItemDto }) {
   const t = useMessages(messages)
   const favorite = useSetFavorite(artist.Id!)
-  const radio = useArtistRadio()
+  const navigate = useNavigate()
   const followed = useFollowedArtists().data?.some((other) => other.Id === artist.Id) ?? !!artist.UserData?.IsFavorite
   return (
     <>
       <DropdownMenuItem onClick={() => favorite.mutate(!followed)}>
         {followed ? <IconUserMinus /> : <IconUserPlus />} {followed ? t.unfollow : t.follow}
       </DropdownMenuItem>
-      <DropdownMenuItem onClick={() => void radio(artist)}>
+      {/* Opens the radio like a playlist (play it from there). */}
+      <DropdownMenuItem onClick={() => void navigate(`/listen/official/radio-${artist.Id}`)}>
         <IconRadio /> {t.radio}
       </DropdownMenuItem>
       <TasteMenuItem kind="artists" id={artist.Id} />

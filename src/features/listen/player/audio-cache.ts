@@ -32,7 +32,14 @@ let index: Index = (() => {
 })()
 let stats = summarize()
 const listeners = new Set<() => void>()
-const inFlight = new Map<string, Promise<void>>()
+interface Prefetch {
+  job: Promise<void>
+  controller: AbortController
+  received: number
+  total: number
+}
+
+const inFlight = new Map<string, Prefetch>()
 
 function summarize() {
   const entries = Object.values(index)
@@ -64,6 +71,18 @@ export function useAudioCacheStats() {
 
 export const isCached = (key: string) => !!index[key]
 
+/**
+ * A cached copy of a song (keys are `id|quality`): the one in `key`'s quality, else, when `anyQuality`, any other
+ * quality kept (on mobile data or offline a song cached over Wi-Fi beats streaming it again).
+ */
+export function cachedKey(key: string, anyQuality: boolean): string | null {
+  if (index[key]) return key
+  if (!anyQuality) return null
+  const prefix = key.slice(0, key.indexOf('|') + 1)
+  if (!prefix) return null
+  return Object.keys(index).find((other) => other.startsWith(prefix)) ?? null
+}
+
 /** A playable URL for a cached song, or null when it isn't cached (or the cache can't be read). */
 export async function cachedAudioUrl(key: string): Promise<string | null> {
   if (!audioCacheAvailable || !index[key]) return null
@@ -94,16 +113,30 @@ export interface CacheLimits {
   keepOftenPlayed: boolean
 }
 
-/** Downloads a song into the cache unless it is there already (or on its way); then trims the cache to the limit. */
+/**
+ * Downloads a song into the cache unless it is there already (or on its way); then trims the cache to the limit.
+ * Runs at low priority and can be called off (`cancelPrefetches`): the song playing always goes first.
+ */
 export function prefetchAudio(key: string, url: string, limits: CacheLimits, plays = 0): Promise<void> {
   if (!audioCacheAvailable || index[key]) return Promise.resolve()
   const running = inFlight.get(key)
-  if (running) return running
-  const job = (async () => {
+  if (running) return running.job
+  const controller = new AbortController()
+  const entry: Prefetch = { job: Promise.resolve(), controller, received: 0, total: 0 }
+  entry.job = (async () => {
     try {
-      const response = await fetch(url)
-      if (!response.ok) return
-      const blob = await response.blob()
+      const response = await fetch(url, { signal: controller.signal, priority: 'low' } as RequestInit)
+      if (!response.ok || !response.body) return
+      entry.total = Number(response.headers.get('Content-Length')) || 0
+      const parts: Uint8Array[] = []
+      const reader = response.body.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        parts.push(value)
+        entry.received += value.byteLength
+      }
+      const blob = new Blob(parts as BlobPart[], { type: response.headers.get('Content-Type') ?? 'audio/mpeg' })
       // A single file bigger than the whole allowance isn't kept.
       if (!blob.size || blob.size > limits.maxBytes) return
       const cache = await caches.open(CACHE_NAME)
@@ -112,13 +145,27 @@ export function prefetchAudio(key: string, url: string, limits: CacheLimits, pla
       saveIndex()
       await trim(limits, key)
     } catch {
-      // Offline, storage full or the server said no: the song simply streams as usual.
+      // Called off, offline, storage full or the server said no: the song simply streams as usual.
     } finally {
-      inFlight.delete(key)
+      if (inFlight.get(key) === entry) inFlight.delete(key)
     }
   })()
-  inFlight.set(key, job)
-  return job
+  inFlight.set(key, entry)
+  return entry.job
+}
+
+/** How far a song's download into the cache is (0–1; null when none runs or its size is unknown). */
+export function prefetchProgress(key: string): number | null {
+  const entry = inFlight.get(key)
+  return entry?.total ? entry.received / entry.total : null
+}
+
+/** Waits for a running download of a song into the cache (resolves at once when none runs). */
+export const prefetchDone = (key: string) => inFlight.get(key)?.job ?? Promise.resolve()
+
+/** Calls off the downloads into the cache, all but `keep`'s: a song starting gets the whole connection. */
+export function cancelPrefetches(keep?: string | null) {
+  for (const [key, entry] of inFlight) if (key !== keep) entry.controller.abort()
 }
 
 /**

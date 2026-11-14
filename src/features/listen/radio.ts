@@ -132,11 +132,14 @@ export function useSimilarLibraryArtists(artist: BaseItemDto | undefined) {
   })
 }
 
-/** Today's radio of an artist for this listener: its query, shared by the page, the cards and "Go to radio". */
+/**
+ * Today's radio of an artist for this listener: its query, shared by the page, the cards and "Go to radio". What is
+ * left out of the taste profile counts from its next build on; leaving something out doesn't rebuild it.
+ */
 function radioQuery(api: Api, userId: string, queryClient: QueryClient, artist: BaseItemDto, taste: ReturnType<typeof useTasteFilter>) {
   const day = localDate(Date.now())
   return {
-    queryKey: ['radio-playlist', userId, artist.Id, day, taste.key, getLocale()],
+    queryKey: ['radio-playlist', userId, artist.Id, day, getLocale()],
     staleTime: 60 * 60_000,
     queryFn: async (): Promise<OfficialPlaylist> => {
       const t = messagesFor(messages)

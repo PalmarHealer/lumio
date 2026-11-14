@@ -108,12 +108,13 @@ export function useOfficialPlaylists() {
   const get = (path: string) => lumioFetch(path)
   const { categories, isLoading: categoriesLoading } = useCategories('listen')
   const views = categories.find((category) => category.id === 'music')?.views ?? []
-  // The personal mixes follow the taste profile (what is left out of it doesn't count).
+  // The personal mixes follow the taste profile (what is left out of it doesn't count). Leaving something out doesn't
+  // rebuild them: the next regular build (day part, half an hour) uses it, as Spotify's mixes do.
   const taste = useTasteFilter()
   // Made anew when the day part turns over (the daylist), so a page left open switches too.
   const period = useMixPeriod()
   const query = useQuery({
-    queryKey: ['official-playlists', session.userId, views.map((view) => view.Id), getLocale(), taste.key, period],
+    queryKey: ['official-playlists', session.userId, views.map((view) => view.Id), getLocale(), period],
     enabled: views.length > 0 && taste.ready,
     staleTime: 30 * 60_000,
     queryFn: async (): Promise<OfficialPlaylist[]> => {

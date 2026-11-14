@@ -37,8 +37,9 @@ export function useTasteExclusions() {
 }
 
 /**
- * Whether a track counts for the taste profile (see countsForTaste), with the songs of left-out playlists loaded. The
- * exclusions are part of `key`, for queries built from the profile.
+ * Whether a track counts for the taste profile (see countsForTaste), with the songs of left-out playlists loaded.
+ * Queries built from the profile read it when they build and leave the exclusions out of their keys: leaving something
+ * out changes what is suggested from the next regular build on, not at once.
  */
 export function useTasteFilter() {
   const { api, session } = useAuthedSession()
@@ -61,7 +62,6 @@ export function useTasteFilter() {
     exclusions,
     /** Ready once the left-out playlists' songs are known. */
     ready: !exclusions.playlists.length || playlists.isFetched,
-    key: JSON.stringify(exclusions),
   }
 }
 

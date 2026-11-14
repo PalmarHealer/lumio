@@ -31,7 +31,8 @@ import { cn, tintWash } from '@/lib/utils'
 import { TRACK_GRID, TRACK_GRID_EXTRA, TrackTableRow } from './album-view'
 import { useOfficialPlaylist } from './official'
 import { playCircle } from './play-circle'
-import { music, START, useMusic } from './player/music-player'
+import { music, START } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { ShuffleToggle } from './shuffle-toggle'
 import { PlaylistDetailsDialog } from './playlist-details-dialog'
 import { LikedCover, OfficialCover, PlaylistCover } from './playlist-cards'
@@ -213,10 +214,10 @@ export function Collection({ kind, title, cover, byline, description, tracks: lo
     setReordered({ from: loaded, order })
     onMove(moved!, to)
   }
-  const state = useMusic()
-  const here = state.source === source && state.index >= 0
+  const state = useNowPlaying()
+  const here = state.source === source
   const totalTicks = tracks.reduce((sum, track) => sum + (track.RunTimeTicks ?? 0), 0)
-  const playAll = () => (here ? music.toggle() : music.play(tracks, START, { source }))
+  const playAll = () => (here ? state.toggle() : music.play(tracks, START, { source }))
   return (
     <div className="pb-12">
       <div className="relative pt-14" style={{ background: tintWash(tint ?? 'rgb(72 72 80)') }}>

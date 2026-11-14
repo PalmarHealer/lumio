@@ -812,6 +812,30 @@ export function setRemoteSink(next: RemoteSink | null) {
   remoteSink = next
 }
 
+/** What this app last started on the controlled device: from which collection, and its songs. */
+export interface RemoteStart {
+  source: string | null
+  ids: ReadonlySet<string>
+}
+let remoteStart: RemoteStart = { source: null, ids: new Set() }
+const remoteStartListeners = new Set<() => void>()
+
+/** Which collection the controlled device plays (pages mark it as playing, as they do for this device's queue). */
+export function useRemoteStart(): RemoteStart {
+  return useSyncExternalStore(
+    (listener) => {
+      remoteStartListeners.add(listener)
+      return () => remoteStartListeners.delete(listener)
+    },
+    () => remoteStart,
+  )
+}
+
+function startedRemotely(items: BaseItemDto[], source: string | undefined) {
+  remoteStart = { source: source ?? null, ids: new Set(items.map((item) => item.Id!)) }
+  for (const listener of remoteStartListeners) listener()
+}
+
 /**
  * What plays here right now, to hand over to another device: the current track and what follows it (podcasts left
  * out, as other devices can't play them), and where in the current track it is. null when nothing music is loaded.
@@ -861,6 +885,7 @@ export const music = {
         const first = playable[startIndex === START ? Math.floor(Math.random() * playable.length) : at]!
         remoteSink!.play([first, ...shuffled(playable.filter((item) => item !== first))], 0)
       } else remoteSink!.play(playable, at)
+      startedRemotely(playable, options.source)
       if (options.source) recordRecent(options.source)
       return
     }

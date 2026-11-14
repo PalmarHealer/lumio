@@ -32,7 +32,8 @@ import { CardRow, MusicCard, MusicRow } from './music-card'
 import { useReleaseLine } from './artist-discography'
 import { LikedFromArtist } from './artist-liked'
 import { Link } from '@/components/link'
-import { currentTrack, music, START, useMusic } from './player/music-player'
+import { music, START } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { ShuffleToggle } from './shuffle-toggle'
 import { playCircle } from './play-circle'
 import { useArtistBio, useArtistPhoto } from './artist-photo'
@@ -129,7 +130,7 @@ export function ArtistPage({ item }: { item: BaseItemDto }) {
   const topTracks = useLastfmTopTracks(item.Name ?? undefined)
   const tracks = useArtistTracks(item.Id ?? undefined)
   const albums = useArtistAlbums(item.Id ?? undefined)
-  const state = useMusic()
+  const state = useNowPlaying()
   const radio = useArtistRadio()
 
   const banner = backdropImageUrl(api, item, { fillWidth: 1600 })
@@ -157,9 +158,9 @@ export function ArtistPage({ item }: { item: BaseItemDto }) {
   const [expanded, setExpanded] = useState(false)
   const shownPopular = popular.slice(0, expanded ? 10 : 5)
 
-  const playingHere = currentTrack(state) && library.some((track) => track.Id === currentTrack(state)?.Id)
+  const playingHere = state.track && library.some((track) => track.Id === state.track?.Id)
   const source = `artist:${item.Id}`
-  const playAll = () => (playingHere ? music.toggle() : music.play(popular.map((entry) => entry.track), START, { source }))
+  const playAll = () => (playingHere ? state.toggle() : music.play(popular.map((entry) => entry.track), START, { source }))
 
   const [following, setFollowing] = useState<boolean | null>(null)
   const isFollowing = following ?? !!item.UserData?.IsFavorite

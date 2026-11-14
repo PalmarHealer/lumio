@@ -25,7 +25,8 @@ import { portraitImageUrl } from '@/lib/images'
 import { artistsOf, titlePath } from '@/lib/item-links'
 import { cn, tintWash } from '@/lib/utils'
 import { MusicRow } from './music-card'
-import { currentTrack, music, START, useMusic } from './player/music-player'
+import { music, START } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { SwipeToQueue } from './swipe-to-queue'
 import { ShuffleToggle } from './shuffle-toggle'
 import { endTrackDrag, startTrackDrag } from './track-drag'
@@ -119,8 +120,8 @@ export function AlbumView({ item }: { item: BaseItemDto }) {
   const artists = artistsOf(item)
   const mainArtist = artists[0]
   const otherAlbums = useArtistAlbums(mainArtist?.id)
-  const state = useMusic()
-  const playingHere = currentTrack(state)?.AlbumId === item.Id
+  const state = useNowPlaying()
+  const playingHere = state.track?.AlbumId === item.Id
   const totalTicks = list.reduce((sum, track) => sum + (track.RunTimeTicks ?? 0), 0)
   const isBook = list.some((track) => ticksToSeconds(track.RunTimeTicks ?? 0) > 20 * 60) || /h[öo]rbuch|audiobook/i.test(item.Genres?.join(' ') ?? '')
   const discs = [...new Set(list.map((track) => track.ParentIndexNumber ?? 1))]
@@ -133,7 +134,7 @@ export function AlbumView({ item }: { item: BaseItemDto }) {
   const favorite = useSetFavorite(item.Id!)
 
   const source = `album:${item.Id}`
-  const playAll = () => (playingHere ? music.toggle() : music.play(list, START, { source }))
+  const playAll = () => (playingHere ? state.toggle() : music.play(list, START, { source }))
 
   return (
     <div className="pb-12">
@@ -315,8 +316,8 @@ export function TrackTableRow({
   onRemove?: () => void
 }) {
   const { api } = useAuthedSession()
-  const state = useMusic()
-  const isCurrent = currentTrack(state)?.Id === track.Id
+  const state = useNowPlaying()
+  const isCurrent = state.track?.Id === track.Id
   // Offline, songs that need the network are greyed out (the player skips them).
   const unavailable = useUnavailable(track)
   const image = cover ? portraitImageUrl(api, track, { fillHeight: 80 }) : undefined

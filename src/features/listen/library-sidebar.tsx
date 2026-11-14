@@ -29,7 +29,7 @@ import { useSocialMe } from '@/features/social/social'
 import { externalOf } from '@/lib/external-items'
 import { cn } from '@/lib/utils'
 import { useOfficialPlaylist, useOfficialPlaylists } from './official'
-import { useMusic } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { LikedCover, OfficialCover, PlaylistCover, SavedEpisodesCover } from './playlist-cards'
 import { ProfileAvatar } from './profile-page'
 import { useProfile } from './profiles'
@@ -881,8 +881,8 @@ interface EntryProps {
 }
 
 function Entry({ to, title, subtitle, cover, compact, round, source, onTracksDrop, menu, unavailable, pinned, nested, target }: EntryProps & EntryExtra) {
-  const state = useMusic()
-  const playing = !!source && state.source === source && state.index >= 0
+  const state = useNowPlaying()
+  const playing = !!source && state.source === source
   const drop = useTrackDrop((tracks) => onTracksDrop?.(tracks), !!onTracksDrop)
   const entryDnd = useEntryDnd(target)
   const inner = (

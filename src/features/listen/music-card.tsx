@@ -14,7 +14,8 @@ import { defineMessages, useMessages } from '@/lib/i18n'
 import { portraitImageUrl } from '@/lib/images'
 import { artistsOf, itemHref } from '@/lib/item-links'
 import { cn } from '@/lib/utils'
-import { currentTrack, music, START, useMusic } from './player/music-player'
+import { music, START } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 import { playCircle } from './play-circle'
 import { useArtistPhoto } from './artist-photo'
 import { ContextMenu } from '@base-ui/react/context-menu'
@@ -55,8 +56,8 @@ export function usePlayCollection() {
 
 /** Whether the music playing comes from this album or artist. */
 function useIsPlayingFrom(item: BaseItemDto) {
-  const state = useMusic()
-  const track = currentTrack(state)
+  const state = useNowPlaying()
+  const track = state.track
   if (!track) return { here: false, playing: false }
   const here = item.Type === 'MusicArtist' ? artistsOf(track).some((artist) => artist.id === item.Id) : track.AlbumId === item.Id
   return { here, playing: here && state.playing }
@@ -83,6 +84,7 @@ interface CardShellProps {
  */
 export function CardShell({ href, cover, title, subtitle, round, here, playing, onPlay, className, menu }: CardShellProps) {
   const t = useMessages(messages)
+  const { toggle } = useNowPlaying()
   const card = (
     <div className={cn('group/music relative w-44 shrink-0 rounded-lg p-3 transition-colors duration-300 hover:bg-foreground/[0.07] data-popup-open:bg-foreground/[0.07]', className)}>
       <Link to={href} className="block outline-none after:absolute after:inset-0 after:rounded-lg focus-visible:after:ring-2 focus-visible:after:ring-ring">
@@ -96,7 +98,7 @@ export function CardShell({ href, cover, title, subtitle, round, here, playing, 
         <button
           type="button"
           aria-label={playing ? t.pause(title) : t.play(title)}
-          onClick={() => (here ? music.toggle() : onPlay())}
+          onClick={() => (here ? toggle() : onPlay())}
           className={cn(
             // After the circle's classes, so its `absolute` wins over their `relative`.
             playCircle.listen,

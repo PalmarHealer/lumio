@@ -15,7 +15,8 @@ import { TrackTableRow } from './album-view'
 import { useArtistBio, useArtistPhoto } from './artist-photo'
 import { useLastfmArtist } from './external'
 import { playCircle } from './play-circle'
-import { music, START, useMusic } from './player/music-player'
+import { music, START } from './player/music-player'
+import { useNowPlaying } from './player/player-controls'
 
 const messages = defineMessages({
   de: {
@@ -83,9 +84,9 @@ export function GuestArtistPage() {
   })
   const performed = useTracks(found.data?.performed ?? [])
   const credited = useTracks(found.data?.credited ?? [])
-  const state = useMusic()
+  const state = useNowPlaying()
   const source = `guest:${name}`
-  const here = state.source === source && state.index >= 0
+  const here = state.source === source
   const songs = performed.data ?? []
   const loading = found.isLoading || performed.isLoading
 
@@ -114,7 +115,7 @@ export function GuestArtistPage() {
         <button
           type="button"
           aria-label={here && state.playing ? t.pause : t.play}
-          onClick={() => (here ? music.toggle() : music.play(songs, START, { source }))}
+          onClick={() => (here ? state.toggle() : music.play(songs, START, { source }))}
           disabled={!songs.length}
           className={cn('size-14', playCircle.listen)}
         >

@@ -14,7 +14,7 @@ const SAVE_AFTER_MS = 2000
 export const RESTORE_TIMEOUT_MS = 400
 
 /** Queries not worth keeping: typed searches, answers that change by the minute, and what the browser measures itself. */
-const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos'])
+const SKIP = new Set(['storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'remote-sessions', 'server-clock-offset'])
 
 interface Saved {
   savedAt: number

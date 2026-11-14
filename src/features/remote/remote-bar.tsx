@@ -10,7 +10,6 @@ import {
   IconRewindForward10,
   IconX,
 } from '@tabler/icons-react'
-import { useQuery } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import { FadeImage } from '@/components/media/fade-image'
 import { Button } from '@/components/ui/button'
@@ -22,8 +21,8 @@ import { backdropImageUrl } from '@/lib/images'
 import { cn } from '@/lib/utils'
 import { remoteBarMessages } from './messages'
 import type { RemoteTarget } from './remote-provider'
+import { useRemoteSession } from './remote-session'
 
-const POLL_MS = 2000
 const SKIP_SECONDS = 10
 /** Length of the exit animation; the bar is unmounted after it. */
 const EXIT_MS = 200
@@ -60,15 +59,9 @@ export function RemoteBar({ target, onDisconnect }: RemoteBarProps) {
 
 /** Controller for another device Lumio is playing on: what is playing there, a seek bar, and play/pause/skip/stop. */
 function RemoteBarContent({ target, closing, onDisconnect }: { target: RemoteTarget; closing: boolean; onDisconnect: () => void }) {
-  const { api, session } = useAuthedSession()
+  const { api } = useAuthedSession()
   const t = useMessages(remoteBarMessages)
-  const sessions = useQuery({
-    queryKey: ['remote-session', target.sessionId],
-    refetchInterval: POLL_MS,
-    queryFn: async () => (await getSessionApi(api).getSessions({ controllableByUserId: session.userId })).data,
-  })
-
-  const remote = sessions.data?.find((entry) => entry.Id === target.sessionId)
+  const { query: sessions, remote, anchor } = useRemoteSession(target.sessionId)
   const playing = remote?.NowPlayingItem
   const paused = remote?.PlayState?.IsPaused ?? false
   const position = remote?.PlayState?.PositionTicks ?? 0
@@ -89,7 +82,9 @@ function RemoteBarContent({ target, closing, onDisconnect }: { target: RemoteTar
     const base =
       lastSeek && lastSeek.at > sessions.dataUpdatedAt
         ? lastSeek.ticks + moved(lastSeek.at)
-        : position + moved(sessions.dataUpdatedAt)
+        : anchor
+          ? secondsToTicks(anchor.position) + moved(anchor.at)
+          : position + moved(sessions.dataUpdatedAt)
     return duration ? Math.min(base, duration) : base
   }
   const livePosition = estimate(now)

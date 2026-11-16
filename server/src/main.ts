@@ -23,6 +23,8 @@ import { StemWorkers } from './stem-workers.ts'
 import { lyricsSearch } from './lyrics-search.ts'
 import { artistTags, artistsOfTrack, measureTrack, trackTags, type SoundTrack } from './sound.ts'
 import { validTimeZone, wrappedFor, wrappedReady, wrappedYears } from './wrapped.ts'
+import { HomeMixes } from './home.ts'
+import type { Who } from './home-worker.ts'
 import { LANGS, detectLanguage, localizeTitle, type Lang, type LanguageDeps, type LocalImage, type LocalImageKind, type Localized, type LocalizedMeta, type Texts, type VideoItem } from './languages.ts'
 
 /**
@@ -100,6 +102,8 @@ const FEED_LIMIT = 15 * 1024 * 1024
 /** What the feed relay passes on: feeds, chapter lists and transcripts (text of some kind), nothing else. */
 const FEED_TYPES = /xml|rss|atom|json|text\/|vtt|srt|subrip/i
 const HOUR = 60 * 60_000
+/** What a request waiting for the home playlists gets when they take longer (see /me/mixes). */
+const PREPARING = Symbol('preparing')
 /**
  * How the server introduces itself to outside services. MusicBrainz asks for a way to reach whoever runs a client and
  * turns anonymous ones away sooner; MUSICBRAINZ_CONTACT (a URL or e-mail address) names the operator.
@@ -194,6 +198,8 @@ if (!JELLYFIN_URL) {
 }
 
 const store = new Store(DATA_DIR)
+/** The home page's playlists and the radios, made in a worker (see home-worker.ts). */
+const homeMixes = new HomeMixes(JELLYFIN_URL, DATA_DIR, (params, key) => lastfmVia(key)(params))
 const lyricsIndex = MEILI_URL && MEILI_KEY ? lyricsSearch(MEILI_URL, MEILI_KEY, MEILI_LYRICS_INDEX) : null
 const bakedClips = new BakedClips(DATA_DIR)
 const stems = new Stems(DATA_DIR)
@@ -213,12 +219,37 @@ async function canSeeItem(token: string, userId: string, item: string) {
   itemAccess.set(key, Date.now() + 600_000)
   return true
 }
+/** The libraries someone sees (Jellyfin's views of them); remembered for ten minutes. */
+const viewAccess = new Map<string, { ids: Set<string>; until: number }>()
+async function userLibraries(token: string, userId: string) {
+  const key = `${token}|${userId}`
+  const kept = viewAccess.get(key)
+  if (kept && kept.until > Date.now()) return kept.ids
+  const response = await fetch(`${JELLYFIN_URL}/UserViews?userId=${userId}`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal: AbortSignal.timeout(15_000) }).catch(() => null)
+  if (!response?.ok) return new Set<string>()
+  const ids = new Set(((await response.json()) as { Items?: Array<{ Id: string }> }).Items?.map((view) => view.Id) ?? [])
+  if (viewAccess.size > 5_000) viewAccess.clear()
+  viewAccess.set(key, { ids, until: Date.now() + 600_000 })
+  return ids
+}
 // Clips no saved transition refers to any more (a reorder, an edit) are freed after a day; the quota is kept.
 setInterval(() => void bakedClips.sweep(store.bakedKeysInUse()).catch((error) => console.warn('Baked clips sweep:', error)), 3600_000).unref()
 
 // ---- authentication: the user's own Jellyfin token ----
 
-const tokens = new Map<string, { person: Person; admin: boolean; until: number }>()
+const tokens = new Map<string, { person: Person; admin: boolean; restricted: boolean; until: number }>()
+
+/** Jellyfin's limits on what an account may see inside the libraries it has (ratings, tags). */
+interface Policy {
+  IsAdministrator?: boolean
+  MaxParentalRating?: number | null
+  BlockedTags?: string[] | null
+  AllowedTags?: string[] | null
+  BlockUnratedItems?: string[] | null
+}
+
+const isRestricted = (policy: Policy | undefined) =>
+  (policy?.MaxParentalRating ?? null) !== null || !!policy?.BlockedTags?.length || !!policy?.AllowedTags?.length || !!policy?.BlockUnratedItems?.includes('Music')
 
 async function authenticate(token: string | null): Promise<Person | null> {
   if (!token) return null
@@ -228,10 +259,10 @@ async function authenticate(token: string | null): Promise<Person | null> {
   try {
     const response = await fetch(`${JELLYFIN_URL}/Users/Me`, { headers: { Authorization: `MediaBrowser Token="${token}"` }, signal: AbortSignal.timeout(15_000) })
     if (!response.ok) return null
-    const user = (await response.json()) as { Id: string; Name: string; PrimaryImageTag?: string | null; Policy?: { IsAdministrator?: boolean } }
+    const user = (await response.json()) as { Id: string; Name: string; PrimaryImageTag?: string | null; Policy?: Policy }
     const person = { id: user.Id, name: user.Name, imageTag: user.PrimaryImageTag ?? null }
     store.upsertPerson(person)
-    tokens.set(token, { person, admin: !!user.Policy?.IsAdministrator, until: Date.now() + TOKEN_TTL_MS })
+    tokens.set(token, { person, admin: !!user.Policy?.IsAdministrator, restricted: isRestricted(user.Policy), until: Date.now() + TOKEN_TTL_MS })
     return person
   } catch {
     return null
@@ -1892,6 +1923,75 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     const signals = tasteSignals(store, me.id, timeZone)
     tasteCache.set(key, signals)
     return send(response, 200, signals)
+  }
+
+  // The home page's playlists and the radios (see home-worker.ts), for some music libraries (`libraries`, comma
+  // separated; each checked with Jellyfin), in the listener's time zone (`tz`) and language (`locale`). `lastfmKey`: the
+  // app's own Last.fm key, for a server without one.
+  // GET /me/mixes: every playlist of the home page ({at, playlists, tracks}; 202 {preparing, read, total} while the
+  // libraries are first read, which takes minutes for a big one). GET /me/mixes/<slug>: one of them, a radio
+  // (radio-<artist id>) or one the home page doesn't list (an artist's "Best of", a smaller genre's mix).
+  // GET /me/radio/similar?artist=: the library's artists like one. POST /me/radio/continue {artist, exclude, seed}: more
+  // songs like an artist's for when the queue runs out.
+  if (path === '/me/mixes' || path.startsWith('/me/mixes/') || path === '/me/radio/similar' || path === '/me/radio/continue') {
+    const token = tokenOf(request, url)!
+    const libraries = (url.searchParams.get('libraries') ?? '').split(',').filter(Boolean)
+    if (!libraries.length || libraries.length > 10 || !libraries.every((id) => /^[0-9a-f]{32}$/.test(id))) return send(response, 400, { error: 'Libraries required' })
+    const visible = await userLibraries(token, me.id)
+    if (!libraries.every((id) => visible.has(id))) return send(response, 403, { error: 'No such library' })
+    const lastfmKey = url.searchParams.get('lastfmKey')?.trim() || undefined
+    const who: Who = {
+      userId: me.id,
+      token,
+      restricted: !!tokens.get(token)?.restricted,
+      libraries,
+      timeZone: validTimeZone(url.searchParams.get('tz')),
+      locale: url.searchParams.get('locale') === 'en' ? 'en' : 'de',
+      lastfm: canLastfm(lastfmKey),
+      lastfmKey,
+    }
+    // A first read of a big library takes minutes: the app is told how far it is and asks again.
+    const answer = async (job: Promise<unknown>) => {
+      const result = await Promise.race([job, new Promise((resolve) => setTimeout(resolve, 20_000, PREPARING))])
+      if (result !== PREPARING) return result === null ? send(response, 404, { error: 'No such playlist' }) : send(response, 200, result)
+      job.catch(() => undefined)
+      const progress = await homeMixes.run<{ read: number; total: number }>({ kind: 'progress', who })
+      return send(response, 202, { preparing: true, ...progress })
+    }
+    try {
+      if (path === '/me/mixes' && request.method === 'GET') return await answer(homeMixes.run({ kind: 'home', who }))
+      const slug = path.match(/^\/me\/mixes\/([a-z0-9-]{1,120})$/)?.[1]
+      if (slug && request.method === 'GET') return await answer(homeMixes.run({ kind: 'slug', who, slug }))
+      if (path === '/me/radio/similar' && request.method === 'GET') {
+        const artist = url.searchParams.get('artist') ?? ''
+        if (!/^[0-9a-f]{32}$/.test(artist)) return send(response, 400, { error: 'Artist required' })
+        return await answer(homeMixes.run({ kind: 'similar', who, artistId: artist }))
+      }
+      if (path === '/me/radio/continue' && request.method === 'POST') {
+        const body = await readJson<{ artist?: unknown; exclude?: unknown; seed?: unknown }>(request, 64 * 1024)
+        const artist = typeof body.artist === 'string' && /^[0-9a-f]{32}$/.test(body.artist) ? body.artist : null
+        if (!artist) return send(response, 400, { error: 'Artist required' })
+        const exclude = Array.isArray(body.exclude) ? body.exclude.filter((id): id is string => typeof id === 'string' && id.length <= 64).slice(0, 1000) : []
+        const seed = typeof body.seed === 'string' ? body.seed.slice(0, 100) : String(Math.random())
+        return await answer(homeMixes.run({ kind: 'continue', who, artistId: artist, exclude, seed }))
+      }
+    } catch (error) {
+      console.warn('Home playlists:', error instanceof Error ? error.message : error)
+      return send(response, 502, { error: 'Could not make the playlists' })
+    }
+    return send(response, 405, { error: 'Not allowed' })
+  }
+
+  // GET /me/taste/sources?tz=: only what they played from lately (the home grid's "heavy rotation"; the signals' part).
+  if (path === '/me/taste/sources' && request.method === 'GET') {
+    const timeZone = validTimeZone(url.searchParams.get('tz'))
+    const key = `${me.id}|${timeZone}`
+    let signals = tasteCache.get(key)
+    if (!signals || Date.now() - signals.at >= 2 * 60_000) {
+      signals = tasteSignals(store, me.id, timeZone)
+      tasteCache.set(key, signals)
+    }
+    return send(response, 200, signals.sources)
   }
 
   // GET /me/taste/sittings: the songs heard together in each sitting of the last half year (for the Daily Mixes). Made

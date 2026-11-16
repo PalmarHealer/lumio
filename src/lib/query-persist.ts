@@ -25,8 +25,8 @@ export const RESTORE_TIMEOUT_MS = 400
 const SKIP = new Set([
   'storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'remote-sessions', 'server-clock-offset',
   'playback', 'track-mix', 'playlist-mixer', 'artist-directory', 'library-artists-page',
-  // Kept by older versions: every artist of the library at once.
-  'library-artists', 'radio-artists',
+  // Kept by older versions: every artist of the library at once, and what they built the mixes from in the app.
+  'library-artists', 'radio-artists', 'official-playlists', 'taste-signals', 'taste-sittings', 'music-sound', 'radio-playlist',
 ])
 
 /** Lists longer than this are not kept, whatever they are (a library with 100,000 songs makes any whole list huge). */

@@ -4,12 +4,12 @@ import { getArtistApi } from '@jellyfin/sdk/lib/utils/api/artist-api'
 import { getLibraryApi } from '@jellyfin/sdk/lib/utils/api/library-api'
 import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { useAuthedSession } from '@/features/auth/session'
-import { useItem } from '@/features/items/queries'
+import { artistByNameOptions, useItem } from '@/features/items/queries'
 import { readLocalSettings } from '@/features/settings/local-settings'
 import { externalOf } from '@/lib/external-items'
 import { defineMessages, getLocale, messagesFor } from '@/lib/i18n'
 import { artistsOf } from '@/lib/item-links'
-import { fetchSimilarArtists, sameName } from './external'
+import { fetchSimilarArtists } from './external'
 import type { OfficialPlaylist } from './official'
 import { assemble } from './mix-engine'
 import { localDate } from './mixes'
@@ -63,21 +63,29 @@ async function artistTracks(api: Api, userId: string, artistId: string, limit: n
   )
 }
 
-/** The library's artists similar to one (Last.fm), or else artists sharing its genres. */
+/**
+ * The library's artists similar to one (Last.fm), or else artists sharing its genres. Each similar name is looked up on
+ * its own and the genre match is asked of the server: the whole artist list of a big library is megabytes.
+ */
 async function similarArtists(api: Api, userId: string, queryClient: QueryClient, artist: { id: string; name: string; genres?: string[] }, seed = '') {
-  const library = await queryClient.fetchQuery({
-    queryKey: ['radio-artists', userId],
-    staleTime: 30 * 60_000,
-    queryFn: async () => (await getArtistApi(api).getAlbumArtists({ userId, fields: [ItemFields.Genres] })).data.Items ?? [],
-  })
   const names = await fetchSimilarArtists(artist.name).catch(() => [] as string[])
-  const matched = names
-    .map((name) => library.find((candidate) => sameName(candidate.Name, name)))
-    .filter((candidate): candidate is BaseItemDto => !!candidate && candidate.Id !== artist.id)
+  const matched: BaseItemDto[] = []
+  // In Last.fm's order, a few names at a time, until there are enough.
+  for (let start = 0; start < Math.min(names.length, 40) && matched.length < SIMILAR_ARTISTS; start += 10) {
+    const found = await Promise.all(
+      names.slice(start, start + 10).map((name) => queryClient.fetchQuery(artistByNameOptions(api, userId, name)).catch(() => null)),
+    )
+    for (const candidate of found) if (candidate && candidate.Id !== artist.id && !matched.some((entry) => entry.Id === candidate.Id)) matched.push(candidate)
+  }
   if (matched.length) return matched.slice(0, SIMILAR_ARTISTS)
-  const genres = new Set(artist.genres ?? [])
-  const sharing = library.filter((candidate) => candidate.Id !== artist.id && candidate.Genres?.some((genre) => genres.has(genre)))
-  return weightedShuffle(sharing, () => 0, `${seed}:${artist.id}:similar`).slice(0, SIMILAR_ARTISTS)
+  if (!artist.genres?.length) return []
+  const sharing = await queryClient.fetchQuery({
+    queryKey: ['radio-genre-artists', userId, [...artist.genres].sort()],
+    staleTime: 30 * 60_000,
+    queryFn: async () =>
+      (await getArtistApi(api).getAlbumArtists({ userId, genres: artist.genres, fields: [ItemFields.Genres], enableImages: false, limit: 300 })).data.Items ?? [],
+  })
+  return weightedShuffle(sharing.filter((candidate) => candidate.Id !== artist.id), () => 0, `${seed}:${artist.id}:similar`).slice(0, SIMILAR_ARTISTS)
 }
 
 interface RadioOptions {

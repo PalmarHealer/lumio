@@ -273,7 +273,7 @@ export function useAlbum(album: Wrapped['topAlbums'][number] | undefined, size =
 
 /** An artist's photo: the library's artist when there is one, else one from outside. */
 export function useArtistImage(name: string | undefined, size = 480) {
-  const lookup = useArtistLookup()
+  const lookup = useArtistLookup(name ? [name] : [])
   const id = name ? lookup(name).id : undefined
   const item = useItem(id ?? '', !!id)
   const artist: BaseItemDto = item.data ?? { Name: name, Type: 'MusicArtist' }

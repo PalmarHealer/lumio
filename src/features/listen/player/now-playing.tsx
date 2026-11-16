@@ -146,7 +146,10 @@ function useCredits(track: BaseItemDto | undefined) {
   const item = useItem(track?.Id ?? '', !!track?.Id && !externalOf(track)).data ?? track
   const recording = useTrackCredits(item, true)
   const artists = useTrackArtists(item, true)
-  const find = useArtistLookup()
+  const find = useArtistLookup([
+    ...(item?.People ?? []).map((person) => person.Name ?? ''),
+    ...(['writers', 'composers', 'lyricists', 'producers', 'mixers', 'engineers'] as const).flatMap((role) => recording?.[role] ?? []),
+  ])
   if (!item) return { item, credits: [] as Credit[], recording }
   const credits: Credit[] = artists.map((artist, index) => ({ id: artist.id, name: artist.name, role: index === 0 ? t.mainArtist : t.artist }))
   const push = (name: string | null | undefined, role: string) => {

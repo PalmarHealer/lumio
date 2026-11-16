@@ -3,9 +3,10 @@ import { BaseItemKind, ItemSortBy, SortOrder } from '@jellyfin/sdk/lib/generated
 import { getLibraryApi } from '@jellyfin/sdk/lib/utils/api/library-api'
 import { IconPlayerPauseFilled, IconPlayerPlayFilled } from '@tabler/icons-react'
 import { useQueryClient } from '@tanstack/react-query'
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Link } from '@/components/link'
 import { FadeImage } from '@/components/media/fade-image'
+import { LoadMoreSentinel } from '@/components/media/load-more-sentinel'
 import { ScrollRow } from '@/components/media/scroll-row'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useAuthedSession } from '@/features/auth/session'
@@ -204,14 +205,24 @@ export function MusicRow({ title, items, loading, action }: { title: string; ite
   )
 }
 
-/** Music cards in a responsive grid (a library or category page). */
+/** How many cards a grid shows at first and adds per scroll step. */
+const GRID_STEP = 120
+
+/**
+ * Music cards in a responsive grid (a library or category page). A long list is shown a step at a time while
+ * scrolling: thousands of cards at once (each with its picture and menu) froze the page.
+ */
 export function MusicGrid({ items, loading }: { items: BaseItemDto[]; loading?: boolean }) {
+  const [count, setCount] = useState(GRID_STEP)
   return (
-    <div className="-mx-3 grid grid-cols-[repeat(auto-fill,minmax(10rem,1fr))] sm:grid-cols-[repeat(auto-fill,minmax(11rem,1fr))]">
-      {loading && Array.from({ length: 12 }, (_, i) => <Skeleton key={i} className="m-3 aspect-square rounded-md" />)}
-      {items.map((item) => (
-        <MusicCard key={item.Id} item={item} className="w-auto" />
-      ))}
-    </div>
+    <>
+      <div className="-mx-3 grid grid-cols-[repeat(auto-fill,minmax(10rem,1fr))] sm:grid-cols-[repeat(auto-fill,minmax(11rem,1fr))]">
+        {loading && Array.from({ length: 12 }, (_, i) => <Skeleton key={i} className="m-3 aspect-square rounded-md" />)}
+        {items.slice(0, count).map((item) => (
+          <MusicCard key={item.Id} item={item} className="w-auto" />
+        ))}
+      </div>
+      {count < items.length && <LoadMoreSentinel onLoadMore={() => setCount((value) => value + GRID_STEP)} />}
+    </>
   )
 }

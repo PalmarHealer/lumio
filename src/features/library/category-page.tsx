@@ -238,15 +238,16 @@ function SectionHeader({ title, open, onToggle, action }: { title: string; open:
 }
 
 /**
- * Music: the artists above the albums. A row by default, which "Show all" opens into a grid of all of them; the
- * heading folds the whole section away.
+ * Music: the artists above the albums. A row by default (the first page of them), which "Show all" opens into a grid
+ * that loads further pages while scrolling; the heading folds the whole section away.
  */
 function ArtistsSection({ views }: { views: BaseItemDto[] }) {
   const t = useMessages(libraryMessages)
   const artists = useLibraryArtists(views)
   const [open, toggleOpen] = useSectionOpen('artists', true)
   const [all, toggleAll] = useSectionOpen('artists-all', false)
-  if (!artists.isLoading && !artists.data?.length) return null
+  const pages = artists.data?.pages ?? []
+  if (!artists.isLoading && !pages[0]?.items.length) return null
   return (
     <section className="space-y-4">
       <SectionHeader
@@ -261,11 +262,14 @@ function ArtistsSection({ views }: { views: BaseItemDto[] }) {
       />
       {open &&
         (all ? (
-          <MusicGrid items={artists.data ?? []} loading={artists.isLoading} />
+          <>
+            <MusicGrid items={pages.flatMap((page) => page.items)} loading={artists.isLoading} />
+            {artists.hasNextPage && <LoadMoreSentinel loading={artists.isFetchingNextPage} onLoadMore={() => void artists.fetchNextPage({ cancelRefetch: false })} />}
+          </>
         ) : (
           // The page has its own side padding; the row brings its own, like on the home page.
           <div className="-mx-4 -mt-3 sm:-mx-8">
-            <MusicRow title="" items={artists.data} loading={artists.isLoading} />
+            <MusicRow title="" items={pages[0]?.items} loading={artists.isLoading} />
           </div>
         ))}
     </section>

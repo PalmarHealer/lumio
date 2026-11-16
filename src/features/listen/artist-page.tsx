@@ -18,8 +18,7 @@ import { ImageLightbox } from '@/components/media/image-lightbox'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useAuthedSession } from '@/features/auth/session'
-import { useArtistAlbums, useLibraryArtists, useSetFavorite } from '@/features/items/queries'
-import { useCategories } from '@/features/library/categories'
+import { useArtistAlbums, useLibraryArtistsNamed, useSetFavorite } from '@/features/items/queries'
 import { useDominantColor } from '@/lib/dominant-color'
 import { defineMessages, getLocaleTag, useLocale, useMessages } from '@/lib/i18n'
 import { backdropImageUrl, portraitImageUrl } from '@/lib/images'
@@ -389,11 +388,8 @@ function About({ artist, image, listeners, bio }: { artist: BaseItemDto; image?:
 /** Last.fm's similar artists, as far as the library has them. */
 function SimilarArtists({ names, self }: { names: string[]; self?: string }) {
   const t = useMessages(messages)
-  const { categories } = useCategories('listen')
-  const musicViews = categories.find((category) => category.id === 'music')?.views ?? []
-  const artists = useLibraryArtists(musicViews, names.length > 0)
-  const similar = names
-    .map((name) => artists.data?.find((artist) => sameName(artist.Name, name)))
-    .filter((artist): artist is BaseItemDto => !!artist && artist.Id !== self)
+  // Each name looked up on its own; the whole artist list of a big library is megabytes.
+  const artists = useLibraryArtistsNamed(names.slice(0, 30))
+  const similar = artists.data.filter((artist) => artist.Id !== self)
   return <MusicRow title={t.fansLike} items={similar} />
 }

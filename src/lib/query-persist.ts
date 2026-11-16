@@ -19,11 +19,27 @@ export const RESTORE_TIMEOUT_MS = 400
  * (their transitions add up, and an old copy would make a playlist mix or not mix by what it was once).
  * Never stream info ('playback'): it holds one playback's session and, for a stored episode, a blob: URL that is dead
  * after a restart; restored, the player opened that dead address and the title "could not be played".
+ * Nor lists of a whole big library (every artist by name for credits, the music category's artist pages): megabytes
+ * that are written again on every save, and every save blocks the page while the browser copies them.
  */
 const SKIP = new Set([
   'storage-info', 'podcast-search', 'places', 'dominant-color', 'playlist-infos', 'remote-sessions', 'server-clock-offset',
-  'playback', 'track-mix', 'playlist-mixer',
+  'playback', 'track-mix', 'playlist-mixer', 'artist-directory', 'library-artists-page',
+  // Kept by older versions: every artist of the library at once.
+  'library-artists', 'radio-artists',
 ])
+
+/** Lists longer than this are not kept, whatever they are (a library with 100,000 songs makes any whole list huge). */
+const MAX_KEPT_ITEMS = 2000
+
+function itemCount(data: unknown): number {
+  if (Array.isArray(data)) return data.length
+  if (data instanceof Map) return data.size
+  // An infinite query: its pages' items.
+  const pages = (data as { pages?: unknown[] } | null)?.pages
+  if (Array.isArray(pages)) return pages.reduce<number>((sum, page) => sum + itemCount((page as { items?: unknown })?.items ?? page), 0)
+  return 0
+}
 
 interface Saved {
   savedAt: number
@@ -62,13 +78,17 @@ export async function restoreQueryCache(client: QueryClient) {
   }
 }
 
-const keep = (query: Query) => query.state.status === 'success' && !SKIP.has(String(query.queryKey[0]))
+const keep = (query: Query) => query.state.status === 'success' && !SKIP.has(String(query.queryKey[0])) && itemCount(query.state.data) <= MAX_KEPT_ITEMS
 
 /** Saves the client's data a moment after it changes, from now on. */
 export function persistQueryCache(client: QueryClient) {
   if (!available()) return () => undefined
   let timer: number | undefined
-  const unsubscribe = client.getQueryCache().subscribe(() => {
+  const unsubscribe = client.getQueryCache().subscribe((event) => {
+    // Only new data (or data gone) changes what is kept; queries starting, observers coming and going don't. Saving
+    // on every event wrote the whole cache again and again while browsing.
+    const changed = event.type === 'removed' || (event.type === 'updated' && (event.action.type === 'success' || event.action.type === 'setState'))
+    if (!changed) return
     window.clearTimeout(timer)
     timer = window.setTimeout(() => {
       const saved: Saved = { savedAt: Date.now(), state: dehydrate(client, { shouldDehydrateQuery: keep }) }

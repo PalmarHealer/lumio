@@ -5,7 +5,7 @@ import { getGenreApi } from '@jellyfin/sdk/lib/utils/api/genre-api'
 import { getLibraryApi } from '@jellyfin/sdk/lib/utils/api/library-api'
 import { getShowApi } from '@jellyfin/sdk/lib/utils/api/show-api'
 import { getUserDataApi } from '@jellyfin/sdk/lib/utils/api/user-data-api'
-import { keepPreviousData, queryOptions, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, queryOptions, useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAuthedSession } from '@/features/auth/session'
 import type { AppMode } from '@/lib/app-mode'
 import { trackIndex } from '@/lib/unscanned'
@@ -423,7 +423,6 @@ export function useArtistAlbums(artistId: string | undefined) {
   })
 }
 
-/** The album artists of some music libraries, for the artists row of the music category. */
 /** The artists most recently added to these libraries, newest first. */
 export function useNewestArtists(views: BaseItemDto[], enabled = true) {
   const { api, session } = useAuthedSession()
@@ -453,29 +452,69 @@ export function useNewestArtists(views: BaseItemDto[], enabled = true) {
   })
 }
 
+/** How many album artists one page of the music category holds. */
+const ARTIST_PAGE = 60
+
+/**
+ * The album artists of some music libraries (all of them: no library named), a page at a time, by name. A big library
+ * has tens of thousands; fetching and showing all at once froze the page.
+ */
 export function useLibraryArtists(views: BaseItemDto[], enabled = true) {
   const { api, session } = useAuthedSession()
-  return useQuery({
-    queryKey: ['library-artists', session.userId, views.map((view) => view.Id)],
+  const parentId = views.length === 1 ? views[0]!.Id! : undefined
+  return useInfiniteQuery({
+    queryKey: ['library-artists-page', session.userId, parentId ?? null],
     enabled: enabled && views.length > 0,
     staleTime: 10 * 60_000,
-    queryFn: async () => {
-      const lists = await Promise.all(
-        views.map(
-          async (view) =>
-            (
-              await getArtistApi(api).getAlbumArtists({
-                userId: session.userId,
-                parentId: view.Id!,
-                sortBy: [ItemSortBy.SortName],
-                fields: [ItemFields.PrimaryImageAspectRatio],
-              })
-            ).data.Items ?? [],
-        ),
-      )
-      const byId = new Map(lists.flat().map((artist) => [artist.Id, artist]))
-      return [...byId.values()].sort((a, b) => (a.SortName ?? a.Name ?? '').localeCompare(b.SortName ?? b.Name ?? ''))
+    initialPageParam: 0,
+    queryFn: async ({ pageParam }) =>
+      pageOf(
+        (
+          await getArtistApi(api).getAlbumArtists({
+            userId: session.userId,
+            parentId,
+            sortBy: [ItemSortBy.SortName],
+            fields: [ItemFields.PrimaryImageAspectRatio],
+            startIndex: pageParam,
+            limit: ARTIST_PAGE,
+          })
+        ).data,
+        pageParam,
+      ),
+    getNextPageParam: (last) => (last.items.length > 0 && last.next < last.total ? last.next : undefined),
+  })
+}
+
+const looseName = (name: string) => name.trim().toLocaleLowerCase()
+
+/** The library's artist of this name (null when the library has none); kept for a while, names rarely change. */
+export const artistByNameOptions = (api: Api, userId: string, name: string) =>
+  queryOptions({
+    queryKey: ['artist-by-name', userId, looseName(name)],
+    staleTime: 60 * 60_000,
+    queryFn: async (): Promise<BaseItemDto | null> => {
+      try {
+        return (await getArtistApi(api).getArtistByName({ name: name.trim(), userId })).data
+      } catch (error) {
+        // Not in the library: Jellyfin answers 404.
+        if ((error as { response?: { status?: number } }).response?.status === 404) return null
+        throw error
+      }
     },
+  })
+
+/**
+ * The library's artists with these names (e.g. Last.fm's similar artists, a concert's line-up), in the order of the
+ * names; names the library doesn't have are left out. Asked one name at a time instead of loading every artist.
+ */
+export function useLibraryArtistsNamed(names: string[], enabled = true) {
+  const { api, session } = useAuthedSession()
+  return useQueries({
+    queries: names.map((name) => ({ ...artistByNameOptions(api, session.userId, name), enabled: enabled && !!name.trim() })),
+    combine: (results) => ({
+      isLoading: results.some((result) => result.isLoading),
+      data: results.flatMap((result) => (result.data ? [result.data] : [])),
+    }),
   })
 }
 

@@ -16,8 +16,7 @@ import { FadeImage } from '@/components/media/fade-image'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useLibraryArtists } from '@/features/items/queries'
-import { useCategories } from '@/features/library/categories'
+import { useLibraryArtistsNamed } from '@/features/items/queries'
 import { defineMessages, getLocaleTag, useLocale, useMessages } from '@/lib/i18n'
 import { titlePath } from '@/lib/item-links'
 import { cn } from '@/lib/utils'
@@ -122,12 +121,11 @@ const messages = defineMessages({
 
 const dateOf = (concert: Concert) => new Date(`${concert.date}T${concert.time ?? '20:00:00'}`)
 
-/** Finds a library artist by name (so a line-up links to artists the user has). */
-function useLibraryArtistFinder(enabled: boolean) {
-  const { categories } = useCategories('listen')
-  const views = categories.find((category) => category.id === 'music')?.views ?? []
-  const artists = useLibraryArtists(views, enabled)
-  return (name: string): BaseItemDto | undefined => artists.data?.find((artist) => sameName(artist.Name, name))
+/** Finds the line-ups' artists in the library (so a line-up links to artists the user has), each looked up by name. */
+function useLibraryArtistFinder(names: string[]) {
+  const unique = [...new Set(names.filter(Boolean))].slice(0, 100)
+  const artists = useLibraryArtistsNamed(unique)
+  return (name: string): BaseItemDto | undefined => artists.data.find((artist) => sameName(artist.Name, name))
 }
 
 /**
@@ -252,7 +250,7 @@ export function ConcertPage() {
   const t = useMessages(messages)
   const locale = getLocaleTag(useLocale())
   const concert = useConcert(id)
-  const findArtist = useLibraryArtistFinder(!!concert.data?.artists.length)
+  const findArtist = useLibraryArtistFinder((concert.data?.artists ?? []).map((artist) => artist.name))
   const headliner = concert.data?.artists[0]
   const more = useConcerts(headliner?.name)
 
@@ -433,7 +431,7 @@ export function ConcertsPage() {
   const near = useConcertSearch({ near: location })
   const followed = useFollowedArtists()
   const followedConcerts = useArtistsConcerts((followed.data ?? []).slice(0, 15).map((artist) => artist.Name ?? '').filter(Boolean))
-  const findArtist = useLibraryArtistFinder(!!near.data?.length)
+  const findArtist = useLibraryArtistFinder((near.data ?? []).flatMap((concert) => concert.artists.map((artist) => artist.name)))
 
   // Searches once typing pauses.
   useEffect(() => {

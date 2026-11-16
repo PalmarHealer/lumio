@@ -8,6 +8,7 @@ import { ticksToSeconds } from '@/lib/format'
 import { artistsOf } from '@/lib/item-links'
 import { sameName } from './external'
 import { useLumioConfig } from '@/features/admin/branding'
+import { useLibraryArtistsNamed } from '@/features/items/queries'
 
 const HOUR = 60 * 60_000
 
@@ -150,10 +151,17 @@ export function useArtistDirectory() {
   })
 }
 
-/** Finds a name among the library's artists. */
-export function useArtistLookup(): (name: string) => CreditedArtist {
-  const directory = useArtistDirectory().data
-  return (name) => directory?.get(normalize(name)) ?? { name }
+/**
+ * Finds these names among the library's artists, each looked up on its own (cached): the whole directory is megabytes
+ * in a big library, and every page with a player needed it. Names not passed in come back unlinked.
+ */
+export function useArtistLookup(names: string[]): (name: string) => CreditedArtist {
+  const unique = [...new Set(names.filter((name) => name.trim()))]
+  const found = useLibraryArtistsNamed(unique).data
+  return (name) => {
+    const artist = found.find((entry) => entry.Name && normalize(entry.Name) === normalize(name))
+    return artist?.Id ? { id: artist.Id, name: artist.Name! } : { name }
+  }
 }
 
 /**
@@ -162,8 +170,9 @@ export function useArtistLookup(): (name: string) => CreditedArtist {
  */
 export function useTrackArtists(track: BaseItemDto | undefined, lookup = false): CreditedArtist[] {
   const credits = useTrackCredits(track, lookup)
-  const find = useArtistLookup()
   const own = track ? artistsOf(track) : []
-  const extra = (credits?.artists ?? []).filter((name) => !own.some((entry) => sameName(entry.name, name))).map(find)
+  const extraNames = (credits?.artists ?? []).filter((name) => !own.some((entry) => sameName(entry.name, name)))
+  const find = useArtistLookup([...own.filter((artist) => !artist.id).map((artist) => artist.name), ...extraNames])
+  const extra = extraNames.map(find)
   return [...own.map((artist) => (artist.id ? artist : find(artist.name))), ...extra]
 }

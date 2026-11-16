@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react'
 import { useAuthedSession } from '@/features/auth/session'
 import { useCategories } from '@/features/library/categories'
 import { defineMessages, getLocale, getLocaleTag, messagesFor } from '@/lib/i18n'
-import { fetchChartTracks, fetchSimilarArtists, homeChartCountry, sameName } from './external'
+import { fetchChartTracks, fetchSimilarArtists, homeChartCountry, looseName, sameName } from './external'
 import { localDate, madeForYou } from './mixes'
 import { useLumioFetch } from '@/features/social/social'
 import { fetchSound } from './sound'
@@ -142,11 +142,17 @@ export function useOfficialPlaylists() {
       const now = Date.now()
       const t = messagesFor(officialMessages)
       // Last.fm's similar artists to the listener's favourites point the discoveries outward (a failure: without).
+      // Each step on its own turn: thousands of songs at once held the page for seconds (on phones above all).
+      await yieldToPage()
       const first = buildTasteModel(tracks, signals, taste.counts, now, undefined, sittings)
       const similar = await similarToFavourites(tracks, first).catch(() => new Set<string>())
+      await yieldToPage()
       const model = similar.size ? buildTasteModel(tracks, signals, taste.counts, now, similar, sittings) : first
+      await yieldToPage()
       const mixes = await madeForYou({ tracks, model, now, userId: session.userId }, sound, seeded)
+      await yieldToPage()
       const playlists = buildPlaylists(tracks, t, taste.counts)
+      await yieldToPage()
       // The charts come from Last.fm; a failure just leaves them out.
       const [code, country] = homeChartCountry()
       const charts: Array<OfficialPlaylist | null> = await Promise.all([
@@ -172,14 +178,18 @@ function useMixPeriod() {
   return period
 }
 
+/** Lets the page handle input and paint before the next long step of building the playlists. */
+const yieldToPage = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
 /** The library's artists Last.fm calls similar to the listener's five favourites (who aren't favourites themselves). */
 async function similarToFavourites(tracks: BaseItemDto[], model: TasteModel) {
   const names = new Map<string, string>()
   for (const track of tracks) for (const artist of [...(track.ArtistItems ?? []), ...(track.AlbumArtists ?? [])]) if (artist.Id && artist.Name) names.set(artist.Id, artist.Name)
   const favourites = [...new Set([...model.phaseArtists.slice(0, 2), ...[...names.keys()].sort((a, b) => model.artist(b) - model.artist(a)).slice(0, 5)])].filter((id) => model.artist(id) > 0)
   const similarNames = (await Promise.all(favourites.map((id) => fetchSimilarArtists(names.get(id)!).catch(() => [] as string[])))).flat()
+  const wanted = new Set(similarNames.map(looseName))
   const result = new Set<string>()
-  for (const [id, name] of names) if (model.artist(id) < 0.3 && similarNames.some((other) => sameName(other, name))) result.add(id)
+  for (const [id, name] of names) if (model.artist(id) < 0.3 && wanted.has(looseName(name))) result.add(id)
   return result
 }
 
@@ -206,10 +216,19 @@ async function chartPlaylist(tracks: BaseItemDto[], t: (typeof officialMessages)
   const number = new Intl.NumberFormat(getLocaleTag())
   const matched: BaseItemDto[] = []
   const extras: Record<string, string> = {}
+  // The library's songs by title, once: searching all of them for each chart entry took seconds with a big library.
+  const byTitle = new Map<string, BaseItemDto[]>()
+  for (const track of tracks) {
+    if (!track.Name) continue
+    const key = looseName(track.Name)
+    const list = byTitle.get(key)
+    if (list) list.push(track)
+    else byTitle.set(key, [track])
+  }
   for (const entry of chart) {
-    const track = tracks.find(
-      (candidate) => sameName(candidate.Name, entry.name) && [...(candidate.Artists ?? []), candidate.AlbumArtist].some((artist) => sameName(artist, entry.artist)),
-    )
+    const track = byTitle
+      .get(looseName(entry.name))
+      ?.find((candidate) => [...(candidate.Artists ?? []), candidate.AlbumArtist].some((artist) => sameName(artist, entry.artist)))
     if (!track?.Id || extras[track.Id]) continue
     matched.push(track)
     extras[track.Id] = t.listeners(number.format(entry.listeners))

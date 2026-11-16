@@ -565,10 +565,13 @@ export async function madeForYou(context: Omit<Context, 't'>, sound: SoundData, 
   const full = { ...context, t: messagesFor(mixMessages) }
   const day = await daylist(full, sound, seededRandom).catch(() => null)
   const moodContext = { ...context, sound, day: localDate(context.now), week: weekOf(context.now, 0) }
-  return {
-    forYou: [day, ...dailyMixes(full, sound), onRepeat(full), discoveries(full), phaseMix(full), newForYou(full), repeatRewind(full)].filter((entry): entry is OfficialPlaylist => !!entry),
-    moods: moodMixes(moodContext),
-    mixes: [...genreMixes(full), ...decadeMixes(full)],
-    tags: tagMixes(moodContext),
-  }
+  // A turn for the page between the groups: each walks the whole library.
+  const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+  const forYou = [day, ...dailyMixes(full, sound), onRepeat(full), discoveries(full), phaseMix(full), newForYou(full), repeatRewind(full)].filter((entry): entry is OfficialPlaylist => !!entry)
+  await pause()
+  const moods = moodMixes(moodContext)
+  await pause()
+  const mixes = [...genreMixes(full), ...decadeMixes(full)]
+  await pause()
+  return { forYou, moods, mixes, tags: tagMixes(moodContext) }
 }

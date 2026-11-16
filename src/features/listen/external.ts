@@ -113,16 +113,30 @@ export function useLastfmTopTracks(name: string | undefined) {
   })
 }
 
-/** Names compared loosely: case, accents, "feat." parts and punctuation don't matter. */
-export function sameName(a: string | null | undefined, b: string | null | undefined) {
-  const normalize = (value: string) =>
-    value
+const looseNames = new Map<string, string>()
+
+/**
+ * A name as compared loosely: case, accents, "feat." parts and punctuation don't matter. Remembered (the same names
+ * are compared again and again, and the regular expressions are slow; a big library compares tens of thousands).
+ */
+export function looseName(value: string) {
+  let loose = looseNames.get(value)
+  if (loose === undefined) {
+    loose = value
       .toLowerCase()
       .normalize('NFD')
       .replace(/\p{Diacritic}/gu, '')
       .replace(/\s*[([].*?(feat|ft|with|remaster|version|edit).*?[)\]]/g, '')
       .replace(/[^\p{L}\p{N}]+/gu, '')
-  return !!a && !!b && normalize(a) === normalize(b)
+    if (looseNames.size > 50_000) looseNames.clear()
+    looseNames.set(value, loose)
+  }
+  return loose
+}
+
+/** Names compared loosely: case, accents, "feat." parts and punctuation don't matter. */
+export function sameName(a: string | null | undefined, b: string | null | undefined) {
+  return !!a && !!b && looseName(a) === looseName(b)
 }
 
 // ---- charts (Last.fm): ranks of artists, and the most played songs ----

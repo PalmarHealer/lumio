@@ -26,6 +26,7 @@ export function PrivacyPage() {
       </Section>
       <Section title={t.activity} scope="account">
         <SwitchField id="privacy-activity" label={t.shareActivity} hint={t.shareActivityHint} checked={privacy.shareActivity} onChange={toggle('shareActivity')} />
+        <SwitchField id="privacy-taste" label={t.shareTaste} hint={t.shareTasteHint} checked={privacy.shareTaste !== false} onChange={toggle('shareTaste')} />
       </Section>
     </SettingsPage>
   )

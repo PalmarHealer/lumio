@@ -779,6 +779,9 @@ export const privacyMessages = defineMessages({
     activity: 'Aktivität',
     shareActivity: 'Höraktivität mit Freund*innen teilen',
     shareActivityHint: 'Deine Freund*innen sehen, was du gerade hörst oder schaust, und was zuletzt.',
+    shareTaste: 'Für Empfehlungen an andere nutzen',
+    shareTasteHint:
+      'Was du hörst, hilft anderen mit ähnlichem Geschmack, neue Künstler*innen zu finden („Hörer*innen wie du mögen auch“). Nur zusammen mit mindestens zwei anderen Leuten, nie deins allein.',
   },
   en: {
     title: 'Privacy',
@@ -793,5 +796,7 @@ export const privacyMessages = defineMessages({
     activity: 'Activity',
     shareActivity: 'Share listening activity with friends',
     shareActivityHint: 'Your friends see what you are listening to or watching right now, and what you played last.',
+    shareTaste: 'Use for suggestions to others',
+    shareTasteHint: 'What you listen to helps people with a similar taste find new artists ("listeners like you also love"). Only together with at least two other people, never yours alone.',
   },
 })

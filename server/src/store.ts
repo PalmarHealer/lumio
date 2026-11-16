@@ -21,6 +21,11 @@ export interface Privacy {
   showFollowers: boolean
   /** Friends (people who follow each other) see what the person plays. */
   shareActivity: boolean
+  /**
+   * The person's listening helps suggest music to others ("listeners like you also love", see community.ts): only
+   * together with at least two other people's, never theirs alone.
+   */
+  shareTaste: boolean
 }
 
 /** A separation worker as kept (see stem-workers.ts). */
@@ -50,7 +55,7 @@ function stemWorkerRow(row: Record<string, unknown>): StemWorkerRow {
   }
 }
 
-export const DEFAULT_PRIVACY: Privacy = { showPlaylists: true, showFollowing: true, showFollowers: true, shareActivity: true }
+export const DEFAULT_PRIVACY: Privacy = { showPlaylists: true, showFollowing: true, showFollowers: true, shareActivity: true, shareTaste: true }
 
 export interface Person {
   id: string
@@ -464,6 +469,14 @@ export class Store {
       .prepare("SELECT item_key, started_at, seconds, reason_start, reason_end FROM plays WHERE user_id = ? AND kind = 'audio' AND started_at >= ? ORDER BY started_at")
       .all(userId, since) as Array<{ item_key: string; started_at: number; seconds: number; reason_start: string | null; reason_end: string | null }>
     return rows.map((row) => ({ key: row.item_key, startedAt: row.started_at, seconds: row.seconds, reasonStart: row.reason_start, reasonEnd: row.reason_end }))
+  }
+
+  /** Everyone's counted song plays since a moment, per person and song: how many and the last (for community.ts). */
+  communityRows(since: number) {
+    const rows = this.db
+      .prepare("SELECT user_id, item_key, COUNT(*) AS plays, MAX(started_at) AS last FROM plays WHERE kind = 'audio' AND seconds >= 30 AND started_at >= ? GROUP BY user_id, item_key")
+      .all(since) as Array<{ user_id: string; item_key: string; plays: number; last: number }>
+    return rows.map((row) => ({ userId: row.user_id, key: row.item_key, plays: row.plays, last: row.last }))
   }
 
   /** What someone played from (album, playlist …) since a moment: the player's source per play, and how long it ran. */

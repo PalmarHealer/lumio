@@ -1,12 +1,11 @@
-import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
-import { defineMessages, getLocale, getLocaleTag, messagesFor } from '@/lib/i18n'
-import { artistsOf } from '@/lib/item-links'
-import { fetchArtistTags } from './external'
-import { assemble } from './mix-engine'
-import { moodMixes, NOISE, qualities, rankers, slugOf, tagMixes } from './mood-mixes'
-import type { OfficialPlaylist } from './official'
-import type { SoundData, SoundFeatures } from './sound'
-import { artistIdsOf, slotOf, type DayPart, type TasteModel } from './taste-model'
+import { assemble } from './mix-engine.ts'
+import type { SoundData, SoundFeatures } from './mix-sound.ts'
+import type { Track } from './music-catalog.ts'
+import { moodMixes, NOISE, qualities, rankers, slugOf, tagMixes } from './mood-mixes.ts'
+import type { Lastfm, Locale, MixPlaylist } from './home-playlists.ts'
+import { artistIdsOf, artistsOf, localDate, slotOf, weekOf, type DayPart, type TasteModel } from './taste-model.ts'
+import { seeded } from './mix-engine.ts'
+import { partsIn } from './wrapped.ts'
 
 /**
  * The made-for-you mixes, after Spotify's (built from the library and the taste model, see taste-model.ts):
@@ -28,8 +27,10 @@ const DAILY_SIZE = 50
 const DAYLIST_SIZE = 40
 const MIX_SIZE = 30
 const MAX_DAILY_MIXES = 6
+/** The home page shows this many genre mixes at most (a big library has hundreds of genres); the rest on request. */
+export const MAX_GENRE_MIXES = 40
 
-export const mixMessages = defineMessages({
+export const mixMessages = {
   de: {
     dailyTitle: (n: number) => `Daily Mix ${n}`,
     dailyDescription: (names: string[]) => `${names.join(', ')} und mehr`,
@@ -79,33 +80,18 @@ export const mixMessages = defineMessages({
     decadeDescription: (decade: string) => `Your ${decade}: favourites and new finds from the decade. New every week.`,
     decadeName: (year: number) => `${year}s`,
   },
-})
+}
 
 type MixMessages = (typeof mixMessages)['de']
 
-// ---- dates (the listener's own clock) ----
-
 const DAY = 24 * 60 * 60_000
+const localeTag = (locale: Locale) => (locale === 'de' ? 'de-DE' : 'en-US')
 
-/** A local date as 2026-11-10. */
-export function localDate(at: number) {
-  return new Date(at).toLocaleDateString('sv')
-}
-
-/** The local date of the last given weekday (0 = Monday) on or before a moment: a week that turns over on that day. */
-export function weekOf(at: number, startDay: number) {
-  const date = new Date(at)
-  const weekday = (date.getDay() + 6) % 7
-  return localDate(at - ((weekday - startDay + 7) % 7) * DAY)
-}
-
-/** When the daylist next turns over (5, 9, 12, 17, 21, 1 o'clock). */
-function nextDayPartStart(at: number) {
-  const next = new Date(at)
-  next.setMinutes(0, 0, 0)
-  do next.setHours(next.getHours() + 1)
-  while (![1, 5, 9, 12, 17, 21].includes(next.getHours()))
-  return next
+/** When the daylist next turns over (5, 9, 12, 17, 21, 1 o'clock), as the listener's clock shows it. */
+function nextDayPartStart(at: number, timeZone: string, locale: Locale) {
+  const hour = partsIn(at, timeZone).hour
+  const next = [1, 5, 9, 12, 17, 21].find((start) => start > hour) ?? 1
+  return new Date(Date.UTC(2000, 0, 1, next)).toLocaleTimeString(localeTag(locale), { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' })
 }
 
 // ---- mood words for the daylist (from Last.fm's tags of the artists played at that time) ----
@@ -134,8 +120,16 @@ const PART_MOODS: Record<DayPart, { de: string; en: string }> = {
   5: { de: 'verträumt', en: 'dreamy' },
 }
 
-async function moodOf(artistNames: string[], part: DayPart, random: () => number, locale: 'de' | 'en') {
-  const tags = (await Promise.all(artistNames.map((name) => fetchArtistTags(name).catch(() => [] as string[])))).flatMap((list) => list.slice(0, 12))
+/** An artist's tags on Last.fm (genres, moods), most used first; empty without Last.fm. */
+async function artistTagsOf(lastfm: Lastfm | null, name: string): Promise<string[]> {
+  if (!lastfm) return []
+  type Response = { toptags?: { tag?: Array<{ name: string; count?: number | string }> } }
+  const data = (await lastfm({ method: 'artist.gettoptags', artist: name })) as Response | null
+  return (data?.toptags?.tag ?? []).filter((tag) => Number(tag.count ?? 0) >= 10).map((tag) => tag.name.toLowerCase())
+}
+
+async function moodOf(lastfm: Lastfm | null, artistNames: string[], part: DayPart, random: () => number, locale: Locale) {
+  const tags = (await Promise.all(artistNames.map((name) => artistTagsOf(lastfm, name).catch(() => [] as string[])))).flatMap((list) => list.slice(0, 12))
   const scores = MOODS.map((mood) => ({ mood, score: tags.filter((tag) => mood.tags.test(tag)).length })).filter((entry) => entry.score > 0)
   if (!scores.length) return PART_MOODS[part][locale]
   // Among the strongest moods, one by chance (seeded), so the title doesn't always say the same.
@@ -156,23 +150,33 @@ function topKeys(map: Map<string, number>, count: number) {
   return [...map].sort((a, b) => b[1] - a[1]).slice(0, count).map(([key]) => key)
 }
 
-interface Context {
-  tracks: BaseItemDto[]
+export interface MixContext {
+  tracks: Track[]
   model: TasteModel
   now: number
   userId: string
-  t: MixMessages
+  timeZone: string
+  locale: Locale
+  lastfm: Lastfm | null
 }
 
+type Context = MixContext & { t: MixMessages }
+
+export type ArtistEntry = { id: string; name: string; tracks: Track[] }
+export type ArtistIndex = Map<string, ArtistEntry>
+
 /** Library artists by id, with a name and their songs. */
-function artistIndex(tracks: BaseItemDto[]) {
-  const index = new Map<string, { id: string; name: string; tracks: BaseItemDto[] }>()
+export function artistIndex(tracks: Track[]): ArtistIndex {
+  const index: ArtistIndex = new Map()
   for (const track of tracks) {
-    const named = new Map([...artistsOf(track), ...(track.AlbumArtists ?? []).map((artist) => ({ id: artist.Id ?? undefined, name: artist.Name ?? '' }))].map((artist) => [artist.id, artist.name]))
-    for (const id of artistIdsOf(track)) {
-      const entry = index.get(id) ?? { id, name: named.get(id) ?? '', tracks: [] }
-      entry.tracks.push(track)
-      index.set(id, entry)
+    for (const artist of [...(track.ArtistItems ?? []), ...(track.AlbumArtists ?? [])]) {
+      if (!artist.Id) continue
+      let entry = index.get(artist.Id)
+      if (!entry) {
+        entry = { id: artist.Id, name: artist.Name ?? '', tracks: [] }
+        index.set(artist.Id, entry)
+      }
+      if (entry.tracks.at(-1) !== track) entry.tracks.push(track)
     }
   }
   return index
@@ -183,7 +187,7 @@ function artistIndex(tracks: BaseItemDto[]) {
 const wordsOf = (tag: string) => tag.split(/[\s-]+/).filter(Boolean)
 
 /** What a list of songs is tagged with: each tag and genre (lower case) with the number of songs carrying it. */
-function tagCounts(list: BaseItemDto[], sound: SoundData, keep: (tag: string) => boolean) {
+function tagCounts(list: Track[], sound: SoundData, keep: (tag: string) => boolean) {
   const counts = new Map<string, number>()
   for (const track of list) {
     const { own, artists } = sound.tags(track)
@@ -204,12 +208,12 @@ function standingOut(inMix: number, mixSize: number, overall: number, overallSiz
 }
 
 /** The mix's mood: from its songs' tags and how it sounds next to the rest of the library; none when neither says. */
-function mixMood(mix: BaseItemDto[], usual: BaseItemDto[], library: BaseItemDto[], sound: SoundData, random: () => number, locale: 'de' | 'en') {
+function mixMood(mix: Track[], usual: Track[], rank: ReturnType<typeof rankers>, sound: SoundData, random: () => number, locale: Locale) {
   const scores = new Map<string, number>()
   const add = (word: string, score: number) => {
     if (score > 0) scores.set(word, (scores.get(word) ?? 0) + score)
   }
-  const matching = (list: BaseItemDto[], pattern: RegExp) =>
+  const matching = (list: Track[], pattern: RegExp) =>
     list.filter((track) => {
       const { own, artists } = sound.tags(track)
       return own.slice(0, 8).some((tag) => pattern.test(tag)) || artists.slice(0, 8).some((tag) => pattern.test(tag))
@@ -220,7 +224,6 @@ function mixMood(mix: BaseItemDto[], usual: BaseItemDto[], library: BaseItemDto[
   }
   const measured = mix.map(sound.features).filter((f): f is SoundFeatures => !!f)
   if (measured.length >= 8) {
-    const rank = rankers(library.map(sound.features).filter((f): f is SoundFeatures => !!f))
     const all = measured.map((f) => qualities(f, rank))
     const mean = (pick: (q: (typeof all)[number]) => number) => sum(all.map(pick)) / all.length
     const energy = mean((q) => q.energy)
@@ -240,7 +243,7 @@ function mixMood(mix: BaseItemDto[], usual: BaseItemDto[], library: BaseItemDto[
 }
 
 /** The tags and genres that set a mix apart from the listener's usual, strongest first (no two sharing a word). */
-function mixWords(mix: BaseItemDto[], usual: BaseItemDto[], sound: SoundData, count: number) {
+function mixWords(mix: Track[], usual: Track[], sound: SoundData, count: number) {
   const names = new Set(mix.flatMap((track) => [...(track.Artists ?? []), track.AlbumArtist ?? '']).map((name) => name.toLowerCase()))
   const keep = (tag: string) => !NOISE.test(tag) && !names.has(tag) && !MOODS.some((mood) => mood.tags.test(tag))
   const inMix = tagCounts(mix, sound, keep)
@@ -258,14 +261,14 @@ function mixWords(mix: BaseItemDto[], usual: BaseItemDto[], sound: SoundData, co
   return picked
 }
 
-export async function daylist(context: Context, sound: SoundData, seededRandom: (seed: string) => () => number): Promise<OfficialPlaylist | null> {
-  const { tracks, model, now, userId, t } = context
-  const { part, weekday, slot } = slotOf(new Date(now))
+async function daylist(context: Context, sound: SoundData): Promise<MixPlaylist | null> {
+  const { tracks, model, now, userId, t, timeZone, locale } = context
+  const { part, weekday, slot } = slotOf(now, timeZone)
   const base = slot - part
   // This slot counts most, the neighbouring day parts and the same part on the other kind of day a little.
   const around = (plays: (slot: number) => number) =>
     plays(slot) + 0.35 * ((part > 0 ? plays(slot - 1) : 0) + (part < 5 ? plays(slot + 1) : 0)) + 0.25 * plays((base === 0 ? 6 : 0) + part)
-  const slotWeight = (track: BaseItemDto) => around((at) => model.slot(track, at))
+  const slotWeight = (track: Track) => around((at) => model.slot(track, at))
   // The artists of this time: heard now, and a bigger part of this time than of the listener's week. A single song is
   // seldom heard often enough at one time to tell; its artist is (a year of listening: mornings have their own artists,
   // while the same songs come back at any hour).
@@ -285,8 +288,8 @@ export async function daylist(context: Context, sound: SoundData, seededRandom: 
     }
     return value
   }
-  const timeOfArtists = (track: BaseItemDto) => Math.max(0, ...artistIdsOf(track).map(artistTime))
-  const timeFit = (track: BaseItemDto) => slotWeight(track) + 2 * timeOfArtists(track)
+  const timeOfArtists = (track: Track) => artistIdsOf(track).reduce((max, id) => Math.max(max, artistTime(id)), 0)
+  const timeFit = (track: Track) => slotWeight(track) + 2 * timeOfArtists(track)
   const known = tracks.filter(model.known)
   const atThisTime = known.filter((track) => slotWeight(track) > 0.05 || timeOfArtists(track) >= 0.5)
   const thisTime = new Set(atThisTime)
@@ -301,8 +304,8 @@ export async function daylist(context: Context, sound: SoundData, seededRandom: 
   }
   if (!genres.size && !artists.size) return null
   const total = sum(genres.values()) || 1
-  const genreShare = (track: BaseItemDto) => Math.max(0, ...(track.Genres ?? []).map((genre) => (genres.get(genre) ?? 0) / total))
-  const seed = `${userId}:daylist:${localDate(now)}:${part}`
+  const genreShare = (track: Track) => (track.Genres ?? []).reduce((max, genre) => Math.max(max, (genres.get(genre) ?? 0) / total), 0)
+  const seed = `${userId}:daylist:${localDate(now, timeZone)}:${part}`
   const mixed = assemble(
     [
       { tracks: enough ? atThisTime : known, weight: (track) => model.love(track) * (enough ? Math.log2(1 + 4 * timeFit(track)) : 1), share: 0.55 },
@@ -313,14 +316,13 @@ export async function daylist(context: Context, sound: SoundData, seededRandom: 
     { size: DAYLIST_SIZE, seed },
   )
   if (mixed.length < 10) return null
-  const locale = getLocale() === 'de' ? 'de' : 'en'
-  const random = seededRandom(seed)
+  const random = seeded(seed)
   // The title describes the mix itself; without tags or measurements, the tags of this time's artists (Last.fm).
-  const mood = mixMood(mixed, known, tracks, sound, random, locale) ?? (await moodOf(topKeys(artists, 4), part, random, locale))
+  const rank = rankers(tracks.map(sound.features).filter((f): f is SoundFeatures => !!f))
+  const mood = mixMood(mixed, known, rank, sound, random, locale) ?? (await moodOf(context.lastfm, topKeys(artists, 4), part, random, locale))
   const words = mixWords(mixed, known, sound, 3)
   const title = [mood, ...words.slice(0, 2), t.daylistWhen(weekday, part)].join(' ')
-  const next = nextDayPartStart(now).toLocaleTimeString(getLocaleTag(), { hour: '2-digit', minute: '2-digit' })
-  return { slug: 'daylist', kind: 'daylist', personal: true, title, description: t.daylistDescription(words, next), tracks: mixed }
+  return { slug: 'daylist', kind: 'daylist', personal: true, title, description: t.daylistDescription(words, nextDayPartStart(now, timeZone, locale)), tracks: mixed }
 }
 
 // ---- Daily Mixes ----
@@ -329,7 +331,7 @@ export async function daylist(context: Context, sound: SoundData, seededRandom: 
  * Artists' profiles: their genres and their Last.fm tags (rarer ones count more, so "Pop" doesn't glue everything
  * together; the tags tell apart what the library files under one genre).
  */
-function genreVectors(index: ReturnType<typeof artistIndex>, tracks: BaseItemDto[], sound: SoundData) {
+function genreVectors(index: ArtistIndex, tracks: Track[], sound: SoundData) {
   const genreCount = new Map<string, number>()
   for (const track of tracks) for (const genre of track.Genres ?? []) genreCount.set(genre, (genreCount.get(genre) ?? 0) + 1)
   const idf = (genre: string) => Math.log(1 + tracks.length / (genreCount.get(genre) ?? 1))
@@ -351,8 +353,15 @@ function genreVectors(index: ReturnType<typeof artistIndex>, tracks: BaseItemDto
 
 function cosine(a: Map<string, number>, b: Map<string, number>) {
   let dot = 0
-  for (const [key, value] of a) dot += value * (b.get(key) ?? 0)
-  const norm = Math.sqrt(sum([...a.values()].map((v) => v * v))) * Math.sqrt(sum([...b.values()].map((v) => v * v)))
+  let normA = 0
+  for (const [key, value] of a) {
+    dot += value * (b.get(key) ?? 0)
+    normA += value * value
+  }
+  if (!dot) return 0
+  let normB = 0
+  for (const value of b.values()) normB += value * value
+  const norm = Math.sqrt(normA) * Math.sqrt(normB)
   return norm ? dot / norm : 0
 }
 
@@ -360,9 +369,8 @@ function addInto(target: Map<string, number>, source: Map<string, number>, weigh
   for (const [key, value] of source) target.set(key, (target.get(key) ?? 0) + value * weight)
 }
 
-export function dailyMixes(context: Context, sound: SoundData): OfficialPlaylist[] {
-  const { tracks, model, now, userId, t } = context
-  const index = artistIndex(tracks)
+function dailyMixes(context: Context, sound: SoundData, index: ArtistIndex): MixPlaylist[] {
+  const { tracks, model, now, userId, t, timeZone } = context
   const vectors = genreVectors(index, tracks, sound)
   // How much an artist belongs to a group: what they sound like (genres, tags) and whether the listener hears them in
   // the same sittings as the group's artists (the three they're heard with most). Sittings say what labels can't: two
@@ -376,6 +384,7 @@ export function dailyMixes(context: Context, sound: SoundData): OfficialPlaylist
   const phase = new Set(model.phaseArtists)
   // The artists the listener really knows: some songs heard, loved enough.
   const loved = [...index.values()]
+    .filter((entry) => model.artist(entry.id) > 0 || phase.has(entry.id))
     .map((entry) => ({ ...entry, known: entry.tracks.filter(model.known).length, affinity: model.artist(entry.id) + (phase.has(entry.id) ? 0.5 : 0) }))
     .filter((entry) => entry.known >= 2 && entry.affinity > 0.15)
     .sort((a, b) => b.affinity - a.affinity)
@@ -399,26 +408,30 @@ export function dailyMixes(context: Context, sound: SoundData): OfficialPlaylist
   }
   // Groups too small for a mix of their own are left out (their artists still turn up as neighbours).
   const groups = clusters.filter((cluster) => cluster.artists.length >= 2 && sum(cluster.artists.map((artist) => artist.known)) >= 12).sort((a, b) => b.score - a.score)
-  const day = localDate(now)
+  const day = localDate(now, timeZone)
   const used = new Set<string>()
   return groups.map((group, i) => {
     const ids = new Set(group.artists.map((artist) => artist.id))
     const own = group.artists.flatMap((artist) => artist.tracks)
-    const nearby = [...index.values()].filter((entry) => !ids.has(entry.id)).map((entry) => ({ entry, similarity: belonging(entry.id, group) }))
-    const neighbours = nearby.filter((entry) => entry.similarity >= 0.35)
-    const similarity = new Map(neighbours.flatMap(({ entry, similarity }) => entry.tracks.map((track) => [track.Id!, similarity])))
+    const neighbours: Array<{ entry: ArtistEntry; similarity: number }> = []
+    for (const entry of index.values()) {
+      if (ids.has(entry.id)) continue
+      const similarity = belonging(entry.id, group)
+      if (similarity >= 0.35) neighbours.push({ entry, similarity })
+    }
+    const similarity = new Map(neighbours.flatMap(({ entry, similarity }) => entry.tracks.map((track) => [track.Id, similarity])))
     const mixed = assemble(
       [
         // A third of what the listener played in a year were songs new to them, most by artists they knew: so a fifth
         // deep cuts and a fifth from nearby.
         { tracks: own.filter(model.known), weight: model.love, share: 0.6 },
         { tracks: own.filter((track) => !model.known(track)), weight: model.novelty, share: 0.2 },
-        { tracks: neighbours.flatMap(({ entry }) => entry.tracks), weight: (track) => (model.known(track) ? 0.5 * model.love(track) : model.novelty(track)) * (similarity.get(track.Id!) ?? 0), share: 0.2 },
+        { tracks: neighbours.flatMap(({ entry }) => entry.tracks), weight: (track) => (model.known(track) ? 0.5 * model.love(track) : model.novelty(track)) * (similarity.get(track.Id) ?? 0), share: 0.2 },
       ],
       // A song in one daily mix isn't in the next.
       { size: DAILY_SIZE, seed: `${userId}:daily:${i}:${day}`, exclude: used, maxPerArtist: 7 },
     )
-    for (const track of mixed) used.add(track.Id!)
+    for (const track of mixed) used.add(track.Id)
     const lead = group.artists[0]!
     return {
       slug: `daily-${i + 1}`,
@@ -434,71 +447,69 @@ export function dailyMixes(context: Context, sound: SoundData): OfficialPlaylist
 
 // ---- On Repeat, Repeat Rewind, discoveries, new for you, the phase ----
 
-export function onRepeat(context: Context): OfficialPlaylist | null {
-  const { tracks, model, t } = context
-  const now = tracks.filter((track) => model.love(track) > 0 || model.now(track) > 0).filter((track) => model.month(track) >= 2 || model.now(track) >= 1.5)
+function onRepeat(context: Context): MixPlaylist | null {
+  const { tracks, model, t, locale } = context
+  const now = tracks.filter((track) => (model.love(track) > 0 || model.now(track) > 0) && (model.month(track) >= 2 || model.now(track) >= 1.5))
   if (now.length < 5) return null
   const list = now.sort((a, b) => model.now(b) + 0.2 * model.month(b) - (model.now(a) + 0.2 * model.month(a))).slice(0, MIX_SIZE)
-  const number = new Intl.NumberFormat(getLocaleTag())
-  const extras = Object.fromEntries(list.map((track) => [track.Id!, t.playsMonth(number.format(Math.round(model.month(track))))]))
+  const number = new Intl.NumberFormat(localeTag(locale))
+  const extras = Object.fromEntries(list.map((track) => [track.Id, t.playsMonth(number.format(Math.round(model.month(track))))]))
   return { slug: 'month', kind: 'month', personal: true, title: t.repeatTitle, description: t.repeatDescription, tracks: list, ...(model.detailed ? { extras, extraLabel: t.playsMonthLabel } : {}) }
 }
 
-export function repeatRewind(context: Context): OfficialPlaylist | null {
-  const { tracks, model, now, userId, t } = context
+function repeatRewind(context: Context): MixPlaylist | null {
+  const { tracks, model, now, userId, t, timeZone } = context
   const back = tracks.filter((track) => model.known(track) && model.now(track) < 0.3 && now - model.lastPlayed(track) > 45 * DAY && model.longRun(track) > 0)
   if (back.length < 8) return null
-  const mixed = assemble([{ tracks: back, weight: model.longRun, share: 1 }], { size: MIX_SIZE, seed: `${userId}:rewind:${weekOf(now, 0)}` })
+  const mixed = assemble([{ tracks: back, weight: model.longRun, share: 1 }], { size: MIX_SIZE, seed: `${userId}:rewind:${weekOf(now, 0, timeZone)}` })
   return { slug: 'rediscover', kind: 'rediscover', personal: true, title: t.rewindTitle, description: t.rewindDescription, tracks: mixed }
 }
 
-export function discoveries(context: Context): OfficialPlaylist | null {
-  const { tracks, model, now, userId, t } = context
+function discoveries(context: Context): MixPlaylist | null {
+  const { tracks, model, now, userId, t, timeZone } = context
   const fresh = tracks.filter((track) => !model.known(track))
-  const lovedArtist = (track: BaseItemDto) => artistIdsOf(track).some((id) => model.artist(id) >= 0.3)
+  const lovedArtist = (track: Track) => artistIdsOf(track).some((id) => model.artist(id) >= 0.3)
   const mixed = assemble(
     [
       // Deep cuts: songs of artists they love that they never played (new songs by known artists are the ones that
       // get played again: about one in seven three times or more, against one in twelve by artists new to them).
       { tracks: fresh.filter(lovedArtist), weight: model.novelty, share: 0.6 },
-      // Further out: artists they hardly know, in genres they like or like the ones they love.
+      // Further out: artists they hardly know, in genres they like, like the ones they love, or loved by listeners like them.
       { tracks: fresh.filter((track) => !lovedArtist(track)), weight: model.novelty, share: 0.4 },
     ],
-    { size: MIX_SIZE, seed: `${userId}:discover:${weekOf(now, 0)}`, maxPerArtist: 2, artistGap: 5 },
+    { size: MIX_SIZE, seed: `${userId}:discover:${weekOf(now, 0, timeZone)}`, maxPerArtist: 2, artistGap: 5 },
   )
   if (mixed.length < 10) return null
   return { slug: 'discover', kind: 'discover', personal: true, title: t.discoverTitle, description: t.discoverDescription, tracks: mixed }
 }
 
-export function newForYou(context: Context): OfficialPlaylist | null {
-  const { tracks, model, now, userId, t } = context
-  const recent = tracks.filter((track) => now - (Date.parse(track.DateCreated ?? '') || 0) < 28 * DAY && !model.known(track))
+function newForYou(context: Context, added: (track: Track) => number): MixPlaylist | null {
+  const { tracks, model, now, userId, t, timeZone } = context
+  const recent = tracks.filter((track) => now - added(track) < 28 * DAY && !model.known(track))
   if (recent.length < 5) return null
   const mixed = assemble([{ tracks: recent, weight: (track) => 0.2 + model.novelty(track), share: 1 }], {
     size: MIX_SIZE,
-    seed: `${userId}:radar:${weekOf(now, 4)}`,
+    seed: `${userId}:radar:${weekOf(now, 4, timeZone)}`,
     maxPerArtist: 4,
   })
   if (mixed.length < 5) return null
   return { slug: 'radar', kind: 'radar', personal: true, title: t.radarTitle, description: t.radarDescription, tracks: mixed }
 }
 
-export function phaseMix(context: Context): OfficialPlaylist | null {
-  const { tracks, model, now, userId, t } = context
-  const index = artistIndex(tracks)
+function phaseMix(context: Context, index: ArtistIndex): MixPlaylist | null {
+  const { tracks, model, now, userId, t, timeZone } = context
   const artistId = model.phaseArtists.find((id) => index.has(id))
   const genre = model.phaseGenres[0]
   // A genre phase reads better than one artist (an artist's phase is On Repeat already), unless only the artist shows.
   const name = genre ?? (artistId ? index.get(artistId)!.name : undefined)
   if (!name) return null
-  const inPhase = genre ? (track: BaseItemDto) => !!track.Genres?.includes(genre) : (track: BaseItemDto) => artistIdsOf(track).includes(artistId!)
-  const pool = tracks.filter(inPhase)
+  const pool = genre ? tracks.filter((track) => !!track.Genres?.includes(genre)) : index.get(artistId!)!.tracks
   const mixed = assemble(
     [
       { tracks: pool.filter(model.known), weight: (track) => model.love(track) * (1 + model.now(track)), share: 0.6 },
       { tracks: pool.filter((track) => !model.known(track)), weight: model.novelty, share: 0.4 },
     ],
-    { size: MIX_SIZE, seed: `${userId}:phase:${name}:${localDate(now)}` },
+    { size: MIX_SIZE, seed: `${userId}:phase:${name}:${localDate(now, timeZone)}` },
   )
   if (mixed.length < 10) return null
   return { slug: 'phase', kind: 'phase', personal: true, title: t.phaseTitle(name), description: t.phaseDescription(name), tracks: mixed }
@@ -507,8 +518,7 @@ export function phaseMix(context: Context): OfficialPlaylist | null {
 // ---- genre and decade mixes ----
 
 /** A mix of a part of the library: mostly what they love in it, a quarter new to them; just a weighted shuffle for someone new. */
-function partMix(context: Context, pool: BaseItemDto[], seed: string) {
-  const { model } = context
+function partMix(model: TasteModel, pool: Track[], seed: string) {
   return assemble(
     [
       { tracks: pool.filter(model.known), weight: model.love, share: 0.75 },
@@ -521,57 +531,77 @@ function partMix(context: Context, pool: BaseItemDto[], seed: string) {
 const MIN_GENRE = 8
 const MIN_DECADE = 20
 
-/** One mix per genre with enough songs, the listener's favourite genres first. */
-export function genreMixes(context: Context): OfficialPlaylist[] {
-  const { tracks, model, now, userId, t } = context
-  const byGenre = new Map<string, BaseItemDto[]>()
-  for (const track of tracks) for (const genre of track.Genres ?? []) byGenre.set(genre, [...(byGenre.get(genre) ?? []), track])
-  const week = weekOf(now, 0)
+/** The library's songs by genre. */
+export function genreIndex(tracks: Track[]) {
+  const byGenre = new Map<string, Track[]>()
+  for (const track of tracks) {
+    for (const genre of track.Genres ?? []) {
+      const list = byGenre.get(genre)
+      if (list) list.push(track)
+      else byGenre.set(genre, [track])
+    }
+  }
+  return byGenre
+}
+
+/** One genre's mix. */
+export function genreMix(context: MixContext, genre: string, list: Track[]): MixPlaylist {
+  const t = mixMessages[context.locale]
+  return {
+    slug: `genre-${slugOf(genre)}`,
+    kind: 'genre',
+    title: t.genreTitle(genre),
+    description: t.genreDescription(genre),
+    tracks: partMix(context.model, list, `${context.userId}:${genre}:${weekOf(context.now, 0, context.timeZone)}`),
+  }
+}
+
+/** A mix per genre with enough songs, the listener's favourite genres first (the first `limit` of them). */
+function genreMixes(context: Context, byGenre: Map<string, Track[]>, limit: number): MixPlaylist[] {
+  const { model } = context
   return [...byGenre]
     .filter(([, list]) => list.length >= MIN_GENRE)
     .sort((a, b) => model.genre(b[0]) - model.genre(a[0]) || b[1].length - a[1].length)
-    .map(([genre, list]) => ({
-      slug: `genre-${slugOf(genre)}`,
-      kind: 'genre' as const,
-      title: t.genreTitle(genre),
-      description: t.genreDescription(genre),
-      tracks: partMix(context, list, `${userId}:${genre}:${week}`),
-    }))
+    .slice(0, limit)
+    .map(([genre, list]) => genreMix(context, genre, list))
 }
 
 /** One mix per decade with enough songs, those the listener plays most first. */
-export function decadeMixes(context: Context): OfficialPlaylist[] {
-  const { tracks, model, now, userId, t } = context
-  const byDecade = new Map<number, BaseItemDto[]>()
+function decadeMixes(context: Context): MixPlaylist[] {
+  const { tracks, model, now, userId, t, timeZone } = context
+  const byDecade = new Map<number, Track[]>()
   for (const track of tracks) {
     const year = track.ProductionYear ?? (track.PremiereDate ? new Date(track.PremiereDate).getFullYear() : undefined)
     if (!year || year < 1900) continue
     const decade = Math.floor(year / 10) * 10
-    byDecade.set(decade, [...(byDecade.get(decade) ?? []), track])
+    const list = byDecade.get(decade)
+    if (list) list.push(track)
+    else byDecade.set(decade, [track])
   }
-  const week = weekOf(now, 0)
-  const loveOf = (list: BaseItemDto[]) => sum(list.map(model.longRun))
+  const week = weekOf(now, 0, timeZone)
+  const loveOf = (list: Track[]) => sum(list.map(model.longRun))
   return [...byDecade]
     .filter(([, list]) => list.length >= MIN_DECADE)
-    .sort((a, b) => loveOf(b[1]) - loveOf(a[1]) || b[1].length - a[1].length)
-    .map(([decade, list]) => {
+    .map(([decade, list]) => ({ decade, list, love: loveOf(list) }))
+    .sort((a, b) => b.love - a.love || b.list.length - a.list.length)
+    .map(({ decade, list }) => {
       const name = t.decadeName(decade)
-      return { slug: `decade-${decade}`, kind: 'decade' as const, title: t.decadeTitle(name), description: t.decadeDescription(name), tracks: partMix(context, list, `${userId}:decade:${decade}:${week}`) }
+      return { slug: `decade-${decade}`, kind: 'decade' as const, title: t.decadeTitle(name), description: t.decadeDescription(name), tracks: partMix(model, list, `${userId}:decade:${decade}:${week}`) }
     })
 }
 
 /** All made-for-you mixes, in the order the home page shows them (moods and tags need the songs' sound and tags). */
-export async function madeForYou(context: Omit<Context, 't'>, sound: SoundData, seededRandom: (seed: string) => () => number) {
-  const full = { ...context, t: messagesFor(mixMessages) }
-  const day = await daylist(full, sound, seededRandom).catch(() => null)
-  const moodContext = { ...context, sound, day: localDate(context.now), week: weekOf(context.now, 0) }
-  // A turn for the page between the groups: each walks the whole library.
-  const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
-  const forYou = [day, ...dailyMixes(full, sound), onRepeat(full), discoveries(full), phaseMix(full), newForYou(full), repeatRewind(full)].filter((entry): entry is OfficialPlaylist => !!entry)
-  await pause()
+export async function madeForYou(context: MixContext, sound: SoundData, index: ArtistIndex, byGenre: Map<string, Track[]>, added: (track: Track) => number) {
+  const full: Context = { ...context, t: mixMessages[context.locale] }
+  const day = await daylist(full, sound).catch((error) => {
+    console.warn('Daylist:', error)
+    return null
+  })
+  const moodContext = { ...context, sound, day: localDate(context.now, context.timeZone), week: weekOf(context.now, 0, context.timeZone) }
+  const forYou = [day, ...dailyMixes(full, sound, index), onRepeat(full), discoveries(full), phaseMix(full, index), newForYou(full, added), repeatRewind(full)].filter(
+    (entry): entry is MixPlaylist => !!entry,
+  )
   const moods = moodMixes(moodContext)
-  await pause()
-  const mixes = [...genreMixes(full), ...decadeMixes(full)]
-  await pause()
+  const mixes = [...genreMixes(full, byGenre, MAX_GENRE_MIXES), ...decadeMixes(full)]
   return { forYou, moods, mixes, tags: tagMixes(moodContext) }
 }

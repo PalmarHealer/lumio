@@ -28,7 +28,7 @@ import { Dialog, DialogClose, DialogContent, DialogTitle } from '@/components/ui
 import { useAuthedSession } from '@/features/auth/session'
 import { defineMessages, getLocaleTag, useLocale, useMessages } from '@/lib/i18n'
 import { titlePath } from '@/lib/item-links'
-import { slugOf, tagSlug } from './mood-mixes'
+import { slugOf, tagSlug } from './mix-slugs'
 import { useOfficialPlaylists } from './official'
 import { cn } from '@/lib/utils'
 import { useArtistLinks, useArtistRanks, useLastfmArtist, type ArtistLink } from './external'

@@ -23,7 +23,7 @@ import { useFollowedArtists, useLikedSongs, usePlaylists, usePlaylistTracks } fr
 import { usePodcast } from './podcasts'
 import { useListeningStats } from './profiles'
 import { useLumioFetch } from '@/features/social/social'
-import { tasteSignalsQuery } from './taste-model'
+import { tasteSourcesQuery } from './taste-sources'
 import { RadioCard } from './radio-card'
 import { useRecentSources } from './recent'
 import { useNewestAlbums, useRecentAlbums } from './queries'
@@ -166,8 +166,8 @@ export function ListenHome() {
   const sources = useRecentSources()
   const { session } = useAuthedSession()
   const lumioFetch = useLumioFetch()
-  const signals = useQuery(tasteSignalsQuery(session.userId, (path) => lumioFetch(path)))
-  const quick = quickPicks(sources, signals.data?.sources, (recent.data ?? []).map((album) => `album:${album.Id}`))
+  const heavy = useQuery(tasteSourcesQuery(session.userId, lumioFetch))
+  const quick = quickPicks(sources, heavy.data ?? undefined, (recent.data ?? []).map((album) => `album:${album.Id}`))
 
   useEffect(() => {
     if (!recent.isLoading) markAppReady()

@@ -17,6 +17,8 @@ export interface SocialPrivacy {
   showFollowing: boolean
   showFollowers: boolean
   shareActivity: boolean
+  /** Their listening helps suggest music to others (with at least two other people's, never alone). */
+  shareTaste?: boolean
 }
 
 export interface SocialActivity {

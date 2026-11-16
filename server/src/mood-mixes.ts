@@ -1,9 +1,8 @@
-import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
-import { defineMessages, messagesFor } from '@/lib/i18n'
-import { assemble } from './mix-engine'
-import type { OfficialPlaylist } from './official'
-import type { SoundData, SoundFeatures } from './sound'
-import type { TasteModel } from './taste-model'
+import { assemble } from './mix-engine.ts'
+import type { SoundData, SoundFeatures } from './mix-sound.ts'
+import type { Track } from './music-catalog.ts'
+import type { TasteModel } from './taste-model.ts'
+import type { Locale, MixPlaylist } from './home-playlists.ts'
 
 /**
  * Mood mixes (running, cozy, sad, motivation, good mood) and tag mixes (Last.fm's tags of songs and artists: queer
@@ -21,7 +20,7 @@ const MIN_MOOD = 15
 const MIN_TAG = 12
 const MAX_TAG_MIXES = 24
 
-export const moodMessages = defineMessages({
+export const moodMessages = {
   de: {
     running: 'Laufen',
     runningDescription: 'Schnelle, treibende Songs im Lauftempo (160–180 BPM). Jeden Tag neu.',
@@ -52,7 +51,7 @@ export const moodMessages = defineMessages({
     queerDescription: 'Queer artists and songs from the library, by their Last.fm tags. New every week.',
     tagDescription: (tag: string) => `Songs tagged "${tag}" on Last.fm, the way you like them. New every week.`,
   },
-})
+}
 
 // ---- the sound, as 0–1 qualities ----
 
@@ -138,28 +137,31 @@ const MOODS: Record<Mood, MoodSpec> = {
 
 const MOOD_ORDER: Mood[] = ['upbeat', 'cozy', 'motivation', 'running', 'sad']
 
-interface Context {
-  tracks: BaseItemDto[]
+export interface MoodContext {
+  tracks: Track[]
   model: TasteModel
   sound: SoundData
   /** How the library's measured songs rank (filled in by moodMixes). */
   rank?: Rankers
-  now: number
   userId: string
   day: string
   week: string
+  locale: Locale
 }
 
 function tagScore(tags: { own: string[]; artists: string[] }, pattern: RegExp) {
-  const own = tags.own.slice(0, 12).filter((tag) => pattern.test(tag)).length
-  const artists = tags.artists.slice(0, 10).filter((tag) => pattern.test(tag)).length
-  return clamp(0.6 * Math.min(own, 2) / 2 + 0.4 * Math.min(artists, 2) / 2)
+  let own = 0
+  for (const tag of tags.own.slice(0, 12)) if (pattern.test(tag)) own++
+  let artists = 0
+  for (const tag of tags.artists.slice(0, 10)) if (pattern.test(tag)) artists++
+  return clamp((0.6 * Math.min(own, 2)) / 2 + (0.4 * Math.min(artists, 2)) / 2)
 }
 
 /** How well a song fits a mood (0–1), from its sound, tags and when the listener plays it. */
-function moodScore(context: Context, mood: MoodSpec, track: BaseItemDto) {
+function moodScore(context: MoodContext, mood: MoodSpec, track: Track) {
   const f = context.sound.features(track)
   const tags = tagScore(context.sound.tags(track), mood.tags)
+  if (!f && !tags) return 0
   const q = f && context.rank ? qualities(f, context.rank) : null
   // The sound decides most; a fitting tag adds to it (and alone, without a measurement, carries less far).
   const base = q ? 0.75 * mood.sound(q) + 0.35 * tags : 0.75 * tags
@@ -174,25 +176,29 @@ function moodScore(context: Context, mood: MoodSpec, track: BaseItemDto) {
   return clamp(base * (1 + 0.3 * (total > 0.2 ? fitting / total : 0)))
 }
 
-export function moodMixes(input: Context): OfficialPlaylist[] {
+export function moodMixes(input: MoodContext): MixPlaylist[] {
   const context = { ...input, rank: rankers(input.tracks.map(input.sound.features).filter((f): f is SoundFeatures => !!f)) }
   const { tracks, model, userId, day } = context
-  const t = messagesFor(moodMessages)
+  const t = moodMessages[context.locale]
   // Without measurements and tags there is nothing to tell moods by.
   if (!context.sound.measured && !tracks.some((track) => context.sound.tags(track).artists.length)) return []
-  const result: OfficialPlaylist[] = []
+  const result: MixPlaylist[] = []
   // A song already in another mood's mix steps back, so the moods don't all open with the same songs.
-  const taken = new Set<BaseItemDto>()
+  const taken = new Set<Track>()
   for (const mood of MOOD_ORDER) {
     const spec = MOODS[mood]
-    const scored = tracks.map((track) => ({ track, score: moodScore(context, spec, track) })).filter((entry) => entry.score > 0)
+    const scored: Array<{ track: Track; score: number }> = []
+    for (const track of tracks) {
+      const score = moodScore(context, spec, track)
+      if (score > 0) scored.push({ track, score })
+    }
     // The best-fitting part of the library: at least clearly fitting, and among its top sixth.
     const sorted = [...scored].sort((a, b) => b.score - a.score)
     const cut = Math.max(0.5, sorted[Math.floor(sorted.length / 6)]?.score ?? 1)
     const fitting = new Map(scored.filter((entry) => entry.score >= cut).map((entry) => [entry.track, entry.score]))
     if (fitting.size < MIN_MOOD) continue
     const pool = [...fitting.keys()]
-    const fit = (track: BaseItemDto) => (fitting.get(track) ?? 0) ** 2 * (taken.has(track) ? 0.3 : 1)
+    const fit = (track: Track) => (fitting.get(track) ?? 0) ** 2 * (taken.has(track) ? 0.3 : 1)
     const mixed = assemble(
       [
         { tracks: pool.filter(model.known), weight: (track) => model.love(track) * fit(track), share: 0.65 },
@@ -215,7 +221,7 @@ const QUEER = /^(queer|lgbt|lgbtq|lgbtq\+|lgbtqia|lgbtqia\+|gay|lesbian|bisexual
 export const NOISE =
   /^(seen live|favorites?|favourites?|my favorites?|my favourites?|love|loved|awesome|beautiful|amazing|best|cool|good|great|spotify|albums i own|under \d+ listeners|check out|[0-9]+|[0-9]+ stars?|all|music|songs?|other|misc|vocal|vocals|male vocalists|female|male|german|deutsch|english|usa|american|british|uk)$/
 
-/** A name as it goes into an address ("Hip-Hop/Rap" → "hip-hop-rap"). */
+/** A name as it goes into an address ("Hip-Hop/Rap" → "hip-hop-rap"). Kept in step with the app's (mix-slugs.ts). */
 export const slugOf = (value: string) =>
   value
     .toLowerCase()
@@ -231,15 +237,20 @@ export function tagSlug(tag: string) {
 
 const titleCase = (tag: string) => tag.replace(/(^|[\s-])(\p{L})/gu, (_, gap: string, letter: string) => gap + letter.toUpperCase())
 
-export function tagMixes(context: Context): OfficialPlaylist[] {
+export function tagMixes(context: MoodContext): MixPlaylist[] {
   const { tracks, model, userId, week, sound } = context
-  const t = messagesFor(moodMessages)
-  const genres = new Set(tracks.flatMap((track) => (track.Genres ?? []).map((genre) => genre.toLowerCase())))
-  // An artist's name as a tag is their "Best of", not a mix of its own.
-  const artistNames = new Set(tracks.flatMap((track) => [...(track.Artists ?? []), track.AlbumArtist ?? ''].map((name) => name.toLowerCase())))
-  const byTag = new Map<string, { name: string; tracks: BaseItemDto[] }>()
+  const t = moodMessages[context.locale]
+  const genres = new Set<string>()
+  const artistNames = new Set<string>()
+  for (const track of tracks) {
+    for (const genre of track.Genres ?? []) genres.add(genre.toLowerCase())
+    // An artist's name as a tag is their "Best of", not a mix of its own.
+    for (const name of [...(track.Artists ?? []), track.AlbumArtist ?? '']) artistNames.add(name.toLowerCase())
+  }
+  const byTag = new Map<string, { name: string; tracks: Track[] }>()
   for (const track of tracks) {
     const { own, artists } = sound.tags(track)
+    if (!own.length && !artists.length) continue
     const keys = new Set<string>()
     for (const tag of [...own.slice(0, 10), ...artists.slice(0, 8)]) {
       if (NOISE.test(tag) || genres.has(tag) || artistNames.has(tag)) continue
@@ -251,13 +262,14 @@ export function tagMixes(context: Context): OfficialPlaylist[] {
       byTag.set(slug, entry)
     }
   }
-  const loveOf = (list: BaseItemDto[]) => list.reduce((sum, track) => sum + model.longRun(track), 0)
+  const loveOf = (list: Track[]) => list.reduce((sum, track) => sum + model.longRun(track), 0)
   return [...byTag]
     .filter(([, entry]) => entry.tracks.length >= MIN_TAG && entry.tracks.length <= tracks.length * 0.6)
+    .map(([slug, entry]) => ({ slug, entry, love: loveOf(entry.tracks) }))
     // Queer first (asked for by name), then the tags the listener plays most.
-    .sort((a, b) => Number(b[0] === 'tag-queer') - Number(a[0] === 'tag-queer') || loveOf(b[1].tracks) - loveOf(a[1].tracks) || b[1].tracks.length - a[1].tracks.length)
+    .sort((a, b) => Number(b.slug === 'tag-queer') - Number(a.slug === 'tag-queer') || b.love - a.love || b.entry.tracks.length - a.entry.tracks.length)
     .slice(0, MAX_TAG_MIXES)
-    .map(([slug, entry]) => {
+    .map(({ slug, entry }) => {
       const mixed = assemble(
         [
           { tracks: entry.tracks.filter(model.known), weight: model.love, share: 0.7 },

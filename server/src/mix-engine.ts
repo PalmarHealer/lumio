@@ -1,6 +1,5 @@
-import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
-import { seeded } from './official'
-import { artistIdsOf } from './taste-model'
+import type { Track } from './music-catalog.ts'
+import { artistIdsOf } from './taste-model.ts'
 
 /**
  * Puts a mix together from pools (the familiar songs, deep cuts, discoveries …), each with its share of the mix and a
@@ -15,8 +14,8 @@ import { artistIdsOf } from './taste-model'
  * - A pool that runs dry hands its share to the others.
  */
 export interface Pool {
-  tracks: BaseItemDto[]
-  weight: (track: BaseItemDto) => number
+  tracks: Track[]
+  weight: (track: Track) => number
   share: number
 }
 
@@ -32,27 +31,90 @@ export interface AssembleOptions {
   exclude?: ReadonlySet<string>
 }
 
-/** A weighted random order: heavier songs tend to come first. Songs weighing nothing are left out. */
-export function weightedOrder(tracks: BaseItemDto[], weight: (track: BaseItemDto) => number, seed: string) {
-  const random = seeded(seed)
-  return tracks
-    .map((track) => ({ track, weight: weight(track) }))
-    .filter((entry) => entry.weight > 0)
-    .map((entry) => ({ track: entry.track, key: Math.log(random() || 1e-12) / entry.weight ** 1.5 }))
-    .sort((a, b) => b.key - a.key)
-    .map((entry) => entry.track)
+export function seeded(seed: string) {
+  let state = 0
+  for (const char of seed) state = (Math.imul(state, 31) + char.charCodeAt(0)) | 0
+  return () => {
+    state = (state + 0x6d2b79f5) | 0
+    let value = Math.imul(state ^ (state >>> 15), 1 | state)
+    value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296
+  }
 }
 
-export function assemble(pools: Pool[], options: AssembleOptions): BaseItemDto[] {
+/**
+ * A shuffle that leans towards what weighs more (the user's taste), yet stays a mix: each entry draws a random key
+ * scaled by its weight (Efraimidis–Spirakis), the same for the same seed.
+ */
+export function weightedShuffle<T>(items: T[], weight: (item: T) => number, seed: string) {
+  const random = seeded(seed)
+  return items
+    .map((item) => ({ item, key: random() ** (1 / (1 + weight(item))) }))
+    .sort((a, b) => b.key - a.key)
+    .map((entry) => entry.item)
+}
+
+/**
+ * The first songs of a weighted random order (heavier songs tend to come first; those weighing nothing are left out).
+ * A mix takes a few dozen songs from pools of tens of thousands, so only the best few hundred keys are sorted.
+ */
+export function weightedOrder(tracks: Track[], weight: (track: Track) => number, seed: string, keep = Infinity) {
+  const random = seeded(seed)
+  const keyed: Array<{ track: Track; key: number }> = []
+  for (const track of tracks) {
+    const value = weight(track)
+    if (value > 0) keyed.push({ track, key: Math.log(random() || 1e-12) / value ** 1.5 })
+  }
+  if (keyed.length > keep * 2) {
+    // The keep-th highest key, found without sorting everything.
+    const keys = keyed.map((entry) => entry.key)
+    const cut = nthHighest(keys, keep)
+    return keyed
+      .filter((entry) => entry.key >= cut)
+      .sort((a, b) => b.key - a.key)
+      .slice(0, keep)
+      .map((entry) => entry.track)
+  }
+  return keyed.sort((a, b) => b.key - a.key).map((entry) => entry.track)
+}
+
+/** The n-th highest value (quickselect; reorders `values`). */
+function nthHighest(values: number[], n: number) {
+  let low = 0
+  let high = values.length - 1
+  const target = Math.min(n, values.length) - 1
+  while (low < high) {
+    const pivot = values[(low + high) >> 1]!
+    let i = low
+    let j = high
+    while (i <= j) {
+      while (values[i]! > pivot) i++
+      while (values[j]! < pivot) j--
+      if (i <= j) {
+        ;[values[i], values[j]] = [values[j]!, values[i]!]
+        i++
+        j--
+      }
+    }
+    if (target <= j) high = j
+    else if (target >= i) low = i
+    else break
+  }
+  return values[target]!
+}
+
+export function assemble(pools: Pool[], options: AssembleOptions): Track[] {
   const { size, seed, maxPerArtist = Math.max(2, Math.ceil(size / 12)), artistGap = 3 } = options
   const used = new Set<string>(options.exclude)
-  const queues = pools.map((pool, i) => ({ share: pool.share, taken: 0, list: weightedOrder(pool.tracks, pool.weight, `${seed}:${i}`) }))
-  const result: BaseItemDto[] = []
+  // Enough of each pool's head that the spacing rules can still be kept (a pool of one artist runs out fast).
+  const keep = Math.max(size * 20, 400)
+  const queues = pools.map((pool, i) => ({ share: pool.share, taken: 0, list: weightedOrder(pool.tracks, pool.weight, `${seed}:${i}`, keep) }))
+  const result: Track[] = []
   const perArtist = new Map<string, number>()
 
   // Strict: the artist isn't among the last few songs, under their limit, not the same album twice in a row. Loose: only
   // the limit holds (for mixes of few artists).
-  const fits = (track: BaseItemDto, strict: boolean) => {
+  const fits = (track: Track, strict: boolean) => {
     if (!track.Id || used.has(track.Id)) return false
     const artists = artistIdsOf(track)
     if (artists.some((id) => (perArtist.get(id) ?? 0) >= (options.artistLimit?.(id) ?? maxPerArtist))) return false
@@ -74,7 +136,7 @@ export function assemble(pools: Pool[], options: AssembleOptions): BaseItemDto[]
     const total = live.reduce((sum, queue) => sum + queue.share, 0)
     // The pools furthest behind their share go first; the next one steps in when one has nothing that fits.
     const order = [...live].sort((a, b) => a.taken - (a.share / total) * (result.length + 1) - (b.taken - (b.share / total) * (result.length + 1)))
-    let picked: { queue: (typeof queues)[number]; track: BaseItemDto } | undefined
+    let picked: { queue: (typeof queues)[number]; track: Track } | undefined
     for (const strict of [true, false]) {
       for (const queue of order) {
         const track = take(queue, strict)
@@ -86,7 +148,7 @@ export function assemble(pools: Pool[], options: AssembleOptions): BaseItemDto[]
       if (picked) break
     }
     if (!picked) break
-    used.add(picked.track.Id!)
+    used.add(picked.track.Id)
     picked.queue.taken++
     for (const id of artistIdsOf(picked.track)) perArtist.set(id, (perArtist.get(id) ?? 0) + 1)
     result.push(picked.track)

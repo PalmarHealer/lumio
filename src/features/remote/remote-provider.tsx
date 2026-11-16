@@ -19,7 +19,7 @@ import { toast } from 'sonner'
 import { useSession } from '@/features/auth/session'
 import { messagesFor } from '@/lib/i18n'
 import { ticksToSeconds } from '@/lib/format'
-import { jellyfin } from '@/lib/jellyfin'
+import { absoluteServerUrl, jellyfin } from '@/lib/jellyfin'
 import { remoteMessages } from './messages'
 import { RemoteBar } from './remote-bar'
 import { measureClockOffset } from './remote-session'
@@ -474,7 +474,7 @@ export function RemoteProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!session || offline) return
     staleGroupChecked.current = false
-    const url = `${session.serverUrl.replace(/^http/, 'ws')}/socket?ApiKey=${encodeURIComponent(session.accessToken)}&deviceId=${encodeURIComponent(jellyfin.deviceInfo.id)}`
+    const url = `${absoluteServerUrl(session.serverUrl).replace(/^http/, 'ws')}/socket?ApiKey=${encodeURIComponent(session.accessToken)}&deviceId=${encodeURIComponent(jellyfin.deviceInfo.id)}`
     const socket = new WebSocketService(url)
     const stopStatus = socket.onStatusChange((status) => {
       if (status === SOCKET_OPEN) announceCapabilities()

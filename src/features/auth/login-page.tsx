@@ -65,9 +65,12 @@ export function LoginPage() {
   const { session } = useSession()
   // As typed; "jelly.example.org" becomes https:// (or http:// when only that answers) before anything connects.
   const [serverInput, setServerInput] = useState(DEFAULT_SERVER_URL)
-  const { address: serverUrl, reachable, resolving } = useServerAddress(serverInput)
-  // With an address to type, the ways to sign in wait until a Jellyfin server answers there.
-  const serverReady = config.serverLocked || reachable
+  const { address, reachable, resolving } = useServerAddress(serverInput)
+  // A locked address is known from the start; a typed one only once it is worked out ('' until then).
+  const serverUrl = config.serverLocked ? DEFAULT_SERVER_URL.trim().replace(/\/+$/, '') : address
+  // With an address to type, the ways to sign in wait until a Jellyfin server answers there; never without one, or a
+  // sign-in would be kept without its server.
+  const serverReady = !!serverUrl && (config.serverLocked || reachable)
   const [mode, setMode] = useState<'quick-connect' | 'password'>('quick-connect')
   const t = useMessages(loginMessages)
   const { appName, logo } = useBranding()

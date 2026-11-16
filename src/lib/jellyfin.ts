@@ -38,6 +38,16 @@ export const DEFAULT_SERVER_URL = (() => {
   return configured.trim() === '/' && typeof window !== 'undefined' ? window.location.origin : configured
 })()
 
+/**
+ * The server address as a session keeps it: always absolute and without a trailing slash. "" or "/" is this very
+ * address (Lumio in front of Jellyfin); a relative one would break everything that needs a whole URL (the socket).
+ */
+export function absoluteServerUrl(serverUrl: string) {
+  const value = serverUrl.trim()
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(value) || !/^https?:$/.test(window.location.protocol)) return value.replace(/\/+$/, '')
+  return new URL(value || '/', window.location.origin).href.replace(/\/+$/, '')
+}
+
 export function createApi(serverUrl: string, accessToken?: string): Api {
   return jellyfin.createApi(serverUrl.replace(/\/+$/, ''), accessToken)
 }

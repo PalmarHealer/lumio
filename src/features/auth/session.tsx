@@ -5,7 +5,7 @@ import { getAuthenticationApi } from '@jellyfin/sdk/lib/utils/api/authentication
 import { useQueryClient } from '@tanstack/react-query'
 import axios, { type AxiosError } from 'axios'
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { createApi } from '@/lib/jellyfin'
+import { absoluteServerUrl, createApi } from '@/lib/jellyfin'
 
 const SESSION_KEY = 'lumio.session'
 
@@ -30,7 +30,14 @@ const SessionContext = createContext<SessionContextValue | null>(null)
 function loadSession(): StoredSession | null {
   try {
     const raw = localStorage.getItem(SESSION_KEY)
-    return raw ? (JSON.parse(raw) as StoredSession) : null
+    if (!raw) return null
+    const stored = JSON.parse(raw) as StoredSession
+    // Sign-ins made while the sign-in page still worked out the address were kept without one ("").
+    const serverUrl = absoluteServerUrl(stored.serverUrl ?? '')
+    if (serverUrl === stored.serverUrl) return stored
+    const repaired = { ...stored, serverUrl }
+    localStorage.setItem(SESSION_KEY, JSON.stringify(repaired))
+    return repaired
   } catch {
     return null
   }
@@ -106,7 +113,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const completeSignIn = useCallback((serverUrl: string, result: AuthenticationResult) => {
     if (!result.AccessToken || !result.User?.Id) throw new Error('Unexpected authentication response')
     const next: StoredSession = {
-      serverUrl: createApi(serverUrl).basePath,
+      serverUrl: absoluteServerUrl(serverUrl),
       accessToken: result.AccessToken,
       userId: result.User.Id,
       userName: result.User.Name ?? '',

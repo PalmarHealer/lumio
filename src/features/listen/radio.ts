@@ -9,7 +9,7 @@ import { externalOf } from '@/lib/external-items'
 import { getLocale } from '@/lib/i18n'
 import { artistsOf } from '@/lib/item-links'
 import { ownKey } from '@/lib/services'
-import { musicLibraries, officialPlaylistQuery } from './official'
+import { musicLibraries, officialPlaylistQuery, unpackTracks } from './official'
 import { music, START } from './player/music-player'
 import { countsForTaste, NO_EXCLUSIONS } from './taste'
 
@@ -77,6 +77,7 @@ export async function continuation(api: Api, userId: string, queryClient: QueryC
     body: JSON.stringify({ artist: artist.id, exclude: played.map((track) => track.Id).filter(Boolean), seed: `${userId}:${Date.now()}` }),
   })
   if (!response.ok || response.status === 202) return []
-  const data = (await response.json()) as { playlists: Array<{ tracks: string[] }>; tracks: Record<string, BaseItemDto> }
-  return (data.playlists[0]?.tracks ?? []).map((id) => data.tracks[id]).filter((track): track is BaseItemDto => !!track)
+  const data = (await response.json()) as Parameters<typeof unpackTracks>[0] & { playlists: Array<{ tracks: string[] }> }
+  const tracks = unpackTracks(data)
+  return (data.playlists[0]?.tracks ?? []).map((id) => tracks.get(id)).filter((track): track is BaseItemDto => !!track)
 }

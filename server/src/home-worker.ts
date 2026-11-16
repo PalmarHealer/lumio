@@ -8,6 +8,7 @@ import { buildRadio, radioPlaylist, similarArtists } from './radio.ts'
 import { Store } from './store.ts'
 import { tasteSignals, tasteSittings } from './taste.ts'
 import { buildTasteModel, localDate, slotOf } from './taste-model.ts'
+import { pack, type WirePlaylists } from './wire.ts'
 
 /**
  * Builds the home page's playlists and the radios off the server's main thread (see home.ts): it holds every music
@@ -34,14 +35,6 @@ export type HomeJob =
   | { kind: 'similar'; who: Who; artistId: string }
   | { kind: 'progress'; who: Who }
 
-/** A playlist as sent to the app: its songs by id (the songs themselves once, beside the playlists). */
-export type WirePlaylist = Omit<MixPlaylist, 'tracks'> & { tracks: string[] }
-export type WireTrack = Track & { UserData?: UserData }
-export interface WirePlaylists {
-  at: number
-  playlists: WirePlaylist[]
-  tracks: Record<string, WireTrack>
-}
 
 const { jellyfinUrl, dataDir } = workerData as { jellyfinUrl: string; dataDir: string }
 const store = new Store(dataDir)
@@ -150,21 +143,18 @@ function listenerFor(who: Who) {
 
 const contextOf = (who: Who) => ({ now: Date.now(), userId: who.userId, timeZone: who.timeZone, locale: who.locale, lastfm: lastfmFor(who) })
 
-function wire(listener: Listener, playlists: MixPlaylist[]): WirePlaylists {
-  const tracks: Record<string, WireTrack> = {}
-  for (const playlist of playlists) {
-    for (const track of playlist.tracks) {
-      if (tracks[track.Id]) continue
-      const data = listener.userData(track)
-      tracks[track.Id] = data ? { ...track, UserData: data } : track
-    }
-  }
-  return { at: Date.now(), tracks, playlists: playlists.map((playlist) => ({ ...playlist, tracks: playlist.tracks.map((track) => track.Id) })) }
+const wire = (listener: Listener, playlists: MixPlaylist[]) => pack(playlists, listener.userData)
+
+/** A home page as made: its playlists (for asking for one of them), and packed for the app. */
+interface Home {
+  listener: Listener
+  playlists: MixPlaylist[]
+  packed: WirePlaylists
 }
 
 // ---- the home page ----
 
-const homes = new Map<string, { at: number; result: Promise<WirePlaylists> }>()
+const homes = new Map<string, { at: number; result: Promise<Home> }>()
 const refreshing = new Set<string>()
 
 /** The playlists of the listener's day part (see slotOf): kept half an hour, then made again while the old are shown. */
@@ -174,7 +164,8 @@ function home(who: Who) {
   const kept = homes.get(key)
   const build = async () => {
     const listener = await listenerFor(who)
-    return wire(listener, await homePlaylists(listener, contextOf(who)))
+    const playlists = await homePlaylists(listener, contextOf(who))
+    return { listener, playlists, packed: wire(listener, playlists) }
   }
   if (kept && now - kept.at < HOME_TTL) return kept.result
   if (kept) {
@@ -206,7 +197,7 @@ async function slug(who: Who, slug: string): Promise<WirePlaylists | null> {
   }
   const all = await home(who)
   const listed = all.playlists.find((playlist) => playlist.slug === slug)
-  if (listed) return { at: all.at, playlists: [listed], tracks: Object.fromEntries(listed.tracks.map((id) => [id, all.tracks[id]!])) }
+  if (listed) return wire(all.listener, [listed])
   const playlist = playlistBySlug(listener, context, slug)
   return playlist ? wire(listener, [playlist]) : null
 }
@@ -214,7 +205,7 @@ async function slug(who: Who, slug: string): Promise<WirePlaylists | null> {
 async function run(job: HomeJob): Promise<unknown> {
   switch (job.kind) {
     case 'home':
-      return home(job.who)
+      return (await home(job.who)).packed
     case 'slug':
       return slug(job.who, job.slug)
     case 'continue': {

@@ -35,11 +35,17 @@ export interface OfficialPlaylist {
   extraLabel?: string
 }
 
-/** The server's answer: each playlist's songs by id, the songs themselves once. */
+/**
+ * The server's answer, packed (server/src/wire.ts): each playlist's songs by id, each song once, and what repeats from
+ * song to song (server id, kind, albums, artist names) in tables.
+ */
 interface Wire {
   at: number
+  serverId?: string
+  artists: Record<string, string>
+  albums: Record<string, [string | null, string | null, string | null]>
   playlists: Array<Omit<OfficialPlaylist, 'tracks'> & { tracks: string[] }>
-  tracks: Record<string, BaseItemDto>
+  tracks: Record<string, BaseItemDto & { a?: string[]; b?: string[] }>
 }
 
 /** While the server first reads a big library (minutes): how far it is. */
@@ -53,8 +59,33 @@ interface Built {
   preparing?: Preparing
 }
 
+/** The songs as Jellyfin's items again. */
+export function unpackTracks(wire: Pick<Wire, 'serverId' | 'artists' | 'albums' | 'tracks'>): Map<string, BaseItemDto> {
+  const result = new Map<string, BaseItemDto>()
+  const refs = (ids: string[] | undefined) => ids?.map((id) => ({ Id: id, Name: wire.artists[id] ?? '' }))
+  for (const [id, packed] of Object.entries(wire.tracks)) {
+    const { a, b, ...rest } = packed
+    const album = rest.AlbumId ? wire.albums[rest.AlbumId] : undefined
+    const ArtistItems = refs(a) ?? []
+    result.set(id, {
+      ServerId: wire.serverId,
+      Type: 'Audio',
+      MediaType: 'Audio',
+      IsFolder: false,
+      HasLyrics: false,
+      ...(album ? { Album: album[0], AlbumPrimaryImageTag: album[1], AlbumArtist: album[2] } : {}),
+      ArtistItems,
+      AlbumArtists: refs(b) ?? [],
+      Artists: ArtistItems.map((artist) => artist.Name),
+      ...rest,
+    })
+  }
+  return result
+}
+
 function unwire(wire: Wire): OfficialPlaylist[] {
-  return wire.playlists.map((playlist) => ({ ...playlist, tracks: playlist.tracks.map((id) => wire.tracks[id]).filter((track): track is BaseItemDto => !!track) }))
+  const tracks = unpackTracks(wire)
+  return wire.playlists.map((playlist) => ({ ...playlist, tracks: playlist.tracks.map((id) => tracks.get(id)).filter((track): track is BaseItemDto => !!track) }))
 }
 
 const timeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'

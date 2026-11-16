@@ -28,7 +28,7 @@ const DAYLIST_SIZE = 40
 const MIX_SIZE = 30
 const MAX_DAILY_MIXES = 6
 /** The home page shows this many genre mixes at most (a big library has hundreds of genres); the rest on request. */
-export const MAX_GENRE_MIXES = 40
+export const MAX_GENRE_MIXES = 20
 
 export const mixMessages = {
   de: {

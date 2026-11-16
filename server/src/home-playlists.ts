@@ -39,7 +39,7 @@ const PERSONAL_SIZE = 100
 /** Charts with fewer of their songs in the library are left out. */
 const MIN_CHART = 5
 /** "Best of" playlists on the home page (a big library has thousands of artists with five songs); others on request. */
-const MAX_ARTIST_LISTS = 40
+const MAX_ARTIST_LISTS = 20
 
 export const officialMessages = {
   de: {

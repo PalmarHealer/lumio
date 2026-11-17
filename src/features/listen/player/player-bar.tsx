@@ -336,6 +336,9 @@ function Extras() {
             'hover:[&_[data-slot=slider-range]]:bg-listen-hover hover:[&_[data-slot=slider-thumb]]:opacity-100',
             'data-dragging:[&_[data-slot=slider-range]]:bg-listen-hover data-dragging:[&_[data-slot=slider-thumb]]:opacity-100',
             '[&:has(:focus-visible)_[data-slot=slider-thumb]]:opacity-100',
+            // Pressing goes to the bar, never the (often invisible) knob: the knob would keep the distance it was
+            // grabbed at and follow the pointer offset, the bar puts the level right under it.
+            '[&_[data-slot=slider-thumb]]:pointer-events-none',
           )}
           min={0}
           max={100}

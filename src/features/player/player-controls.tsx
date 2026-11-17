@@ -130,10 +130,14 @@ export function PlayerControls({
             <Slider
               min={0}
               max={1}
-              step={0.05}
+              // Fine steps, so dragging moves smoothly (in 5 % steps the short bar jumped by several pixels).
+              step={0.01}
               value={[silent ? 0 : state.volume]}
               aria-label={t.volume}
               onValueChange={(next) => onVolume(Array.isArray(next) ? (next[0] ?? 0) : next)}
+              // Centred on the level, the bar shows it from the start: an edge-aligned one is only placed once its knob
+              // is measured, and folded away (and the knob scaled to nothing) it isn't until first touched.
+              thumbAlignment="center"
               // Same look and behaviour as the seek bar: thin track that thickens on hover, knob only while hovered,
               // focused or dragged.
               className={cn(
@@ -142,6 +146,9 @@ export function PlayerControls({
                 '**:data-[slot=slider-range]:bg-white',
                 '**:data-[slot=slider-thumb]:size-3.5 **:data-[slot=slider-thumb]:scale-0 **:data-[slot=slider-thumb]:border-0 **:data-[slot=slider-thumb]:bg-white **:data-[slot=slider-thumb]:shadow **:data-[slot=slider-thumb]:ring-0 **:data-[slot=slider-thumb]:transition-transform',
                 'hover:**:data-[slot=slider-thumb]:scale-100 has-[:focus-visible]:**:data-[slot=slider-thumb]:scale-100 data-dragging:**:data-[slot=slider-thumb]:scale-100',
+                // Pressing goes to the bar, never the knob: the knob would keep the distance it was grabbed at and
+                // follow the pointer offset, the bar puts the level right under it.
+                '**:data-[slot=slider-thumb]:pointer-events-none',
               )}
             />
           </div>

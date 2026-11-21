@@ -599,19 +599,28 @@ export function useSearch(term: string, mode: AppMode = 'watch') {
     queryKey: ['search', session.userId, term, mode],
     enabled: term.length > 0,
     placeholderData: (previous) => previous,
-    queryFn: async () =>
-      (
+    queryFn: async () => {
+      const items = (
         (
-        await getLibraryApi(api).getItems({
-          userId: session.userId,
-          searchTerm: term,
-          recursive: true,
-          includeItemTypes: SEARCH_TYPES[mode],
-          fields: [ItemFields.PrimaryImageAspectRatio],
-          limit: 120,
-        })
-      ).data.Items ?? []
-      ).filter((item) => item.Type !== 'Playlist' || isVideoPlaylist(item) === (mode === 'watch')),
+          await getLibraryApi(api).getItems({
+            userId: session.userId,
+            searchTerm: term,
+            recursive: true,
+            includeItemTypes: SEARCH_TYPES[mode],
+            fields: [ItemFields.PrimaryImageAspectRatio],
+            limit: 120,
+          })
+        ).data.Items ?? []
+      ).filter((item) => item.Type !== 'Playlist' || isVideoPlaylist(item) === (mode === 'watch'))
+      // Jellyfin compares the term with a series' "clean" name ("S.W.A.T." becomes "s w a t"), so "swat" finds only its
+      // episodes (they match through their series name). The series those episodes belong to come first.
+      const found = new Set(items.map((item) => item.Id))
+      const missing = [...new Set(items.flatMap((item) => (item.Type === 'Episode' && item.SeriesId && !found.has(item.SeriesId) ? [item.SeriesId] : [])))]
+      if (!missing.length) return items
+      const series =
+        (await getLibraryApi(api).getItems({ userId: session.userId, ids: missing, fields: [ItemFields.PrimaryImageAspectRatio] })).data.Items ?? []
+      return [...series, ...items]
+    },
   })
 }
 

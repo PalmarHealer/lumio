@@ -1,7 +1,7 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
 import { IconBookmark, IconBookmarkFilled, IconEye, IconEyeCheck, IconPlayerPlay } from '@tabler/icons-react'
 import { useEffect, useMemo, useRef, useState, type Ref } from 'react'
-import { Navigate, useLocation, useParams, useSearchParams } from 'react-router'
+import { Navigate, useLocation, useNavigationType, useParams, useSearchParams } from 'react-router'
 import { Link } from '@/components/link'
 import { FadeImage } from '@/components/media/fade-image'
 import { MediaRow } from '@/components/media/media-row'
@@ -132,7 +132,7 @@ export function DetailPage() {
         {series && <MediaRow title={t.seriesRow(series.name)} items={series.films} currentId={item.Id} />}
         <PersonRow title={t.cast} people={cast.slice(0, 30).map((person) => ({ person }))} />
         {isSeries && <GuestStarsRow seriesId={item.Id!} />}
-        {isSeries && <SeasonsSection key={`${item.Id}:${search.get('season') ?? ''}:${search.get('episode') ?? ''}`} series={item} seriesId={item.Id!} initialSeasonId={search.get('season') ?? undefined} highlightId={search.get('episode') ?? undefined} />}
+        {isSeries && <SeasonsSection key={`${item.Id}:${search.get('episode') ?? ''}`} series={item} seriesId={item.Id!} highlightId={search.get('episode') ?? undefined} />}
         <SimilarRow item={item} exclude={series?.films} />
         <PluginSlot name="item:bottom" context={{ item }} className="px-4 sm:px-8" />
       </div>
@@ -246,13 +246,26 @@ function currentSeasonId(seasons: BaseItemDto[]): string | undefined {
 interface SeasonsSectionProps {
   series: BaseItemDto
   seriesId: string
-  initialSeasonId?: string
   highlightId?: string
 }
 
-function SeasonsSection({ series, seriesId, initialSeasonId, highlightId }: SeasonsSectionProps) {
+function SeasonsSection({ series, seriesId, highlightId }: SeasonsSectionProps) {
   const seasons = useSeasons(seriesId)
-  const [picked, setPicked] = useState<string | undefined>(initialSeasonId)
+  // The season shown lives in the address (?season=): coming back from the player (or any other page) opens the page
+  // exactly as it was left, instead of working out "where the user is" again.
+  const [search, setSearch] = useSearchParams()
+  const picked = search.get('season') ?? undefined
+  const showSeason = (id: string) =>
+    setSearch(
+      (current) => {
+        const next = new URLSearchParams(current)
+        next.set('season', id)
+        return next
+      },
+      // Only the address changes: the page stays where it is (see PageTransition).
+      { replace: true, preventScrollReset: true, state: { keepScroll: true } },
+    )
+  const navigationType = useNavigationType()
   const orderedSeasons = useMemo(() => {
     const all = seasons.data ?? []
     return [...all.filter((season) => !isSpecials(season)), ...all.filter(isSpecials)]
@@ -266,10 +279,16 @@ function SeasonsSection({ series, seriesId, initialSeasonId, highlightId }: Seas
   const seasonId = picked ?? (playTarget.isPending && !playTarget.isError ? undefined : (targetSeason ?? currentSeasonId(orderedSeasons)))
   const episodes = useEpisodes(seriesId, seasonId)
   const episodesLoading = episodes.isLoading || (!seasonId && orderedSeasons.length > 0)
+  // The season worked out on arrival is kept in the address too, so it stays when the user comes back.
+  useEffect(() => {
+    if (!picked && seasonId) showSeason(seasonId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [picked, seasonId])
 
-  // Jump to the episode the user came from (e.g. "Weiterschauen"), once per episode.
+  // Jump to the episode the user came from (e.g. "Weiterschauen"), once per episode. Not on the way back (from the
+  // player): the page then keeps the scroll position it was left at.
   const highlighted = useRef<HTMLLIElement>(null)
-  const scrolledTo = useRef<string | undefined>(undefined)
+  const scrolledTo = useRef<string | undefined>(navigationType === 'POP' ? highlightId : undefined)
   useEffect(() => {
     if (!highlightId || scrolledTo.current === highlightId || !highlighted.current) return
     scrolledTo.current = highlightId
@@ -283,7 +302,7 @@ function SeasonsSection({ series, seriesId, initialSeasonId, highlightId }: Seas
     <section className="space-y-4 px-4 sm:px-8">
         <div className="flex flex-wrap items-center gap-2">
           {orderedSeasons.map((season) => (
-            <Button key={season.Id} size="sm" variant={season.Id === seasonId ? 'default' : 'outline'} onClick={() => setPicked(season.Id!)}>
+            <Button key={season.Id} size="sm" variant={season.Id === seasonId ? 'default' : 'outline'} onClick={() => showSeason(season.Id!)}>
               <SeasonName season={season} />
             </Button>
           ))}

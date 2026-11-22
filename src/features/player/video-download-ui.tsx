@@ -10,7 +10,7 @@ import { languageKey, languageName } from '@/lib/track-labels'
 import { defineMessages, useMessages } from '@/lib/i18n'
 import { useOffline } from '@/lib/network'
 import { cn } from '@/lib/utils'
-import { useVideoStored, videoCacheAvailable } from './video-cache'
+import { forgetVideo, useVideoStored, videoCacheAvailable } from './video-cache'
 import {
   downloadVideos,
   removeEpisodeDownload,
@@ -44,6 +44,8 @@ const messages = defineMessages({
     unavailable: 'Offline nicht verfügbar',
     chooseLanguage: 'Tonspur zum Herunterladen',
     preferred: 'Bevorzugt',
+    stored: 'Für dich vorbereitet (heruntergeladen)',
+    removeStored: (name: string) => `Gespeicherte Kopie von „${name}“ entfernen`,
   },
   en: {
     download: 'Download',
@@ -64,6 +66,8 @@ const messages = defineMessages({
     unavailable: 'Not available offline',
     chooseLanguage: 'Audio to download',
     preferred: 'Preferred',
+    stored: 'Prepared for you (downloaded)',
+    removeStored: (name: string) => `Remove the stored copy of “${name}”`,
   },
 })
 
@@ -85,6 +89,17 @@ export function useVideoUnavailable(itemId: string | null | undefined) {
   const offline = useOffline()
   const stored = useVideoStored(itemId)
   return !!itemId && offline && !stored
+}
+
+/**
+ * A film's or episode's download as shown: a copy the cache stored ahead (the next episodes while watching) looks
+ * exactly like a download; `stored` tells it apart (removing it forgets the copy instead of a download).
+ */
+function useShownDownload(itemId: string | null | undefined): { download: VideoDownloadState; stored: boolean } {
+  const download = useVideoDownload(itemId)
+  const hasCopy = useVideoStored(itemId)
+  if (download || !hasCopy) return { download, stored: false }
+  return { download: { state: 'done' }, stored: true }
 }
 
 const glyphState = (download: VideoDownloadState) => (download ? download.state : 'none')
@@ -157,7 +172,7 @@ function LanguageMenu({
 /** The film's download, beside its play button. */
 export function MovieDownloadButton({ movie }: { movie: BaseItemDto }) {
   const t = useMessages(messages)
-  const download = useVideoDownload(movie.Id)
+  const { download, stored } = useShownDownload(movie.Id)
   const { languages, preferred } = useLanguageChoice([movie])
   if (!videoCacheAvailable || !movie.Id) return null
   const key = `movie:${movie.Id}`
@@ -168,8 +183,8 @@ export function MovieDownloadButton({ movie }: { movie: BaseItemDto }) {
       size="lg"
       variant="outline"
       aria-pressed={!!download}
-      title={download ? t.remove : t.download}
-      onClick={ask ? undefined : () => (download ? removeVideoDownload(key) : start(preferred))}
+      title={stored ? t.removeStored(movie.Name ?? '') : download ? t.remove : t.download}
+      onClick={ask ? undefined : () => (stored ? void forgetVideo(movie.Id!) : download ? removeVideoDownload(key) : start(preferred))}
       className={cn(download && 'text-listen hover:text-listen')}
     />
   )
@@ -232,10 +247,14 @@ export function SeasonDownloadButton({ series, seasons, season, episodes }: { se
  */
 export function EpisodeDownloadButton({ episode, context, className }: { episode: BaseItemDto; context: BaseItemDto[]; className?: string }) {
   const t = useMessages(messages)
-  const download = useVideoDownload(episode.Id)
+  const { download, stored } = useShownDownload(episode.Id)
   const { languages, preferred } = useLanguageChoice([episode])
   if (!videoCacheAvailable || !episode.Id) return null
-  const label = download ? `${labelOf(t, download)} · ${t.removeEpisode(episode.Name ?? '')}` : t.downloadEpisode(episode.Name ?? '')
+  const label = stored
+    ? `${t.stored} · ${t.removeStored(episode.Name ?? '')}`
+    : download
+      ? `${labelOf(t, download)} · ${t.removeEpisode(episode.Name ?? '')}`
+      : t.downloadEpisode(episode.Name ?? '')
   const start = (language: string | null) => downloadVideos(`episode:${episode.Id}`, 'episode', episode.Name ?? '', [episode], context, language)
   const ask = !download && languages.length > 1
   const button = (
@@ -250,7 +269,8 @@ export function EpisodeDownloadButton({ episode, context, className }: { episode
           : (event) => {
               event.preventDefault()
               event.stopPropagation()
-              if (download) removeEpisodeDownload(episode.Id!)
+              if (stored) void forgetVideo(episode.Id!)
+              else if (download) removeEpisodeDownload(episode.Id!)
               else start(preferred)
             }
       }
@@ -279,10 +299,11 @@ export function EpisodeDownloadButton({ episode, context, className }: { episode
 /** The small mark of a downloaded (or downloading) episode, e.g. in the player's episode list. */
 export function VideoDownloadMark({ itemId, className }: { itemId: string | null | undefined; className?: string }) {
   const t = useMessages(messages)
-  const download = useVideoDownload(itemId)
+  const { download, stored } = useShownDownload(itemId)
   if (!download) return null
+  const label = stored ? t.stored : labelOf(t, download)
   return (
-    <span role="img" aria-label={labelOf(t, download)} title={labelOf(t, download)} className={cn('inline-grid', download.state === 'queued' ? 'text-white/60' : 'text-listen', className)}>
+    <span role="img" aria-label={label} title={label} className={cn('inline-grid', download.state === 'queued' ? 'text-white/60' : 'text-listen', className)}>
       <DownloadGlyph state={download.state} share={shareOf(download)} className="size-4" />
     </span>
   )

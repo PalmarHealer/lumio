@@ -6,7 +6,9 @@ import { getLibraryApi } from '@jellyfin/sdk/lib/utils/api/library-api'
 import { getShowApi } from '@jellyfin/sdk/lib/utils/api/show-api'
 import { getUserDataApi } from '@jellyfin/sdk/lib/utils/api/user-data-api'
 import { keepPreviousData, queryOptions, useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMemo } from 'react'
 import { useAuthedSession } from '@/features/auth/session'
+import { rankResults, type ArtistAffinity } from '@/features/search/rank'
 import type { AppMode } from '@/lib/app-mode'
 import { trackIndex } from '@/lib/unscanned'
 
@@ -593,35 +595,78 @@ const SEARCH_TYPES: Record<AppMode, BaseItemKind[]> = {
   listen: [BaseItemKind.MusicArtist, BaseItemKind.MusicAlbum, BaseItemKind.Audio, BaseItemKind.AudioBook, BaseItemKind.Playlist],
 }
 
-export function useSearch(term: string, mode: AppMode = 'watch') {
+/**
+ * How much the user listens to each artist: their most played songs, counted per artist. Loaded once in a while, it lets
+ * the search put the artists (and their songs) the user actually hears first.
+ */
+function useArtistAffinity(enabled: boolean) {
   const { api, session } = useAuthedSession()
   return useQuery({
+    queryKey: ['search', 'artist-affinity', session.userId],
+    enabled,
+    staleTime: 30 * 60 * 1000,
+    queryFn: async (): Promise<ArtistAffinity> => {
+      const { data } = await getLibraryApi(api).getItems({
+        userId: session.userId,
+        recursive: true,
+        includeItemTypes: [BaseItemKind.Audio],
+        filters: [ItemFilter.IsPlayed],
+        sortBy: [ItemSortBy.PlayCount],
+        sortOrder: [SortOrder.Descending],
+        enableImages: false,
+        limit: 500,
+      })
+      const affinity: ArtistAffinity = new Map()
+      for (const song of data.Items ?? []) {
+        const plays = song.UserData?.PlayCount || 1
+        const ids = new Set([...(song.ArtistItems ?? []), ...(song.AlbumArtists ?? [])].map((artist) => artist.Id).filter(Boolean) as string[])
+        for (const id of ids) affinity.set(id, (affinity.get(id) ?? 0) + plays)
+      }
+      return affinity
+    },
+  })
+}
+
+/**
+ * Searches the library, best results first for this user (see `rankResults`). Next to the plain search it asks for the
+ * matches the user played or liked: with ~100k songs those are often far behind the first 120 plain matches.
+ */
+export function useSearch(term: string, mode: AppMode = 'watch') {
+  const { api, session } = useAuthedSession()
+  const affinity = useArtistAffinity(mode === 'listen' && term.length > 0)
+  const search = useQuery({
     queryKey: ['search', session.userId, term, mode],
     enabled: term.length > 0,
     placeholderData: (previous) => previous,
     queryFn: async () => {
-      const items = (
-        (
-          await getLibraryApi(api).getItems({
-            userId: session.userId,
-            searchTerm: term,
-            recursive: true,
-            includeItemTypes: SEARCH_TYPES[mode],
-            fields: [ItemFields.PrimaryImageAspectRatio],
-            limit: 120,
-          })
-        ).data.Items ?? []
-      ).filter((item) => item.Type !== 'Playlist' || isVideoPlaylist(item) === (mode === 'watch'))
+      const library = getLibraryApi(api)
+      const base = {
+        userId: session.userId,
+        searchTerm: term,
+        recursive: true,
+        includeItemTypes: SEARCH_TYPES[mode],
+        fields: [ItemFields.PrimaryImageAspectRatio],
+      }
+      const [plain, played, liked] = await Promise.all([
+        library.getItems({ ...base, limit: 120 }),
+        library.getItems({ ...base, filters: [ItemFilter.IsPlayed], sortBy: [ItemSortBy.PlayCount], sortOrder: [SortOrder.Descending], limit: 30 }),
+        library.getItems({ ...base, filters: [ItemFilter.IsFavorite], limit: 30 }),
+      ])
+      const unique = new Map<string, BaseItemDto>()
+      for (const item of [...(plain.data.Items ?? []), ...(played.data.Items ?? []), ...(liked.data.Items ?? [])]) {
+        if (item.Id && !unique.has(item.Id)) unique.set(item.Id, item)
+      }
+      const items = [...unique.values()].filter((item) => item.Type !== 'Playlist' || isVideoPlaylist(item) === (mode === 'watch'))
       // Jellyfin compares the term with a series' "clean" name ("S.W.A.T." becomes "s w a t"), so "swat" finds only its
       // episodes (they match through their series name). The series those episodes belong to come first.
-      const found = new Set(items.map((item) => item.Id))
-      const missing = [...new Set(items.flatMap((item) => (item.Type === 'Episode' && item.SeriesId && !found.has(item.SeriesId) ? [item.SeriesId] : [])))]
+      const missing = [...new Set(items.flatMap((item) => (item.Type === 'Episode' && item.SeriesId && !unique.has(item.SeriesId) ? [item.SeriesId] : [])))]
       if (!missing.length) return items
-      const series =
-        (await getLibraryApi(api).getItems({ userId: session.userId, ids: missing, fields: [ItemFields.PrimaryImageAspectRatio] })).data.Items ?? []
+      const series = (await library.getItems({ userId: session.userId, ids: missing, fields: [ItemFields.PrimaryImageAspectRatio] })).data.Items ?? []
       return [...series, ...items]
     },
   })
+  const data = useMemo(() => (search.data ? rankResults(search.data, term, affinity.data) : undefined), [search.data, term, affinity.data])
+  return { ...search, data }
 }
 
 /** Everything a person (actor, director, ...) appears in. */

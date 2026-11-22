@@ -1,4 +1,5 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
+import { SingerLabel, singerChange } from './lyrics-singer'
 import {
   IconArrowsDiagonal,
   IconArrowsDiagonalMinimize2,
@@ -1005,6 +1006,7 @@ export function LyricsView({ track, big }: { track: BaseItemDto; big: boolean })
             synced && 'cursor-pointer hover:text-white/90',
           )}
         >
+          {singerChange(lines, index) && <SingerLabel name={line.singer!} />}
           {line.text || '♪'}
         </p>
       ))}

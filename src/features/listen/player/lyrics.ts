@@ -1,4 +1,5 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
+import { getArtistApi } from '@jellyfin/sdk/lib/utils/api/artist-api'
 import { getLyricApi } from '@jellyfin/sdk/lib/utils/api/lyric-api'
 import type { Api } from '@jellyfin/sdk'
 import { queryOptions, useQuery } from '@tanstack/react-query'
@@ -13,6 +14,8 @@ export interface LyricLine {
   /** Seconds into the track; missing for plain (unsynced) lyrics. */
   time?: number
   text: string
+  /** Who sings the line, when the lyrics say so ("{Jennie} …" at the line's start; see `withSingers`). */
+  singer?: string
 }
 
 export interface Lyrics {
@@ -48,7 +51,8 @@ export function useLyrics(item: BaseItemDto | undefined) {
 /** The lyrics query, also for loading them ahead (the next track's). */
 export function lyricsOptions(api: Api, item: BaseItemDto | undefined) {
   return queryOptions({
-    queryKey: ['lyrics', item?.Id],
+    // v2: lines carry their singer (withSingers); lyrics kept from before are read again.
+    queryKey: ['lyrics', 2, item?.Id],
     // Podcasts have no lyrics.
     enabled: !!item?.Id && !externalOf(item),
     // Lyrics don't change: kept (also across restarts, see query-persist) as long as the saved data is. "None" is asked
@@ -56,40 +60,96 @@ export function lyricsOptions(api: Api, item: BaseItemDto | undefined) {
     staleTime: (query) => (query.state.data ? Infinity : 12 * 60 * 60_000),
     gcTime: 30 * 24 * 60 * 60_000,
     retry: false,
-    queryFn: async (): Promise<Lyrics | null> => {
-      try {
-        const { data } = await getLyricApi(api).getLyrics({ itemId: item!.Id! })
-        const lines = (data.Lyrics ?? []).map((line) => ({
-          time: line.Start != null ? ticksToSeconds(line.Start) : undefined,
-          text: line.Text ?? '',
-        }))
-        if (lines.length) return { lines, synced: lines.some((line) => line.time !== undefined), source: 'jellyfin' }
-      } catch {
-        // No lyrics in Jellyfin (404); try the others.
-      }
-      let best: Lyrics | null = null
-      const kept = await lumioGet(`/music/lyrics/${item!.Id}`).catch(() => null)
-      if (kept?.ok) {
-        best = (await kept.json()) as Lyrics
-        if (best.synced) return best
-      }
-      const track = lyricsTrack(item!)
-      for (const provider of [lrclib, ...lyricsProviders()]) {
-        let found: Lyrics | null = null
-        try {
-          found = toLyrics(await provider.find(track), provider.id)
-        } catch (error) {
-          console.warn(`Lyrics provider "${provider.id}" failed`, error)
-        }
-        // Plain lyrics only help while there are none; synced ones end the search.
-        if (!found || (best && !found.synced)) continue
-        void lumioSend('PUT', `/music/lyrics/${item!.Id}`, found).catch(() => undefined)
-        if (found.synced) return found
-        best = found
-      }
-      return best
+    queryFn: async () => {
+      const found = await findLyrics(api, item!)
+      return found && withSingers(api, found)
     },
   })
+}
+
+async function findLyrics(api: Api, item: BaseItemDto): Promise<Lyrics | null> {
+  try {
+    const { data } = await getLyricApi(api).getLyrics({ itemId: item.Id! })
+    const lines = (data.Lyrics ?? []).map((line) => ({
+      time: line.Start != null ? ticksToSeconds(line.Start) : undefined,
+      text: line.Text ?? '',
+    }))
+    if (lines.length) return { lines, synced: lines.some((line) => line.time !== undefined), source: 'jellyfin' }
+  } catch {
+    // No lyrics in Jellyfin (404); try the others.
+  }
+  let best: Lyrics | null = null
+  const kept = await lumioGet(`/music/lyrics/${item.Id}`).catch(() => null)
+  if (kept?.ok) {
+    best = (await kept.json()) as Lyrics
+    if (best.synced) return best
+  }
+  const track = lyricsTrack(item)
+  for (const provider of [lrclib, ...lyricsProviders()]) {
+    let found: Lyrics | null = null
+    try {
+      found = toLyrics(await provider.find(track), provider.id)
+    } catch (error) {
+      console.warn(`Lyrics provider "${provider.id}" failed`, error)
+    }
+    // Plain lyrics only help while there are none; synced ones end the search.
+    if (!found || (best && !found.synced)) continue
+    void lumioSend('PUT', `/music/lyrics/${item.Id}`, found).catch(() => undefined)
+    if (found.synced) return found
+    best = found
+  }
+  return best
+}
+
+/** "{Jennie} Click-clack": the singer in braces at a line's start (as lrclib's K-pop lyrics often have it). */
+const SINGER = /^\s*\{([^{}]{1,40})\}\s*/
+
+/**
+ * Takes the singers out of the lines ("{Jennie} …" becomes the line "…" sung by Jennie). Names often lost their accents
+ * on the way into lrclib ("{Ros?}"): a name with "?" is looked up among the library's artists ("ROSÉ"), written in the
+ * lyrics' own case ("Rosé").
+ */
+async function withSingers(api: Api, lyrics: Lyrics): Promise<Lyrics> {
+  // Curly apostrophes got lost the same way ("I?m", "don?t"): a "?" between two letters is never a question mark.
+  const mended = lyrics.lines.map((line) => (/\p{L}\?\p{L}/u.test(line.text) ? { ...line, text: line.text.replace(/(\p{L})\?(?=\p{L})/gu, '$1’') } : line))
+  if (!mended.some((line) => SINGER.test(line.text))) return { ...lyrics, lines: mended }
+  const lines: LyricLine[] = mended.map((line) => {
+    const match = SINGER.exec(line.text)
+    return match ? { ...line, text: line.text.slice(match[0].length), singer: match[1]!.trim() } : line
+  })
+  const broken = [...new Set(lines.map((line) => line.singer).filter((name): name is string => !!name && LOST.test(name)))]
+  const repaired = new Map(await Promise.all(broken.map(async (name) => [name, await repairName(api, name)] as const)))
+  return { ...lyrics, lines: lines.map((line) => (line.singer && repaired.get(line.singer) ? { ...line, singer: repaired.get(line.singer) } : line)) }
+}
+
+/** A letter lost on the way: "?" or the replacement character. */
+const LOST = /[?�]/u
+
+/** "Ros?" → "Rosé", when an artist in the library has that name with a letter in place of each "?". */
+async function repairName(api: Api, name: string): Promise<string | undefined> {
+  const chars = [...name]
+  const known = name.split(LOST)[0]!.trim()
+  if (known.length < 2) return undefined
+  const fits = (candidate: string) => {
+    const letters = [...candidate]
+    return letters.length === chars.length && chars.every((char, i) => LOST.test(char) || char.toLowerCase() === letters[i]!.toLowerCase())
+  }
+  try {
+    const { data } = await getArtistApi(api).getArtists({ searchTerm: known, limit: 50, enableImages: false })
+    const artist = (data.Items ?? []).map((item) => item.Name ?? '').find(fits)
+    if (!artist) return undefined
+    const letters = [...artist]
+    return chars
+      .map((char, i) => {
+        if (!LOST.test(char)) return char
+        // In the lyrics' own case: "Ros?" with the library's "ROSÉ" gives "Rosé".
+        const before = chars[i - 1] ?? ''
+        return before && before === before.toLowerCase() ? letters[i]!.toLowerCase() : letters[i]!
+      })
+      .join('')
+  } catch {
+    return undefined
+  }
 }
 
 /** What providers are told about a song. */

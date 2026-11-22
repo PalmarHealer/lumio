@@ -107,14 +107,7 @@ export function initialChoice(
   }
 }
 
-/** Quality steps of the player menu; the one without a bitrate is the original. */
-export const QUALITY_OPTIONS: Array<{ resolution?: string; bitrate?: number }> = [
-  {},
-  { resolution: '1080p', bitrate: 20_000_000 },
-  { resolution: '720p', bitrate: 8_000_000 },
-  { resolution: '480p', bitrate: 3_000_000 },
-  { resolution: '360p', bitrate: 1_500_000 },
-]
+export { QUALITY_OPTIONS } from './labels'
 
 function withApiKey(path: string, token: string) {
   return `${path}${path.includes('?') ? '&' : '?'}ApiKey=${encodeURIComponent(token)}`

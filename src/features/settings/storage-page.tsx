@@ -7,19 +7,32 @@ import { clearVideoCache, trimVideos, useVideoCacheStats, videoCacheAvailable } 
 import { clearVideoDownloads, useVideoDownloadStats } from '@/features/player/video-downloads'
 import { useAppMode } from '@/lib/app-mode'
 import { appCacheBytes, clearAppCaches } from '@/lib/app-cache'
-import { getLocaleTag, useLocale, useMessages } from '@/lib/i18n'
+import { getLocaleTag, useLocale, useMessages, type Locale } from '@/lib/i18n'
+import { QUALITY_OPTIONS, qualityLabel } from '@/features/player/labels'
 import { networkTypeKnown, useCellular } from '@/lib/network'
 import { Section, SelectField, SettingsPage, SwitchField } from './fields'
 import { DEFAULT_SETTINGS, useLocalSettings } from './local-settings'
 import { playbackMessages } from './messages'
 
 const MB = 1024 * 1024
+const MBIT = 1_000_000
 const GB = 1024 * MB
 
 /** Shows sizes in MB or GB. */
 function useSize() {
   const number = new Intl.NumberFormat(getLocaleTag(useLocale()), { maximumFractionDigits: 1 })
   return (bytes: number) => (bytes >= GB ? `${number.format(bytes / GB)} GB` : `${number.format(Math.max(bytes, 0) / MB)} MB`)
+}
+
+/**
+ * The player's quality steps ("720p · 8 Mbit/s"), so a quality picked in the player is recognised here. A rate chosen
+ * before the steps were aligned (12, 5 Mbit/s) stays in the list while it is set.
+ */
+function videoQualityOptions(current: number, original: string, locale: Locale) {
+  const steps = QUALITY_OPTIONS.flatMap((option) => (option.bitrate ? [option.bitrate / MBIT] : []))
+  if (current && !steps.includes(current)) steps.push(current)
+  steps.sort((a, b) => b - a)
+  return [{ value: 0, label: original }, ...steps.map((mbit) => ({ value: mbit, label: qualityLabel(mbit * MBIT, locale) }))]
 }
 
 // The download qualities stay: changing them downloads everything again.
@@ -71,6 +84,7 @@ function MobileDataSection() {
 
 /** Watch's downloads: their quality, how much they take, and removing them all (the list is Watch's Downloads tab). */
 function VideoDownloadsSection() {
+  const locale = useLocale()
   const { settings, update } = useLocalSettings()
   const t = useMessages(playbackMessages)
   const size = useSize()
@@ -82,7 +96,7 @@ function VideoDownloadsSection() {
         label={t.videoDownloadQualityLabel}
         hint={t.videoDownloadQualityHint}
         value={settings.videoDownloadMbit}
-        options={[{ value: 0, label: t.videoOriginal }, ...[20, 12, 8, 5, 3].map((mbit) => ({ value: mbit, label: `${mbit} Mbit/s` }))]}
+        options={videoQualityOptions(settings.videoDownloadMbit, t.videoOriginal, locale)}
         onChange={(value) => update({ videoDownloadMbit: value })}
       />
       {stats.count + stats.pending > 0 && (
@@ -120,6 +134,7 @@ function MusicDownloadsSection() {
 }
 
 function VideoCacheSection() {
+  const locale = useLocale()
   const { settings, update } = useLocalSettings()
   const t = useMessages(playbackMessages)
   return (
@@ -148,7 +163,7 @@ function VideoCacheSection() {
         label={t.videoBitrateLabel}
         hint={t.videoBitrateHint}
         value={settings.videoBitrateMbit}
-        options={[{ value: 0, label: t.videoOriginal }, ...[20, 12, 8, 5, 3].map((mbit) => ({ value: mbit, label: `${mbit} Mbit/s` }))]}
+        options={videoQualityOptions(settings.videoBitrateMbit, t.videoOriginal, locale)}
         onChange={(value) => update({ videoBitrateMbit: value })}
       />
     </Section>
@@ -174,7 +189,7 @@ function MusicCacheSection() {
         label={t.cacheSizeLabel}
         hint={t.cacheSizeHint}
         value={settings.musicCacheMb}
-        options={[256, 512, 1024, 2048, 5120, 10240].map((mb) => ({ value: mb, label: mb >= 1024 ? `${number.format(mb / 1024)} GB` : `${mb} MB` }))}
+        options={[256, 512, 1024, 2048, 5120, 10240, 20480, 51200].map((mb) => ({ value: mb, label: mb >= 1024 ? `${number.format(mb / 1024)} GB` : `${mb} MB` }))}
         onChange={(value) => {
           update({ musicCacheMb: value })
           trimAudioCache({ maxBytes: value * MB, keepOftenPlayed: settings.musicKeepOften })

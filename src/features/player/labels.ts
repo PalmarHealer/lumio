@@ -22,6 +22,24 @@ export function formatNumber(value: number, digits?: number, locale: Locale = ge
   return new Intl.NumberFormat(getLocaleTag(locale), options).format(value)
 }
 
+/** Quality steps of the player menu; the one without a bitrate is the original. */
+export const QUALITY_OPTIONS: Array<{ resolution?: string; bitrate?: number }> = [
+  {},
+  { resolution: '1080p', bitrate: 20_000_000 },
+  { resolution: '720p', bitrate: 8_000_000 },
+  { resolution: '480p', bitrate: 3_000_000 },
+  { resolution: '360p', bitrate: 1_500_000 },
+]
+
+/**
+ * A bitrate as the player's quality menu names it ("720p · 8 Mbit/s"), so settings elsewhere (downloads, the episode
+ * cache, streaming) can be recognised; a rate between the steps is just "12 Mbit/s".
+ */
+export function qualityLabel(bits: number, locale: Locale = getLocale()) {
+  const resolution = QUALITY_OPTIONS.find((option) => option.bitrate === bits)?.resolution
+  return [resolution, mbitLabel(bits, undefined, locale)].filter(Boolean).join(' · ')
+}
+
 /** Bit/s as "1,5 Mbit/s" / "1.5 Mbit/s". */
 export function mbitLabel(bits: number, digits?: number, locale: Locale = getLocale()) {
   return `${formatNumber(bits / 1_000_000, digits, locale)} Mbit/s`

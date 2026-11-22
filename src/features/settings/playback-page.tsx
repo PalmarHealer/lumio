@@ -1,7 +1,7 @@
 import { Section, SelectField, SettingsPage, SettingsPending, SwitchField, withCurrent } from './fields'
 import { SAME_AS_WIFI, useLocalSettings, type SegmentAction, type SegmentKind } from './local-settings'
 import { networkTypeKnown } from '@/lib/network'
-import { fitLabels, SPEEDS, speedLabel, VIDEO_FITS } from '@/features/player/labels'
+import { fitLabels, qualityLabel, SPEEDS, speedLabel, VIDEO_FITS } from '@/features/player/labels'
 import { getLocaleTag, useLocale, useMessages } from '@/lib/i18n'
 import { fieldMessages, playbackMessages } from './messages'
 import { useLanguageOptions } from './use-languages'
@@ -54,7 +54,7 @@ export function PlaybackPage() {
     { value: 6, label: t.channels(number.format(5.1)) },
     { value: 8, label: t.channels(number.format(7.1)) },
   ]
-  const bitrateOptions = [{ value: 0, label: t.auto }, ...BITRATES_MBIT.map((mbit) => ({ value: mbit * MBIT, label: `${number.format(mbit)} Mbit/s` }))]
+  const bitrateOptions = [{ value: 0, label: t.auto }, ...BITRATES_MBIT.map((mbit) => ({ value: mbit * MBIT, label: qualityLabel(mbit * MBIT, locale) }))]
   const skipOptions = SKIP_SECONDS.map((value) => ({ value, label: seconds(value) }))
   const segmentActions = SEGMENT_ACTIONS.map((value) => ({ value, label: t[`action${value}`] }))
 

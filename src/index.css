@@ -550,7 +550,8 @@ html[data-frameless] [data-titlebar] {
   -webkit-app-region: drag;
   app-region: drag;
 }
-html[data-frameless] [data-titlebar] :is(a, button, input, select, textarea, label, [role='button'], [role='slider'], [role='radiogroup'], [tabindex]) {
+/* Popups opened from a header (the search suggestions) hang below it but stay in its tree: they must not move the window. */
+html[data-frameless] [data-titlebar] :is(a, button, input, select, textarea, label, [role='button'], [role='slider'], [role='radiogroup'], [role='listbox'], [role='dialog'], [role='menu'], [tabindex]) {
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }

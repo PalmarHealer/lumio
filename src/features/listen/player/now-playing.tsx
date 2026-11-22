@@ -1,4 +1,5 @@
 import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models'
+import { SingerLabel, singerChange } from './lyrics-singer'
 import { IconArrowsDiagonal } from '@tabler/icons-react'
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useNavigate } from 'react-router'
@@ -351,6 +352,7 @@ function LyricsPreview({ track, onExpand }: { track: BaseItemDto; onExpand?: () 
                 !synced || index === current ? 'text-white' : index < current ? 'text-white/55' : 'text-white/35',
               )}
             >
+              {singerChange(lines, index) && <SingerLabel name={line.singer!} />}
               {line.text}
             </span>
           ))}

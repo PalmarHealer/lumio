@@ -46,7 +46,7 @@ import { useTouch } from '@/lib/use-media-query'
 import { holdAppFullscreen, inNativeApp } from '@/lib/native-app'
 import { inCapacitor, onPipEvents, setAutoPip } from '@/lib/capacitor'
 import { desktop } from '@/lib/desktop'
-import { startAfterIntro, useMediaSegments } from './segments'
+import { startAfterIntro, useMediaSegments, type Segment } from './segments'
 import { fitLabels } from './labels'
 import { SettingsPanel } from './settings-panel'
 import { ScrubPreview } from './scrub-preview'
@@ -65,6 +65,8 @@ const LOAD_TARGET_SECONDS = 10
 const SUBTITLE_LINE_PX = 36
 /** The element counts as "at the start position" within 10 s of it (keyframes make it land a bit earlier). */
 const START_TOLERANCE_TICKS = 100_000_000
+/** This close to the end (2 s), a stream that stops or breaks off has finished. */
+const END_SLACK_TICKS = 20_000_000
 /** If the start position is never reached (e.g. beyond the end), trust the element's clock after this long. */
 const START_FALLBACK_MS = 15_000
 /** Clicks this soon after the controls appeared belong to the tap that showed them. */
@@ -280,7 +282,11 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
     setBreakDue(settings.breakReminderMinutes)
   })
 
+  const lastEnded = useRef(0)
   const handleEnded = useEffectEvent(() => {
+    // The end can be noticed more than once (the element's event, a stream breaking off in its last seconds).
+    if (Date.now() - lastEnded.current < 3000) return
+    lastEnded.current = Date.now()
     // Watched to the end: a copy stored ahead has done its job (episodes are rarely watched twice); downloads stay.
     if (isVideoCached(id) && !isVideoPinned(id)) void forgetVideo(id)
     // The sleep timer was set to the end of this video: it stops here instead of going on.
@@ -354,10 +360,20 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
 
     // What doesn't play as it is (a codec the device claims but can't decode, a broken remux, a damaged stored copy)
     // gets one more try converted by the server, from where it stopped. Only then the error screen, with the reason.
+    // In its last seconds, a stream that breaks off or stalls has simply ended. Retrying would start it over (a new
+    // stream from "where it stopped", i.e. past its end, comes back from the beginning), so it counts as the end.
+    const atEnd = () => {
+      const runtime = itemRef.current?.RunTimeTicks || (Number.isFinite(element.duration) ? secondsToTicks(element.duration) + offsetTicks : 0)
+      return startReached && runtime > 0 && positionTicks.current() >= runtime - END_SLACK_TICKS
+    }
     let gaveUp = false
     const fail = (reason: string) => {
       if (gaveUp) return
       gaveUp = true
+      if (atEnd()) {
+        console.info('[player] stream ended early', reason)
+        return handleEnded()
+      }
       console.warn('[player] stream failed', reason, data.stats)
       if (!choice.transcode && navigator.onLine) {
         setChoice((current) => ({ ...current, transcode: true, startTicks: positionTicks.current() }))
@@ -379,6 +395,7 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
       let networkRetries = 0
       instance.on(Hls.Events.ERROR, (_event, details) => {
         if (!details.fatal) return
+        if (atEnd()) return fail(`hls ${details.type}: ${details.details}`)
         if (details.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 2) {
           if (mediaRecoveries++ === 1) instance.swapAudioCodec()
           instance.recoverMediaError()
@@ -411,6 +428,11 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
     element.addEventListener('loadeddata', onLoadedData)
     element.addEventListener('playing', onFirstPlay, { once: true })
     const onEnded = () => handleEnded()
+    // A playlist promising a little more than the file holds: playback waits for data that never comes.
+    const onWaiting = () => {
+      if (atEnd() && !element.paused) handleEnded()
+    }
+    element.addEventListener('waiting', onWaiting)
     const onPauseOrPlay = () => report('progress')
     element.addEventListener('error', onError)
     element.addEventListener('ended', onEnded)
@@ -473,6 +495,7 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
       setStarted(false)
       element.removeEventListener('error', onError)
       element.removeEventListener('ended', onEnded)
+      element.removeEventListener('waiting', onWaiting)
       element.removeEventListener('pause', onPauseOrPlay)
       element.removeEventListener('play', onPauseOrPlay)
       element.removeEventListener('play', shareActivity)
@@ -572,8 +595,10 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
       const el = video.current
       if (!el) return
       if (progressiveTranscode) {
-        // A progressive transcode can't be scrubbed; ask the server for a new one starting at the target.
-        setChoice((current) => ({ ...current, startTicks: secondsToTicks(Math.max(seconds, 0)) }))
+        // A progressive transcode can't be scrubbed; ask the server for a new one starting at the target. Never at or
+        // past the end: such a stream comes back from the beginning.
+        const latest = runtimeSeconds > 0 ? runtimeSeconds - 3 : Infinity
+        setChoice((current) => ({ ...current, startTicks: secondsToTicks(Math.max(Math.min(seconds, latest), 0)) }))
       } else if (Number.isFinite(el.duration)) {
         el.currentTime = Math.min(Math.max(seconds, 0), el.duration)
       } else {
@@ -581,7 +606,7 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
         el.addEventListener('loadedmetadata', () => (el.currentTime = Math.max(seconds, 0)), { once: true })
       }
     },
-    [progressiveTranscode],
+    [progressiveTranscode, runtimeSeconds],
   )
   const seek = useCallback(
     (seconds: number) => (syncActive ? remote.syncRequests.seek(secondsToTicks(Math.max(seconds, 0))) : seekLocal(seconds)),
@@ -891,11 +916,21 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
   // In the language being watched.
   const watchedLanguage = data?.streams.find((stream) => stream.Type === 'Audio' && stream.Index === data.audioIndex)?.Language
   useVideoPrefetch(item.data, started && state.currentTime > 60, watchedLanguage)
+  // Skipping credits that run to the very end means the episode is over: go on to the next one. Seeking to the end
+  // instead could land past the stream (a progressive transcode asked to start there comes back from the beginning).
+  const runsToEnd = (segment: Segment) =>
+    !syncActive && !!next?.Id && state.duration > 0 && segment.end >= state.duration - ticksToSeconds(END_SLACK_TICKS)
+  const skipSegment = (segment: Segment) => (runsToEnd(segment) ? playNext() : seek(segment.end))
+  const autoSkip = useEffectEvent((segment: Segment) => {
+    // Skipped automatically, it ends the episode as the end itself would: the autoplay setting and sleep timer apply.
+    if (runsToEnd(segment)) handleEnded()
+    else seek(segment.end)
+  })
   useEffect(() => {
     if (!activeSegment || segmentAction !== 'Skip' || autoSkipped.current.has(activeSegment.id)) return
     autoSkipped.current.add(activeSegment.id)
-    seek(activeSegment.end)
-  }, [activeSegment, segmentAction, seek])
+    autoSkip(activeSegment)
+  }, [activeSegment, segmentAction])
 
   // Opened directly (no in-app history): fall back to the detail page instead of leaving the app.
   const goBack = useCallback(
@@ -1096,7 +1131,7 @@ function Player({ id, shell }: { id: string; shell: React.RefObject<HTMLDivEleme
           onFocus={(event) => event.stopPropagation()}
           onPointerDown={(event) => event.stopPropagation()}
           onPointerUp={(event) => event.stopPropagation()}
-          onClick={() => seek(activeSegment.end)}
+          onClick={() => skipSegment(activeSegment)}
         >
           {skipLabels[activeSegment.kind]}
         </Button>

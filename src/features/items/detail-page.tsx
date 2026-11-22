@@ -21,11 +21,12 @@ import { useLocalizedItem } from '@/lib/localized'
 import { AlbumView } from '@/features/listen/album-view'
 import { ArtistPage } from '@/features/listen/artist-page'
 import { cn } from '@/lib/utils'
+import { EpisodeContextMenu, EpisodeWatchedButton } from './episode-actions'
 import { useFilmSeries } from './film-series'
 import { detailMessages } from './messages'
 import { usePlayTarget } from './play-target'
 import { TrackPicker, type TrackChoice } from './track-picker'
-import { useEpisodes, useItem, useOtherVersions, useSeasons, useSeriesGuestStars, useSetFavorite, useSetPlayed, useSimilarItems } from './queries'
+import { useEpisodes, useItem, useOtherVersions, useSeasons, useSeriesGuestStars, useSeriesPlayTarget, useSetFavorite, useSetPlayed, useSimilarItems } from './queries'
 import { useUserViews } from '@/features/home/queries'
 import { MediaAdminMenu } from '@/features/admin/media-admin'
 import { EpisodeDownloadButton, MovieDownloadButton, SeasonDownloadButton, useVideoDownloadMessages, useVideoUnavailable } from '@/features/player/video-download-ui'
@@ -256,8 +257,15 @@ function SeasonsSection({ series, seriesId, initialSeasonId, highlightId }: Seas
     const all = seasons.data ?? []
     return [...all.filter((season) => !isSpecials(season)), ...all.filter(isSpecials)]
   }, [seasons.data])
-  const seasonId = picked ?? currentSeasonId(orderedSeasons)
+  // Opens at the season of the episode "play" would start (in progress, else next up). A watched episode opened again
+  // doesn't count (see unfinished), so a quick look into an old season doesn't move the series back there.
+  const playTarget = useSeriesPlayTarget(picked ? undefined : seriesId)
+  // A watched target is only the "from the start" fallback of a series seen in full: that one opens at its last season.
+  const target = playTarget.data?.UserData?.Played ? undefined : playTarget.data
+  const targetSeason = orderedSeasons.find((season) => season.Id === target?.SeasonId && !isSpecials(season))?.Id
+  const seasonId = picked ?? (playTarget.isPending && !playTarget.isError ? undefined : (targetSeason ?? currentSeasonId(orderedSeasons)))
   const episodes = useEpisodes(seriesId, seasonId)
+  const episodesLoading = episodes.isLoading || (!seasonId && orderedSeasons.length > 0)
 
   // Jump to the episode the user came from (e.g. "Weiterschauen"), once per episode.
   const highlighted = useRef<HTMLLIElement>(null)
@@ -289,7 +297,7 @@ function SeasonsSection({ series, seriesId, initialSeasonId, highlightId }: Seas
 
         {/* One column as wide as the page: long titles truncate instead of widening it (and the whole page). */}
         <ul className="grid grid-cols-1 gap-3">
-          {episodes.isLoading && Array.from({ length: 4 }, (_, i) => <Skeleton key={i} className="h-24 rounded-lg" />)}
+          {episodesLoading && Array.from({ length: 4 }, (_, i) => <Skeleton key={i} className="h-24 rounded-lg" />)}
           {episodes.data?.map((episode) => {
             const isHighlighted = episode.Id === highlightId
             return (
@@ -321,44 +329,49 @@ function EpisodeItem({ episode: jellyfinEpisode, highlighted, context, ref }: { 
   const progress = episode.UserData?.PlayedPercentage
   const overview = plainText(episode.Overview)
   return (
-    // The card is the row; its download button sits inside it, on the right.
-    <li
-      ref={ref}
-      title={unavailable ? t.unavailable : undefined}
-      className={cn(
-        'relative rounded-lg transition hover:bg-muted',
-        highlighted && 'bg-muted ring-1 ring-foreground/30',
-        unavailable && 'opacity-40 hover:bg-transparent',
-      )}
-    >
-      <Link
-        to={playHref(episode)}
-        aria-disabled={unavailable || undefined}
-        onClick={(event) => unavailable && event.preventDefault()}
+    // The card is the row; its watched and download buttons sit inside it, on the right. Right-click: more.
+    <EpisodeContextMenu episode={episode}>
+      <li
+        ref={ref}
+        title={unavailable ? t.unavailable : undefined}
         className={cn(
-          'flex min-w-0 gap-4 rounded-lg p-2 pr-16 outline-none focus-visible:ring-2 focus-visible:ring-ring',
-          unavailable && 'cursor-default',
+          'group/episode relative rounded-lg transition hover:bg-muted',
+          highlighted && 'bg-muted ring-1 ring-foreground/30',
+          unavailable && 'opacity-40 hover:bg-transparent',
         )}
       >
-        <div className="relative aspect-video w-40 shrink-0 overflow-hidden rounded-md bg-muted sm:w-52">
-          {thumb && <FadeImage src={thumb} alt="" loading="lazy" className="size-full object-cover" />}
-          <WatchedBadge item={episode} className="absolute right-1.5 top-1.5" />
-          {!!progress && (
-            <div className="absolute inset-x-0 bottom-0 h-1 bg-black/50">
-              <div className="h-full bg-primary" style={{ width: `${progress}%` }} />
-            </div>
+        <Link
+          to={playHref(episode)}
+          aria-disabled={unavailable || undefined}
+          onClick={(event) => unavailable && event.preventDefault()}
+          className={cn(
+            'flex min-w-0 gap-4 rounded-lg p-2 pr-28 outline-none focus-visible:ring-2 focus-visible:ring-ring',
+            unavailable && 'cursor-default',
           )}
+        >
+          <div className="relative aspect-video w-40 shrink-0 overflow-hidden rounded-md bg-muted sm:w-52">
+            {thumb && <FadeImage src={thumb} alt="" loading="lazy" className="size-full object-cover" />}
+            <WatchedBadge item={episode} className="absolute right-1.5 top-1.5" />
+            {!!progress && (
+              <div className="absolute inset-x-0 bottom-0 h-1 bg-black/50">
+                <div className="h-full bg-primary" style={{ width: `${progress}%` }} />
+              </div>
+            )}
+          </div>
+          <div className="min-w-0 space-y-1">
+            <p className={cn('truncate font-medium', episode.UserData?.Played && 'text-muted-foreground')}>
+              {episode.IndexNumber}. {episode.Name}
+            </p>
+            <p className="text-xs text-muted-foreground">{formatRuntime(episode.RunTimeTicks)}</p>
+            <p className="line-clamp-2 whitespace-pre-line text-sm text-muted-foreground">{overview}</p>
+          </div>
+        </Link>
+        <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center">
+          <EpisodeWatchedButton episode={episode} />
+          <EpisodeDownloadButton episode={episode} context={context} />
         </div>
-        <div className="min-w-0 space-y-1">
-          <p className={cn('truncate font-medium', episode.UserData?.Played && 'text-muted-foreground')}>
-            {episode.IndexNumber}. {episode.Name}
-          </p>
-          <p className="text-xs text-muted-foreground">{formatRuntime(episode.RunTimeTicks)}</p>
-          <p className="line-clamp-2 whitespace-pre-line text-sm text-muted-foreground">{overview}</p>
-        </div>
-      </Link>
-      <EpisodeDownloadButton episode={episode} context={context} className="absolute right-2 top-1/2 -translate-y-1/2" />
-    </li>
+      </li>
+    </EpisodeContextMenu>
   )
 }
 

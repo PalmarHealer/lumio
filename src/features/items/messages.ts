@@ -58,3 +58,30 @@ export const trackPickerMessages = defineMessages({
   de: { off: 'Aus', video: 'Video', language: 'Sprache', subtitles: 'Untertitel' },
   en: { off: 'Off', video: 'Video', language: 'Language', subtitles: 'Subtitles' },
 })
+
+export const episodeActionMessages = defineMessages({
+  de: {
+    markWatched: 'Als gesehen markieren',
+    markUnwatched: 'Als nicht gesehen markieren',
+    resetProgress: 'Fortschritt zurücksetzen',
+    fileInfo: 'Dateiinfo',
+    noInfo: 'Zu dieser Folge gibt es keine Dateiinformationen.',
+    video: 'Video',
+    audio: 'Ton',
+    subtitles: 'Untertitel',
+    file: 'Datei',
+    none: 'Keine',
+  },
+  en: {
+    markWatched: 'Mark as watched',
+    markUnwatched: 'Mark as unwatched',
+    resetProgress: 'Reset progress',
+    fileInfo: 'File info',
+    noInfo: 'There is no file information for this episode.',
+    video: 'Video',
+    audio: 'Audio',
+    subtitles: 'Subtitles',
+    file: 'File',
+    none: 'None',
+  },
+})

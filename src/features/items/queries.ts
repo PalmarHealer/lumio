@@ -5,7 +5,7 @@ import { getGenreApi } from '@jellyfin/sdk/lib/utils/api/genre-api'
 import { getLibraryApi } from '@jellyfin/sdk/lib/utils/api/library-api'
 import { getShowApi } from '@jellyfin/sdk/lib/utils/api/show-api'
 import { getUserDataApi } from '@jellyfin/sdk/lib/utils/api/user-data-api'
-import { keepPreviousData, queryOptions, useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, queryOptions, useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { useMemo } from 'react'
 import { useAuthedSession } from '@/features/auth/session'
 import { rankResults, type ArtistAffinity } from '@/features/search/rank'
@@ -52,12 +52,22 @@ export function useEpisodes(seriesId: string | undefined, seasonId: string | und
   })
 }
 
+/**
+ * Resume items minus the ones already watched: a watched episode opened again keeps its position (it is shown), but
+ * isn't "in progress" anywhere (Continue Watching, the series' play button, the season a series opens at).
+ */
+export function unfinished(items: BaseItemDto[] | null | undefined): BaseItemDto[] {
+  return (items ?? []).filter((item) => !item.UserData?.Played)
+}
+
 /** Which episode "play" should start for a series: the one in progress, else next up, else the very first. */
 export const seriesPlayTargetOptions = (api: Api, userId: string, seriesId: string) =>
   queryOptions({
     queryKey: ['series-play-target', userId, seriesId],
     queryFn: async () => {
-      const resume = (await getLibraryApi(api).getResumeItems({ userId, parentId: seriesId, limit: 1, mediaTypes: ['Video'] })).data.Items?.[0]
+      const resume = unfinished(
+        (await getLibraryApi(api).getResumeItems({ userId, parentId: seriesId, limit: 8, mediaTypes: ['Video'] })).data.Items,
+      )[0]
       if (resume) return resume
       const next = (await getShowApi(api).getNextUp({ userId, seriesId, limit: 1 })).data.Items?.[0]
       if (next) return next
@@ -701,28 +711,41 @@ export function useSetPlayed(itemId: string) {
       else await userData.markUnplayedItem({ itemId, userId: session.userId })
       return played
     },
-    onSuccess: () => {
-      // Played state shows up in many lists (cards, episode rows, resume, history, search), so refetch broadly.
-      for (const key of [
-        'item',
-        'episodes',
-        'seasons',
-        'tracks',
-        'resume',
-        'next-up',
-        'next-episode',
-        'latest',
-        'library',
-        'favorites',
-        'history',
-        'search',
-        'person-items',
-        'series-play-target',
-      ]) {
-        void queryClient.invalidateQueries({ queryKey: [key] })
-      }
-    },
+    onSuccess: () => refreshPlayedState(queryClient),
   })
+}
+
+/** Forgets where an item was stopped (an episode clicked into by mistake); whether it counts as watched stays. */
+export function useResetProgress(itemId: string) {
+  const { api, session } = useAuthedSession()
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      getUserDataApi(api).updateItemUserData({ itemId, userId: session.userId, updateUserItemDataDto: { PlaybackPositionTicks: 0 } }),
+    onSuccess: () => refreshPlayedState(queryClient),
+  })
+}
+
+// Played state shows up in many lists (cards, episode rows, resume, history, search), so refetch broadly.
+const PLAYED_STATE_KEYS = [
+  'item',
+  'episodes',
+  'seasons',
+  'tracks',
+  'resume',
+  'next-up',
+  'next-episode',
+  'latest',
+  'library',
+  'favorites',
+  'history',
+  'search',
+  'person-items',
+  'series-play-target',
+]
+
+function refreshPlayedState(queryClient: QueryClient) {
+  for (const key of PLAYED_STATE_KEYS) void queryClient.invalidateQueries({ queryKey: [key] })
 }
 
 const HISTORY_PAGE_SIZE = 40

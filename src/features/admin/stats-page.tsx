@@ -29,7 +29,6 @@ const messages = defineMessages({
     totalTime: 'Gesamtzeit',
     activeUsers: 'Aktive Nutzer',
     perDay: 'Pro Tag',
-    jellyfin: 'Jellyfin',
     users: 'Nutzer',
     podcastPart: (time: string) => `davon ${time} Podcasts`,
     playsCount: (count: string) => `${count} Wiedergaben`,
@@ -91,7 +90,6 @@ const messages = defineMessages({
     totalTime: 'Total time',
     activeUsers: 'Active users',
     perDay: 'Per day',
-    jellyfin: 'Jellyfin',
     users: 'Users',
     podcastPart: (time: string) => `${time} of it podcasts`,
     playsCount: (count: string) => `${count} plays`,
@@ -140,6 +138,8 @@ const messages = defineMessages({
 type Kind = 'Movie' | 'Episode' | 'Audio' | 'Podcast'
 const KINDS: Kind[] = ['Movie', 'Episode', 'Audio', 'Podcast']
 const JELLYFIN_KINDS: Kind[] = ['Movie', 'Episode', 'Audio']
+/** Shades of the accent for the stacked day chart, strongest at the bottom. */
+const KIND_COLORS: Record<Kind, string> = { Movie: 'bg-primary', Episode: 'bg-primary/70', Audio: 'bg-primary/45', Podcast: 'bg-primary/25' }
 
 interface Breakdown {
   label: string
@@ -159,7 +159,8 @@ interface UserActivity {
 
 interface Reporting {
   activity: UserActivity[]
-  perDay: Array<{ user_id: string; user_name: string; user_usage: Record<string, number> }>
+  /** Per type, so the day chart can stack films, episodes and music. */
+  perDay: Partial<Record<Kind, Array<{ user_id: string; user_name: string; user_usage: Record<string, number> }>>>
   byType: Breakdown[]
   byMethod: Breakdown[]
   byClient: Breakdown[]
@@ -207,9 +208,16 @@ function useReporting(days: number, kinds: Kind[], measure: 'count' | 'time') {
         return (await response.json()) as T
       }
       try {
+        type DayUsage = NonNullable<Reporting['perDay'][Kind]>
+        const perDayOf = async () =>
+          Object.fromEntries(
+            await Promise.all(
+              types.map(async (type) => [type, await get<DayUsage>(`PlayActivity?${range}&filter=${type}&dataType=${measure}`)] as const),
+            ),
+          ) as Reporting['perDay']
         const [activity, perDay, byType, byMethod, byClient, byDevice, hourly] = await Promise.all([
           get<UserActivity[]>(`user_activity?${range}`),
-          get<Reporting['perDay']>(`PlayActivity?${range}&${filter}&dataType=${measure}`),
+          perDayOf(),
           get<Breakdown[]>(`ItemType/BreakdownReport?${range}`),
           get<Breakdown[]>(`PlaybackMethod/BreakdownReport?${range}`),
           get<Breakdown[]>(`ClientName/BreakdownReport?${range}`),
@@ -355,36 +363,39 @@ export function StatsPage() {
   }
   const userRows = [...users.values()].sort((a, b) => (measure === 'time' ? b.seconds - a.seconds : b.count - a.count))
 
-  // Per day: Jellyfin's (all users together) and the podcasts, side by side in each bar.
-  const dayList: Array<{ day: string; jellyfin: number; podcasts: number }> = []
+  // Per day: all users together, stacked by type (films, episodes and music from Jellyfin, podcasts from Lumio).
+  const dayList: Array<{ day: string; total: number } & Record<Kind, number>> = []
   const today = new Date(now)
   for (let offset = days - 1; offset >= 0; offset--) {
     const date = new Date(today)
     date.setDate(today.getDate() - offset)
-    dayList.push({ day: dayKey(date), jellyfin: 0, podcasts: 0 })
+    dayList.push({ day: dayKey(date), total: 0, Movie: 0, Episode: 0, Audio: 0, Podcast: 0 })
   }
   const dayIndex = new Map(dayList.map((entry, index) => [entry.day, index]))
-  if (jellyfinKinds.length)
-    for (const user of report?.perDay ?? []) {
+  for (const kind of jellyfinKinds)
+    for (const user of report?.perDay[kind] ?? []) {
       if (user.user_id === 'labels_user') continue
       for (const [day, value] of Object.entries(user.user_usage ?? {})) {
         const index = dayIndex.get(day)
-        if (index !== undefined) dayList[index]!.jellyfin += value
+        if (index !== undefined) dayList[index]![kind] += value
       }
     }
   for (const play of plays) {
     const index = dayIndex.get(dayKey(new Date(play.startedAt)))
     if (index === undefined) continue
-    if (measure === 'time') dayList[index]!.podcasts += play.seconds
-    else if (play.seconds >= MIN_PLAY_SECONDS) dayList[index]!.podcasts++
+    if (measure === 'time') dayList[index]!.Podcast += play.seconds
+    else if (play.seconds >= MIN_PLAY_SECONDS) dayList[index]!.Podcast++
   }
   for (const play of offlineVideos) {
     const index = dayIndex.get(dayKey(new Date(play.startedAt)))
     if (index === undefined) continue
-    if (measure === 'time') dayList[index]!.jellyfin += play.seconds
-    else if (play.seconds >= MIN_PLAY_SECONDS) dayList[index]!.jellyfin++
+    const kind = play.subtitle as Kind
+    if (measure === 'time') dayList[index]![kind] += play.seconds
+    else if (play.seconds >= MIN_PLAY_SECONDS) dayList[index]![kind]++
   }
-  const dayMax = Math.max(1, ...dayList.map((entry) => entry.jellyfin + entry.podcasts))
+  for (const entry of dayList) entry.total = KINDS.reduce((sum, kind) => sum + entry[kind], 0)
+  const dayMax = Math.max(1, ...dayList.map((entry) => entry.total))
+  const dayKinds = KINDS.filter((kind) => kinds.includes(kind))
 
   // Times of day: seconds by weekday and hour, both sources.
   const hourly: Record<string, number> = jellyfinKinds.length ? { ...(report?.hourly ?? {}) } : {}
@@ -518,25 +529,31 @@ export function StatsPage() {
                 {dayList.map((entry) => (
                   <div
                     key={entry.day}
-                    className="flex h-full min-w-0 flex-1 flex-col-reverse"
-                    title={`${new Date(`${entry.day}T12:00:00`).toLocaleDateString(locale, { day: 'numeric', month: 'short' })}: ${
-                      measure === 'time' ? duration(entry.jellyfin + entry.podcasts) : number.format(entry.jellyfin + entry.podcasts)
-                    }`}
+                    className="flex h-full min-w-0 flex-1 flex-col justify-end"
+                    title={[
+                      new Date(`${entry.day}T12:00:00`).toLocaleDateString(locale, { day: 'numeric', month: 'short' }),
+                      ...dayKinds
+                        .filter((kind) => entry[kind] > 0)
+                        .map((kind) => `${kindName(kind)}: ${measure === 'time' ? duration(entry[kind]) : number.format(entry[kind])}`),
+                    ].join('\n')}
                   >
-                    <span className="block rounded-b-sm bg-primary" style={{ height: `${(entry.jellyfin / dayMax) * 100}%` }} />
-                    <span className="block rounded-t-sm bg-primary/45" style={{ height: `${(entry.podcasts / dayMax) * 100}%` }} />
+                    {/* One rounded box per day, the types stacked inside it (films at the bottom). */}
+                    <div className="flex flex-col-reverse overflow-hidden rounded-t-sm" style={{ height: `${(entry.total / dayMax) * 100}%` }}>
+                      {dayKinds.map((kind) => (
+                        <span key={kind} className={cn('block shrink-0', KIND_COLORS[kind])} style={{ height: `${entry.total ? (entry[kind] / entry.total) * 100 : 0}%` }} />
+                      ))}
+                    </div>
                   </div>
                 ))}
               </div>
               <div className="flex justify-between text-[11px] text-muted-foreground">
                 <span>{new Date(`${dayList[0]!.day}T12:00:00`).toLocaleDateString(locale, { day: 'numeric', month: 'short' })}</span>
-                <span className="flex gap-3">
-                  <span className="flex items-center gap-1">
-                    <span className="size-2 rounded-sm bg-primary" /> {t.jellyfin}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="size-2 rounded-sm bg-primary/45" /> {t.typePodcast}
-                  </span>
+                <span className="flex flex-wrap justify-center gap-x-3 gap-y-1">
+                  {dayKinds.map((kind) => (
+                    <span key={kind} className="flex items-center gap-1">
+                      <span className={cn('size-2 rounded-sm', KIND_COLORS[kind])} /> {kindName(kind)}
+                    </span>
+                  ))}
                 </span>
                 <span>{new Date(`${dayList.at(-1)!.day}T12:00:00`).toLocaleDateString(locale, { day: 'numeric', month: 'short' })}</span>
               </div>

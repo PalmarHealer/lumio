@@ -656,7 +656,13 @@ export function useSearch(term: string, mode: AppMode = 'watch') {
       for (const item of [...(plain.data.Items ?? []), ...(played.data.Items ?? []), ...(liked.data.Items ?? [])]) {
         if (item.Id && !unique.has(item.Id)) unique.set(item.Id, item)
       }
-      return [...unique.values()].filter((item) => item.Type !== 'Playlist' || isVideoPlaylist(item) === (mode === 'watch'))
+      const items = [...unique.values()].filter((item) => item.Type !== 'Playlist' || isVideoPlaylist(item) === (mode === 'watch'))
+      // Jellyfin compares the term with a series' "clean" name ("S.W.A.T." becomes "s w a t"), so "swat" finds only its
+      // episodes (they match through their series name). The series those episodes belong to come first.
+      const missing = [...new Set(items.flatMap((item) => (item.Type === 'Episode' && item.SeriesId && !unique.has(item.SeriesId) ? [item.SeriesId] : [])))]
+      if (!missing.length) return items
+      const series = (await library.getItems({ userId: session.userId, ids: missing, fields: [ItemFields.PrimaryImageAspectRatio] })).data.Items ?? []
+      return [...series, ...items]
     },
   })
   const data = useMemo(() => (search.data ? rankResults(search.data, term, affinity.data) : undefined), [search.data, term, affinity.data])

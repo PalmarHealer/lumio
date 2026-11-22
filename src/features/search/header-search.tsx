@@ -27,7 +27,6 @@ import { useRecentSearches, type SearchEntry, type SearchTarget } from './recent
 import { displayName } from '@/lib/unscanned'
 import { MissingCover } from '@/features/listen/missing-cover'
 
-const TYPE_ORDER = ['Movie', 'Series', 'BoxSet', 'MusicArtist', 'MusicAlbum', 'Playlist', 'AudioBook', 'Book', 'Episode', 'Audio']
 const DEBOUNCE_MS = 200
 const MAX_RESULTS = 8
 
@@ -88,10 +87,8 @@ export function HeaderSearch({ persistent = false }: { persistent?: boolean }) {
   const results = useSearch(listing ? term : '', mode)
   const podcasts = usePodcastSearch(listing && mode === 'listen' ? term : '')
   const lyrics = useLyricsSearch(listing && mode === 'listen' ? term : '')
-  // Whole titles first; episodes and tracks would otherwise crowd the short list.
-  const found = [...(results.data ?? [])]
-    .sort((a, b) => TYPE_ORDER.indexOf(a.Type ?? '') - TYPE_ORDER.indexOf(b.Type ?? ''))
-    .slice(0, MAX_RESULTS)
+  // Already best first for this user (name match plus what they play and like, see search/rank.ts).
+  const found = (results.data ?? []).slice(0, MAX_RESULTS)
   // Then songs whose lyrics have the term (those found by name already aren't repeated). Kept for the term they were
   // found for, so the previous term's songs don't linger under the new one.
   const foundIds = new Set(found.map((item) => item.Id))

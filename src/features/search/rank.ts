@@ -14,6 +14,9 @@ export function normalize(text: string) {
 function textScore(name: string, term: string) {
   if (!term) return 0
   if (name === term) return 100
+  // "S.W.A.T." for "swat", "BOOM!" for "boom": the same without punctuation is as good as exact.
+  const bare = (text: string) => text.replace(/[^\p{L}\p{N}]/gu, '')
+  if (bare(name) && bare(name) === bare(term)) return 95
   if (name.startsWith(term)) return 70
   if (name.split(/[\s\-_/(),.&+]+/).some((word) => word.startsWith(term))) return 50
   if (name.includes(term)) return 30
